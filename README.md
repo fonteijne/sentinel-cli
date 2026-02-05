@@ -7,7 +7,14 @@ Autonomous agent orchestration system for Jira ticket implementation.
 cd sentinel && source init.sh  # Install deps + activate environment
 # Edit config/.env with your API credentials
 sentinel validate              # Verify setup
+sentinel auth configure        # Configure Claude Code Auth
 sentinel projects add          # Add your first project
+
+sentinel info ACME-123         # Get info of Jira ticket
+sentinel plan ACME-123         # Create plan for Jira ticket
+sentinel plan ACME-123 --revise      # Work on feedback in MR
+sentinel execute ACME-123      # Execute the plan
+sentinel execute ACME-123 --revise   # Work on feedback in MR
 ```
 
 ---
