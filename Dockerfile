@@ -1,0 +1,105 @@
+# Sentinel Docker Container
+# Includes: Python 3.11, Poetry, Beads (bd), and Claude Code
+#
+# Multi-stage build for optimal caching:
+# - base: System deps, Node.js, Poetry, Claude Code, Beads (slow, rarely changes)
+# - app: Application dependencies and code (faster, changes often)
+
+# =============================================================================
+# BASE STAGE - Heavy installations (cached unless base image changes)
+# =============================================================================
+FROM python:3.11-slim-bookworm AS base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    POETRY_VERSION=1.8.3 \
+    POETRY_HOME="/opt/poetry" \
+    POETRY_VIRTUALENVS_CREATE=false \
+    POETRY_NO_INTERACTION=1
+
+# Add Poetry to PATH
+ENV PATH="$POETRY_HOME/bin:$PATH"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    ca-certificates \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (required for Claude Code)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN curl -sSL https://install.python-poetry.org | python3 -
+
+# Install Claude Code globally via npm (slow - ~13 min)
+RUN npm install -g @anthropic-ai/claude-code
+
+# Create Claude Code directory structure (prevents CLI issues in containers)
+RUN mkdir -p /etc/claude-code/.claude/skills \
+    && mkdir -p /root/.claude
+
+# Install Beads (bd) via pip
+RUN pip install beads
+
+# =============================================================================
+# APP STAGE - Application code (rebuilds faster on code changes)
+# =============================================================================
+FROM base AS app
+
+# Set working directory
+WORKDIR /app
+
+# Copy dependency files first (for better layer caching)
+COPY pyproject.toml poetry.lock ./
+
+# Install Python dependencies (without dev deps for production)
+RUN poetry install --no-root --no-dev
+
+# Copy the rest of the application
+COPY . .
+
+# Install the project itself
+RUN poetry install --only-root
+
+# Create workspace directory for Sentinel operations
+RUN mkdir -p /workspaces
+
+# Set default environment variables
+ENV WORKSPACE_ROOT=/workspaces
+
+# Default command - run sentinel CLI
+ENTRYPOINT ["sentinel"]
+CMD ["--help"]
+
+# =============================================================================
+# DEV STAGE - Includes dev dependencies
+# =============================================================================
+FROM base AS dev
+
+WORKDIR /app
+
+# Copy dependency files
+COPY pyproject.toml poetry.lock ./
+
+# Install ALL dependencies including dev
+RUN poetry install --no-root
+
+# Copy application (in dev, this is usually mounted instead)
+COPY . .
+
+# Install the project
+RUN poetry install --only-root
+
+RUN mkdir -p /workspaces
+ENV WORKSPACE_ROOT=/workspaces
+
+# No entrypoint for dev - allows flexible command execution
+CMD ["bash"]

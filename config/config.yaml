@@ -1,0 +1,49 @@
+version: '1.0'
+workspace:
+  root_dir: ~/sentinel-workspaces
+  plans_dir: .agents/plans
+  memory_dir: .agents/memory
+agents:
+  plan_generator:
+    model: claude-opus-4-5
+    temperature: 0.3
+  python_developer:
+    model: claude-4-5-sonnet
+    temperature: 0.2
+    specializations:
+    - python
+    - pydantic-ai
+    - fastapi
+    - postgresql
+  security_review:
+    model: claude-4-5-sonnet
+    temperature: 0.1
+    strictness: 5
+    veto_power: true
+iteration_limits:
+  max_iterations: 5
+  retry_on_failure: 2
+beads:
+  auto_create: true
+  task_prefix: sentinel
+agent_sdk:
+  default_tools:
+  - Read
+  - Grep
+  - Glob
+  auto_edits: true
+  planning_agent_tools:
+  - Read
+  - Grep
+  - Glob
+  - Bash(git *)
+  implementation_agent_tools:
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - Bash
+logging:
+  level: INFO
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
