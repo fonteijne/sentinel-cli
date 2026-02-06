@@ -52,9 +52,13 @@ class ConfigLoader:
         self.local_config_path = self.config_path.parent / "config.local.yaml"
 
         # Load .env file from config directory if it exists
+        # Then load .env.local which takes precedence (for local overrides)
         env_path = self.config_path.parent / ".env"
+        env_local_path = self.config_path.parent / ".env.local"
         if env_path.exists():
             load_dotenv(env_path)
+        if env_local_path.exists():
+            load_dotenv(env_local_path, override=True)
 
         self._config: Dict[str, Any] = {}
         self._local_config: Dict[str, Any] = {}

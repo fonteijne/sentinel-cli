@@ -17,7 +17,7 @@ class BeadsManager:
                 check=True,
             )
         except (subprocess.CalledProcessError, FileNotFoundError):
-            raise RuntimeError("beads CLI (bd) not found. Install with: pip install beads")
+            raise RuntimeError("beads CLI (bd) not found. Install with: npm install -g @beads/bd")
 
     def init_project(self, ticket_id: str, working_dir: Optional[str] = None) -> None:
         """Initialize beads project for a ticket (if not already initialized).
