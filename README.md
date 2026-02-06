@@ -542,7 +542,12 @@ Please ensure:
 
 ## License
 
-[Add your license here]
+Sentinel is dual-licensed:
+
+- **Non-commercial use**: [PolyForm Noncommercial License 1.0.0](LICENSE)
+- **Commercial use**: [Commercial License](COMMERCIAL-LICENSE.md) required
+
+For commercial licensing inquiries, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 
 ---
 
