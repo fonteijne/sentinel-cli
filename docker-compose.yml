@@ -8,23 +8,17 @@ services:
     volumes:
       # Mount workspace directory for persistent workspaces
       - sentinel-workspaces:/workspaces
-      # Mount config for runtime configuration changes
+      # Mount config for runtime configuration changes (read-only)
       - ./config:/app/config:ro
-      # Mount Claude credentials if using Claude Code subscription
-      - ~/.claude:/root/.claude:ro
+      # Mount .env.local as writable for sentinel auth configure
+      - ./config/.env.local:/app/config/.env.local:rw
+      # Uncomment below if using Claude Code subscription mode (not API key):
+      # - ~/.claude:/root/.claude:ro
     environment:
-      # Jira Configuration
-      - JIRA_API_TOKEN=${JIRA_API_TOKEN}
-      - JIRA_EMAIL=${JIRA_EMAIL}
-      - JIRA_BASE_URL=${JIRA_BASE_URL}
-      # GitLab Configuration
-      - GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
-      - GITLAB_BASE_URL=${GITLAB_BASE_URL}
-      # LLM Configuration (optional - for direct API or proxy)
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
-      # Workspace
+      # Workspace root (container path)
       - WORKSPACE_ROOT=/workspaces
+      # Note: Jira, GitLab, and LLM credentials are loaded from
+      # the mounted config/.env file by the application
     # Interactive mode for CLI usage
     stdin_open: true
     tty: true
@@ -45,15 +39,11 @@ services:
       # Mount source code for live development
       - .:/app
       - sentinel-workspaces:/workspaces
-      - ~/.claude:/root/.claude:ro
+      # Mount .env.local as writable for sentinel auth configure
+      - ./config/.env.local:/app/config/.env.local:rw
+      # Uncomment below if using Claude Code subscription mode (not API key):
+      # - ~/.claude:/root/.claude:ro
     environment:
-      - JIRA_API_TOKEN=${JIRA_API_TOKEN}
-      - JIRA_EMAIL=${JIRA_EMAIL}
-      - JIRA_BASE_URL=${JIRA_BASE_URL}
-      - GITLAB_API_TOKEN=${GITLAB_API_TOKEN}
-      - GITLAB_BASE_URL=${GITLAB_BASE_URL}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
       - WORKSPACE_ROOT=/workspaces
     stdin_open: true
     tty: true

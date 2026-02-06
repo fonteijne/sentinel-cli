@@ -932,11 +932,21 @@ def validate() -> None:
 
         # Test Beads
         click.echo("\n4️⃣  Testing Beads CLI...")
+        import subprocess as sp
         try:
             beads_mgr = BeadsManager()
-            stats = beads_mgr.get_stats()
-            click.echo("   ✅ Beads CLI available")
-            click.echo(f"      Total issues: {stats.get('total', 0)}")
+            # BeadsManager.__init__ verifies bd --version works
+            click.echo("   ✅ Beads CLI installed")
+            try:
+                stats = beads_mgr.get_stats()
+                click.echo(f"      Total issues: {stats.get('total', 0)}")
+            except sp.CalledProcessError:
+                # No database initialized yet - that's OK for validation
+                click.echo("      ℹ️  No beads database (run 'bd init' in a project)")
+        except RuntimeError as e:
+            click.echo(f"   ❌ {e}")
+            all_valid = False
+            beads_failed = True
         except Exception as e:
             click.echo(f"   ❌ Beads CLI error: {e}")
             all_valid = False
@@ -976,7 +986,7 @@ def validate() -> None:
 
             # Beads instructions
             if beads_failed:
-                click.echo(f"{step}. Install beads CLI: pip install beads")
+                click.echo(f"{step}. Install beads CLI: npm install -g @beads/bd")
                 step += 1
 
             # Generic hint if .env doesn't exist
@@ -1259,7 +1269,7 @@ def auth_configure() -> None:
             click.echo("❌ Invalid API key")
             sys.exit(1)
 
-        # Save to .env file
+        # Save to .env.local file
         env_path = Path(__file__).parent.parent / "config" / ".env"
         _update_env_file(env_path, {
             "ANTHROPIC_API_KEY": api_key,
@@ -1268,7 +1278,7 @@ def auth_configure() -> None:
 
         click.echo("\n✅ Direct API configured!")
         click.echo(f"   API Key: {'*' * 8}{api_key[-4:]}")
-        click.echo(f"   Saved to: {env_path}")
+        click.echo(f"   Saved to: {env_path.parent / '.env.local'}")
 
     else:
         # Custom proxy
@@ -1285,7 +1295,7 @@ def auth_configure() -> None:
             click.echo("❌ Invalid base URL")
             sys.exit(1)
 
-        # Save to .env file
+        # Save to .env.local file
         env_path = Path(__file__).parent.parent / "config" / ".env"
         _update_env_file(env_path, {
             "ANTHROPIC_API_KEY": api_key,
@@ -1295,23 +1305,27 @@ def auth_configure() -> None:
         click.echo("\n✅ Custom proxy configured!")
         click.echo(f"   API Key: {'*' * 8}{api_key[-4:]}")
         click.echo(f"   Base URL: {base_url}")
-        click.echo(f"   Saved to: {env_path}")
+        click.echo(f"   Saved to: {env_path.parent / '.env.local'}")
 
     click.echo("\nRun 'sentinel validate' to verify configuration.")
 
 
 def _update_env_file(env_path: Path, updates: dict) -> None:
-    """Update or create .env file with the given key-value pairs."""
-    # Read existing content
-    if env_path.exists():
-        lines = env_path.read_text().split("\n")
+    """Update or create .env.local file with the given key-value pairs.
+
+    Writes to .env.local instead of .env to support read-only .env mounts
+    in containerized environments. The .env.local file takes precedence
+    over .env when loaded by config_loader.
+    """
+    # Always write to .env.local for local overrides
+    local_env_path = env_path.parent / ".env.local"
+
+    # Read existing .env.local content if it exists
+    if local_env_path.exists():
+        lines = local_env_path.read_text().split("\n")
     else:
-        # Create from template if available
-        template_path = env_path.parent / ".env.example"
-        if template_path.exists():
-            lines = template_path.read_text().split("\n")
-        else:
-            lines = []
+        # Start with a header comment
+        lines = ["# Local environment overrides (takes precedence over .env)"]
 
     # Update or add each key
     for key, value in updates.items():
@@ -1329,8 +1343,8 @@ def _update_env_file(env_path: Path, updates: dict) -> None:
         if not key_found and value:
             lines.append(f"{key}={value}")
 
-    # Write back
-    env_path.write_text("\n".join(lines))
+    # Write to .env.local
+    local_env_path.write_text("\n".join(lines))
 
 
 @cli.group()

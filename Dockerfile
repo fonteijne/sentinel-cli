@@ -29,6 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     gnupg \
+    zsh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Claude Code)
@@ -39,15 +40,12 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # Install Poetry
 RUN curl -sSL https://install.python-poetry.org | python3 -
 
-# Install Claude Code globally via npm (slow - ~13 min)
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code and Beads globally via npm (slow - ~13 min)
+RUN npm install -g @anthropic-ai/claude-code @beads/bd
 
 # Create Claude Code directory structure (prevents CLI issues in containers)
 RUN mkdir -p /etc/claude-code/.claude/skills \
     && mkdir -p /root/.claude
-
-# Install Beads (bd) via pip
-RUN pip install beads
 
 # =============================================================================
 # APP STAGE - Application code (rebuilds faster on code changes)
@@ -71,6 +69,9 @@ RUN poetry install --only-root
 
 # Create workspace directory for Sentinel operations
 RUN mkdir -p /workspaces
+
+# Create empty .env.local for auth configure (ensures bind mount works)
+RUN touch /app/config/.env.local
 
 # Set default environment variables
 ENV WORKSPACE_ROOT=/workspaces
@@ -99,6 +100,10 @@ COPY . .
 RUN poetry install --only-root
 
 RUN mkdir -p /workspaces
+
+# Create empty .env.local for auth configure (ensures bind mount works)
+RUN touch /app/config/.env.local
+
 ENV WORKSPACE_ROOT=/workspaces
 
 # No entrypoint for dev - allows flexible command execution
