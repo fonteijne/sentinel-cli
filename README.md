@@ -4,8 +4,20 @@ Autonomous agent orchestration system for Jira ticket implementation.
 
 **Quick start for new users:**
 ```bash
+
+# For running on your own machine:
 cd sentinel && source init.sh  # Install deps + activate environment
+
+# For running the docker container
+docker compose up -d
+docker compose exec sentinel zsh
+
 # Edit config/.env with your API credentials
+cp config/.env.example config/.env
+```
+
+Start commands
+```bash
 sentinel validate              # Verify setup
 sentinel auth configure        # Configure Claude Code Auth
 sentinel projects add          # Add your first project
