@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import Optional
 
 import click
+from importlib.metadata import version
 
 
 from src.config_loader import get_config
 from src.worktree_manager import WorktreeManager
-from src.jira_client import JiraClient
+from src.jira_factory import get_jira_client
 from src.beads_manager import BeadsManager
 from src.session_tracker import SessionTracker
 from src.agents.plan_generator import PlanGeneratorAgent
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version=version("sentinel"))
 def cli() -> None:
     """Sentinel - Autonomous agent orchestration for Jira tickets.
 
@@ -111,7 +112,7 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False) ->
 
         else:
             # Normal plan generation workflow
-            jira_client = JiraClient()
+            jira_client = get_jira_client()
 
             click.echo(f"📋 Planning ticket: {ticket_id}")
             click.echo(f"🏗️  Project: {project}")
@@ -730,7 +731,7 @@ def info(ticket_id: str) -> None:
         click.echo(f"🔍 Fetching ticket: {ticket_id}\n")
 
         # Initialize Jira client
-        jira_client = JiraClient()
+        jira_client = get_jira_client()
 
         # Fetch ticket
         ticket_data = jira_client.get_ticket(ticket_id)
@@ -802,12 +803,15 @@ def validate() -> None:
         # Test Jira
         click.echo("1️⃣  Testing Jira API...")
         try:
-            jira_client = JiraClient()
-            # Test by fetching current user
-            response = jira_client.session.get(f"{jira_client.base_url}/rest/api/3/myself")
+            jira_client = get_jira_client()
+            # Test by fetching current user - use correct API version
+            from src.jira_server_client import JiraServerClient
+            api_version = "2" if isinstance(jira_client, JiraServerClient) else "3"
+            response = jira_client.session.get(f"{jira_client.base_url}/rest/api/{api_version}/myself")
             response.raise_for_status()
             user_data = response.json()
             click.echo(f"   ✅ Jira connected: {user_data.get('displayName', 'Unknown')}")
+            click.echo(f"      URL: {jira_client.base_url}")
             click.echo(f"      Email: {user_data.get('emailAddress', 'N/A')}")
         except ValueError as e:
             click.echo(f"   ❌ Jira configuration error: {e}")
