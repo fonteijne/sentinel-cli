@@ -790,7 +790,7 @@ def validate() -> None:
     - LLM provider (custom proxy, direct API, or Claude Code subscription)
     """
     try:
-        click.echo("🔐 Validating API Credentials\n")
+        click.echo(f"🔐 Validating API Credentials (Sentinel v{version('sentinel')})\n")
 
         all_valid = True
         # Track which services failed for targeted fix instructions
@@ -832,6 +832,7 @@ def validate() -> None:
             response.raise_for_status()
             user_data = response.json()
             click.echo(f"   ✅ GitLab connected: {user_data.get('name', 'Unknown')}")
+            click.echo(f"      URL: {gitlab_client.base_url}")
             click.echo(f"      Username: @{user_data.get('username', 'N/A')}")
         except ValueError as e:
             click.echo(f"   ❌ GitLab configuration error: {e}")
