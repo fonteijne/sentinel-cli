@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from src.agents.base_agent import PlanningAgent
-from src.jira_client import JiraClient
+from src.jira_factory import get_jira_client
 from src.gitlab_client import GitLabClient
 from src.config_loader import get_config
 from src.utils.adf_parser import parse_adf_to_text
@@ -31,7 +31,7 @@ class PlanGeneratorAgent(PlanningAgent):
             temperature=0.3,
         )
 
-        self.jira = JiraClient()
+        self.jira = get_jira_client()
         self.gitlab = GitLabClient()
         self.config = get_config()
 

@@ -64,7 +64,7 @@ def mock_prompt():
 @pytest.fixture
 def mock_jira():
     """Mock Jira client."""
-    with patch("src.agents.plan_generator.JiraClient") as mock_class:
+    with patch("src.agents.plan_generator.get_jira_client") as mock_factory:
         client = Mock()
         client.base_url = "https://test.atlassian.net"
         client.get_ticket.return_value = {
@@ -75,8 +75,8 @@ def mock_jira():
             "status": "To Do",
         }
         client.add_comment.return_value = {"id": "12345"}
-        mock_class.return_value = client
-        yield mock_class
+        mock_factory.return_value = client
+        yield mock_factory
 
 
 @pytest.fixture
