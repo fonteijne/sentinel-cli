@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from src.agents.base_agent import PlanningAgent
+from src.attachment_manager import AttachmentManager
 from src.jira_factory import get_jira_client
 from src.gitlab_client import GitLabClient
 from src.config_loader import get_config
@@ -56,6 +57,26 @@ class PlanGeneratorAgent(PlanningAgent):
         # Fetch ticket data
         ticket_data = self.jira.get_ticket(ticket_id)
 
+        # Download attachments if worktree is available
+        attachment_mgr = AttachmentManager()
+        attachments_data = None
+        attachment_context = ""
+        attachments_metadata = ticket_data.get("attachments", [])
+
+        if worktree_path and attachments_metadata:
+            attachments_data = attachment_mgr.download_attachments(
+                self.jira.session, attachments_metadata, ticket_id, worktree_path,
+                base_url=self.jira.base_url,
+            )
+            attachment_context = attachment_mgr.format_for_prompt(attachments_data)
+            logger.info(
+                f"Attachments: {len(attachments_data.get('text_attachments', []))} text, "
+                f"{len(attachments_data.get('image_attachments', []))} images, "
+                f"{len(attachments_data.get('skipped', []))} skipped"
+            )
+        elif attachments_metadata:
+            attachment_context = attachment_mgr.format_metadata_only(attachments_metadata)
+
         # Extract and parse description
         description_raw = ticket_data.get("description", "")
         if isinstance(description_raw, dict):
@@ -84,7 +105,7 @@ class PlanGeneratorAgent(PlanningAgent):
 
 **Description**:
 {description}
-
+{attachment_context}
 **OUTPUT FORMAT** (return ONLY this JSON, no other text):
 ```json
 {{
@@ -125,6 +146,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
                 "technical_approach": ai_analysis.get("technical_approach", "TDD implementation"),
                 "risks": ai_analysis.get("risks", []),
                 "estimated_complexity": ai_analysis.get("estimated_complexity", "medium"),
+                "attachments_data": attachments_data,
             }
 
             logger.info(f"Ticket analysis complete: {len(analysis['requirements'])} requirements")
@@ -274,6 +296,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         technical_approach = context.get("technical_approach", "TDD")
         risks = context.get("risks", [])
         complexity = context.get("estimated_complexity", "medium")
+        attachments_data = context.get("attachments_data")
 
         # Build plan generation prompt
         requirements_text = chr(10).join(f"  - {req}" for req in requirements) if requirements else "  - No specific requirements provided"
@@ -305,7 +328,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
 {risks_text}
 
 **Estimated Complexity**: {complexity}
-
+{AttachmentManager().format_for_prompt(attachments_data) if attachments_data else ""}
 ## OUTPUT FILE PATH
 
 Use the Write tool to save the implementation plan to: `{plan_file_path}`

@@ -452,6 +452,18 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
             project_key = ticket_id.split("-")[0]
             self.set_project(project_key)
 
+        # Check for attachments context
+        attach_dir = worktree_path / ".agents" / "attachments" / ticket_id
+        attachment_context = ""
+        if attach_dir.exists():
+            files = list(attach_dir.iterdir())
+            if files:
+                attachment_context = (
+                    "\n\nNote: This ticket has attachments available at "
+                    f"`{attach_dir}`. Use the Read tool to view them if needed."
+                )
+                logger.info(f"Found {len(files)} attachments for {ticket_id}")
+
         # Break down plan into tasks
         tasks = self.break_down_plan(plan_file)
 
@@ -472,7 +484,8 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         results = []
         for task in tasks:
             try:
-                impl_result = self.implement_feature(task, {}, worktree_path)
+                task_with_context = task + attachment_context if attachment_context else task
+                impl_result = self.implement_feature(task_with_context, {}, worktree_path)
 
                 # Commit the changes if implementation was successful
                 if impl_result.get("success"):

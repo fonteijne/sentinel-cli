@@ -57,7 +57,7 @@ class JiraServerClient:
         """
         url = f"{self.base_url}/rest/api/2/issue/{ticket_id}"
         params = {
-            "fields": "summary,description,status,priority,assignee,created,updated,comment"
+            "fields": "summary,description,status,priority,assignee,created,updated,comment,attachment"
         }
 
         response = self.session.get(url, params=params)
@@ -80,6 +80,7 @@ class JiraServerClient:
             "assignee": fields.get("assignee", {}).get("displayName") if fields.get("assignee") else None,
             "created": fields.get("created", ""),
             "updated": fields.get("updated", ""),
+            "attachments": fields.get("attachment", []),
             "raw": data,
         }
 
