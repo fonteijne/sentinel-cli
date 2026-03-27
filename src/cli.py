@@ -718,11 +718,19 @@ def status(project: Optional[str] = None) -> None:
 
 @cli.command()
 @click.argument("ticket_id")
-def info(ticket_id: str) -> None:
+@click.option("--attachment", "-a", default=None,
+              help='Show attachment content. Use filename or "all" for all text attachments.')
+def info(ticket_id: str, attachment: str | None) -> None:
     """Display information about a Jira ticket.
 
     Fetches and displays the summary and description of a Jira ticket
     to validate connectivity and ticket details.
+
+    Use --attachment to view file contents:
+
+      sentinel info ACME-123 --attachment spec.md
+
+      sentinel info ACME-123 --attachment all
 
     Args:
         ticket_id: Jira ticket ID (e.g., ACME-123)
@@ -757,6 +765,64 @@ def info(ticket_id: str) -> None:
             description = raw_description
         click.echo(description)
         click.echo("-" * 80)
+
+        # Display attachments
+        attachments = ticket_data.get('attachments', [])
+        if attachments:
+            click.echo(f"\n📎 Attachments ({len(attachments)}):")
+            for att in attachments:
+                filename = att.get('filename', 'unknown')
+                size = att.get('size', 0)
+                mime_type = att.get('mimeType', '')
+                size_kb = size / 1024
+                if size_kb >= 1024:
+                    size_str = f"{size_kb / 1024:.1f} MB"
+                else:
+                    size_str = f"{size_kb:.1f} KB"
+                click.echo(f"   - {filename} ({size_str}, {mime_type})")
+
+        # Show attachment content if requested
+        if attachment and attachments:
+            from src.attachment_manager import AttachmentManager
+            import tempfile
+
+            mgr = AttachmentManager()
+
+            # Find matching attachments
+            if attachment.lower() == "all":
+                targets = [a for a in attachments if mgr.classify(a.get("filename", ""), a.get("mimeType", "")) == "text"]
+                if not targets:
+                    click.echo("\n⚠️  No text attachments found.")
+            else:
+                targets = [a for a in attachments if a.get("filename") == attachment]
+                if not targets:
+                    click.echo(f"\n❌ Attachment '{attachment}' not found.", err=True)
+                    available = [a.get("filename") for a in attachments]
+                    click.echo(f"   Available: {', '.join(available)}", err=True)
+                    sys.exit(1)
+
+            # Download to temp dir, display, then clean up
+            with tempfile.TemporaryDirectory(prefix="sentinel-att-") as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                att_data = mgr.download_attachments(
+                    jira_client.session, targets, ticket_id, tmp_path,
+                    base_url=jira_client.base_url,
+                )
+
+                for text_att in att_data.get("text_attachments", []):
+                    click.echo(f"\n📄 {text_att['filename']}:")
+                    click.echo("=" * 80)
+                    click.echo(text_att["content"])
+                    click.echo("=" * 80)
+
+                for img_att in att_data.get("image_attachments", []):
+                    click.echo(f"\n🖼️  {img_att['filename']}: Image file (cannot display in terminal)")
+
+                for skipped in att_data.get("skipped", []):
+                    click.echo(f"\n⚠️  {skipped['filename']}: {skipped['reason']}")
+
+        elif attachment and not attachments:
+            click.echo("\n⚠️  This ticket has no attachments.")
 
         # Display additional useful fields if available
         if ticket_data.get('labels'):

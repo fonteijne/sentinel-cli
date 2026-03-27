@@ -20,6 +20,12 @@ agents:
     temperature: 0.1
     strictness: 5
     veto_power: true
+attachments:
+  enabled: true
+  max_text_size: 102400     # 100KB per text file
+  max_image_size: 5242880   # 5MB per image
+  max_total_size: 20971520  # 20MB total
+  max_count: 20
 iteration_limits:
   max_iterations: 5
   retry_on_failure: 2

@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from src.attachment_manager import AttachmentManager
 from src.config_loader import get_config
 
 
@@ -270,6 +271,9 @@ poetry run ruff check src/
 
         if not worktree_dir.exists():
             return
+
+        # Clean up attachments before removing worktree
+        AttachmentManager.cleanup(ticket_id, worktree_dir)
 
         # Remove worktree
         subprocess.run(

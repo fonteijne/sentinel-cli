@@ -98,6 +98,27 @@ class TestGetTicket:
             assert result["assignee"] == "John Doe"
             assert result["created"] == "2024-01-01T00:00:00.000Z"
             assert result["updated"] == "2024-01-02T00:00:00.000Z"
+            assert result["attachments"] == []
+
+    def test_get_ticket_with_attachments(self, jira_client):
+        """Test that attachments are included in ticket data."""
+        attachment_data = [
+            {"id": "1", "filename": "spec.md", "size": 1024, "mimeType": "text/markdown",
+             "content": "https://example.com/attachments/spec.md"},
+        ]
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "key": "ACME-123",
+            "fields": {
+                "summary": "Test",
+                "status": {"name": "Open"},
+                "attachment": attachment_data,
+            }
+        }
+
+        with patch.object(jira_client.session, "get", return_value=mock_response):
+            result = jira_client.get_ticket("ACME-123")
+            assert result["attachments"] == attachment_data
 
     def test_get_ticket_no_assignee(self, jira_client):
         """Test fetching a ticket with no assignee."""

@@ -102,9 +102,31 @@ class TestGetTicket:
             assert result["priority"] == "High"
             assert result["assignee"] == "John Doe"
 
+            assert result["attachments"] == []
+
             # Verify API v2 endpoint
             call_url = mock_get.call_args[0][0]
             assert "/rest/api/2/" in call_url
+
+    def test_get_ticket_with_attachments(self, jira_server_client):
+        """Test that attachments are included in ticket data."""
+        attachment_data = [
+            {"id": "1", "filename": "spec.txt", "size": 512, "mimeType": "text/plain",
+             "content": "https://jira.mycompany.com/attachments/spec.txt"},
+        ]
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "key": "ACME-123",
+            "fields": {
+                "summary": "Test",
+                "status": {"name": "Open"},
+                "attachment": attachment_data,
+            }
+        }
+
+        with patch.object(jira_server_client.session, "get", return_value=mock_response):
+            result = jira_server_client.get_ticket("ACME-123")
+            assert result["attachments"] == attachment_data
 
     def test_get_ticket_no_assignee(self, jira_server_client):
         """Test fetching a ticket with no assignee."""
