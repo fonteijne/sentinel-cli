@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Optional
 
 import click
-from importlib.metadata import version
 
 
 from src.config_loader import get_config
@@ -31,8 +30,25 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_version() -> str:
+    """Read version from pyproject.toml (hot-reload friendly).
+
+    Falls back to installed package metadata if pyproject.toml isn't available.
+    """
+    try:
+        pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        if pyproject_path.exists():
+            for line in pyproject_path.read_text().splitlines():
+                if line.startswith("version"):
+                    return line.split('"')[1]
+    except Exception:
+        pass
+    from importlib.metadata import version
+    return version("sentinel")
+
+
 @click.group()
-@click.version_option(version=version("sentinel"))
+@click.version_option(version=_get_version())
 def cli() -> None:
     """Sentinel - Autonomous agent orchestration for Jira tickets.
 
@@ -894,7 +910,7 @@ def validate() -> None:
     - LLM provider (custom proxy, direct API, or Claude Code subscription)
     """
     try:
-        click.echo(f"🔐 Validating API Credentials (Sentinel v{version('sentinel')})\n")
+        click.echo(f"🔐 Validating API Credentials (Sentinel v{_get_version()})\n")
 
         all_valid = True
         # Track which services failed for targeted fix instructions
