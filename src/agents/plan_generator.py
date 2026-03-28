@@ -12,6 +12,7 @@ from src.attachment_manager import AttachmentManager
 from src.jira_factory import get_jira_client
 from src.gitlab_client import GitLabClient
 from src.config_loader import get_config
+from src.worktree_manager import get_branch_name
 from src.utils.adf_parser import parse_adf_to_text
 
 
@@ -644,7 +645,7 @@ Comment: {body}
             )
 
             # Push to remote
-            branch_name = f"feature/{ticket_id}"
+            branch_name = get_branch_name(ticket_id)
             subprocess.run(
                 ["git", "push", "-u", "origin", branch_name],
                 cwd=worktree_path,
@@ -716,7 +717,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
 """
 
         # Create draft MR
-        source_branch = f"feature/{ticket_id}"
+        source_branch = get_branch_name(ticket_id)
         target_branch = project_config.get("default_branch", "main")
 
         mr_data = self.gitlab.create_merge_request(
@@ -761,7 +762,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
             - MR URL: URL of the merge request
             - was_created: True if a new MR was created, False if existing
         """
-        source_branch = f"feature/{ticket_id}"
+        source_branch = get_branch_name(ticket_id)
 
         # Get project config
         project_config = self.config.get_project_config(project_key)
@@ -915,7 +916,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         else:
             project_path = f"{project_key.lower()}/backend"
 
-        source_branch = f"feature/{ticket_id}"
+        source_branch = get_branch_name(ticket_id)
         mrs = self.gitlab.list_merge_requests(
             project_id=project_path,
             source_branch=source_branch,

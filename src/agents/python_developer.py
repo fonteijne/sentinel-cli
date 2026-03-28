@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 from src.agents.base_agent import ImplementationAgent
 from src.beads_manager import BeadsManager
+from src.worktree_manager import get_branch_name
 
 
 logger = logging.getLogger(__name__)
@@ -565,7 +566,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         else:
             project_path = f"{project_key.lower()}/backend"
 
-        source_branch = f"feature/{ticket_id}"
+        source_branch = get_branch_name(ticket_id)
         mrs = gitlab.list_merge_requests(
             project_id=project_path,
             source_branch=source_branch,

@@ -7,6 +7,21 @@ from typing import Optional
 from src.attachment_manager import AttachmentManager
 from src.config_loader import get_config
 
+# Branch prefix for all Sentinel-created branches
+BRANCH_PREFIX = "sentinel/feature"
+
+
+def get_branch_name(ticket_id: str) -> str:
+    """Get the standard branch name for a ticket.
+
+    Args:
+        ticket_id: Ticket ID (e.g., "ACME-123")
+
+    Returns:
+        Branch name (e.g., "sentinel/feature/ACME-123")
+    """
+    return f"{BRANCH_PREFIX}/{ticket_id}"
+
 
 class WorktreeManager:
     """Manages git worktrees for isolated ticket development."""
@@ -124,7 +139,7 @@ class WorktreeManager:
         )
 
         # Create or checkout feature branch
-        branch_name = f"feature/{ticket_id}"
+        branch_name = get_branch_name(ticket_id)
 
         # Check if branch already exists
         result = subprocess.run(
@@ -293,7 +308,7 @@ poetry run ruff check src/
             True if branch was deleted, False if it didn't exist
         """
         bare_clone_dir = self.workspace_root / project_key.lower()
-        branch_name = f"feature/{ticket_id}"
+        branch_name = get_branch_name(ticket_id)
 
         if not bare_clone_dir.exists():
             return False

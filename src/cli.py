@@ -12,7 +12,7 @@ from importlib.metadata import version
 
 
 from src.config_loader import get_config
-from src.worktree_manager import WorktreeManager
+from src.worktree_manager import WorktreeManager, get_branch_name
 from src.environment_manager import EnvironmentManager
 from src.jira_factory import get_jira_client
 from src.beads_manager import BeadsManager
@@ -454,7 +454,7 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                             project_path = f"{project.lower()}/backend"
 
                         # Find the MR for this branch
-                        source_branch = f"feature/{ticket_id}"
+                        source_branch = get_branch_name(ticket_id)
                         mrs = gitlab.list_merge_requests(
                             project_id=project_path,
                             source_branch=source_branch,
@@ -516,7 +516,7 @@ def _reset_ticket(
     # Confirmation
     click.echo("\nThis will remove:")
     click.echo(f"  • Worktree for {ticket_id}")
-    click.echo(f"  • Local branch feature/{ticket_id}")
+    click.echo(f"  • Local branch {get_branch_name(ticket_id)}")
     click.echo("\n⚠️  Any uncommitted changes will be lost!")
 
     if not skip_confirm and not click.confirm("Continue?", default=False):
@@ -533,7 +533,7 @@ def _reset_ticket(
 
     click.echo("\n2️⃣  Deleting local branch...")
     if result["branch_deleted"]:
-        click.echo(f"   ✓ Branch feature/{ticket_id} deleted")
+        click.echo(f"   ✓ Branch {get_branch_name(ticket_id)} deleted")
     else:
         click.echo("   ℹ️  No local branch found")
 

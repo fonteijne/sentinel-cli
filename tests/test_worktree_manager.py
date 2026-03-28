@@ -280,7 +280,7 @@ class TestCreateWorktree:
             checkout_call = mock_run.call_args_list[2][0][0]
             assert "git" in checkout_call
             assert "checkout" in checkout_call
-            assert "feature/ACME-123" in checkout_call
+            assert "sentinel/feature/ACME-123" in checkout_call
             assert "-b" not in checkout_call
 
     @patch("subprocess.run")
@@ -310,7 +310,7 @@ class TestCreateWorktree:
             assert "git" in checkout_call
             assert "checkout" in checkout_call
             assert "-b" in checkout_call
-            assert "feature/ACME-123" in checkout_call
+            assert "sentinel/feature/ACME-123" in checkout_call
 
 
 class TestCleanupWorktree:
@@ -633,7 +633,7 @@ class TestDeleteLocalBranch:
         assert result is True
         assert mock_run.call_count == 2
         mock_run.assert_any_call(
-            ["git", "branch", "-D", "feature/ACME-123"],
+            ["git", "branch", "-D", "sentinel/feature/ACME-123"],
             cwd=temp_workspace / "acme",
             check=True,
         )
