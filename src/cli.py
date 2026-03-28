@@ -13,6 +13,7 @@ from importlib.metadata import version
 
 from src.config_loader import get_config
 from src.worktree_manager import WorktreeManager
+from src.environment_manager import EnvironmentManager
 from src.jira_factory import get_jira_client
 from src.beads_manager import BeadsManager
 from src.session_tracker import SessionTracker
@@ -183,7 +184,12 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False) ->
     is_flag=True,
     help="Revise existing implementation based on MR feedback",
 )
-def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False) -> None:
+@click.option(
+    "--no-env",
+    is_flag=True,
+    help="Skip container environment setup (for Python-only projects or debugging).",
+)
+def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False, no_env: bool = False) -> None:
     """Execute implementation plan for a Jira ticket.
 
     Reads the plan, implements features using TDD, and iterates with security review
@@ -306,156 +312,188 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         click.echo(f"🏗️  Project: {project}")
         click.echo(f"🔄 Max iterations: {max_iterations}")
 
-        # Initialize Python project structure in worktree
-        click.echo("\n1️⃣  Initializing worktree...")
-        project_name = ticket_id.lower().replace("-", "_")
-        worktree_mgr.initialize_python_project(worktree_path, project_name)
-        click.echo("   ✓ Python project structure initialized")
+        # Initialize container environment (auto-detects from project contents)
+        env_mgr = EnvironmentManager()
+        env_info = None
 
-        # Initialize beads for coordination
-        click.echo("\n2️⃣  Initializing task tracking...")
-        beads_mgr.init_project(ticket_id, str(worktree_path))
-        click.echo("   ✓ Beads initialized")
-
-        # Find plan file
-        plan_file = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
-        if not plan_file.exists():
-            click.echo(f"\n❌ Plan file not found: {plan_file}", err=True)
-            click.echo("   Run 'sentinel plan' first to generate the plan")
-            sys.exit(1)
-
-        # Execute implementation with developer and security review loop
-        click.echo("\n3️⃣  Executing implementation...")
-        developer = PythonDeveloperAgent()
-        security = SecurityReviewerAgent()
-
-        for iteration in range(1, max_iterations + 1):
-            click.echo(f"\n   Iteration {iteration}/{max_iterations}")
-
-            # Developer implements features
-            click.echo("   🔨 Developer: Implementing features...")
-            dev_result = developer.run(plan_file=plan_file, worktree_path=worktree_path)
-            click.echo(f"      ✓ {dev_result['tasks_completed']} tasks completed")
-            if dev_result['tasks_failed'] > 0:
-                click.echo(f"      ⚠ {dev_result['tasks_failed']} tasks failed")
-
-            # Security reviews the implementation
-            click.echo("   🔒 Security: Reviewing code...")
-            sec_result = security.run(worktree_path=worktree_path, ticket_id=ticket_id)
-
-            if sec_result["approved"]:
-                click.echo("      ✅ Security review PASSED")
-                break
-            else:
-                issues_count = len(sec_result.get("findings", []))
-                click.echo(f"      ⚠️  Found {issues_count} security issues")
-
-                # Create beads tasks for security findings (for next iteration)
-                if iteration < max_iterations:
-                    click.echo("      📝 Creating fix tasks for security findings...")
-                    for finding in sec_result.get("findings", []):
-                        try:
-                            task_title = f"Fix {finding['severity'].upper()} - {finding['category']}: {finding['file']}:{finding['line']}"
-                            task_description = f"{finding['description']}\n\nRecommendation: {finding['recommendation']}"
-
-                            beads_mgr.create_task(
-                                title=task_title[:100],  # Limit title length
-                                task_type="bug",
-                                priority=0 if finding['severity'] == 'critical' else 1,  # P0 for critical, P1 for high
-                                description=task_description,
-                                working_dir=str(worktree_path),
-                            )
-                        except Exception as e:
-                            logger.warning(f"Could not create beads task for finding: {e}")
-
-                    click.echo(f"      ✓ Created {issues_count} fix tasks")
-                    click.echo("      ↻  Developer will address feedback...")
+        if no_env:
+            click.echo("\n1️⃣  Skipping container environment (--no-env)")
+        else:
+            click.echo("\n1️⃣  Setting up environment...")
+            try:
+                env_info = env_mgr.setup(worktree_path, ticket_id)
+                if env_info.active:
+                    click.echo(f"   ✓ Container environment started: {', '.join(env_info.services)}")
+                    if env_info.tooling:
+                        click.echo(f"   ✓ Available tooling: {', '.join(env_info.tooling.keys())}")
                 else:
-                    click.echo("\n❌ Max iterations reached without approval", err=True)
-                    click.echo("   Manual review required. Check security findings.")
-                    sys.exit(1)
+                    click.echo("   ✓ No container environment needed")
+            except RuntimeError as e:
+                click.echo(f"   ⚠️  Container setup failed: {e}", err=True)
+                click.echo("   Continuing without container environment...")
+                env_info = None
 
-        # Push changes to remote
-        click.echo("\n4️⃣  Pushing changes to remote...")
         try:
-            import subprocess
+            # Initialize project structure in worktree (for Python projects without containers)
+            if not env_info or not env_info.active:
+                click.echo("\n   Initializing worktree...")
+                project_name = ticket_id.lower().replace("-", "_")
+                worktree_mgr.initialize_python_project(worktree_path, project_name)
+                click.echo("   ✓ Python project structure initialized")
 
-            # Get current branch name
-            branch_result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            branch_name = branch_result.stdout.strip()
+            # Initialize beads for coordination
+            click.echo("\n2️⃣  Initializing task tracking...")
+            beads_mgr.init_project(ticket_id, str(worktree_path))
+            click.echo("   ✓ Beads initialized")
 
-            # Build push command
-            push_cmd = ["git", "push", "-u", "origin", branch_name]
-            if force:
-                push_cmd.insert(2, "--force")
-                click.echo("   ⚠️  Force-pushing (may overwrite remote commits)")
+            # Find plan file
+            plan_file = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
+            if not plan_file.exists():
+                click.echo(f"\n❌ Plan file not found: {plan_file}", err=True)
+                click.echo("   Run 'sentinel plan' first to generate the plan")
+                sys.exit(1)
 
-            # Attempt push
-            push_result = subprocess.run(
-                push_cmd,
-                cwd=worktree_path,
-                capture_output=True,
-                text=True,
-            )
+            # Execute implementation with developer and security review loop
+            click.echo("\n3️⃣  Executing implementation...")
+            developer = PythonDeveloperAgent()
+            security = SecurityReviewerAgent()
 
-            if push_result.returncode == 0:
-                click.echo(f"   ✓ Pushed to origin/{branch_name}")
+            for iteration in range(1, max_iterations + 1):
+                click.echo(f"\n   Iteration {iteration}/{max_iterations}")
 
-                # Mark MR as ready for review (remove draft status)
-                try:
-                    from src.gitlab_client import GitLabClient
+                # Developer implements features
+                click.echo("   🔨 Developer: Implementing features...")
+                dev_result = developer.run(plan_file=plan_file, worktree_path=worktree_path)
+                click.echo(f"      ✓ {dev_result['tasks_completed']} tasks completed")
+                if dev_result['tasks_failed'] > 0:
+                    click.echo(f"      ⚠ {dev_result['tasks_failed']} tasks failed")
 
-                    gitlab = GitLabClient()
-                    config = get_config()
-                    project_config = config.get_project_config(project)
-                    git_url = project_config.get("git_url", "")
+                # Security reviews the implementation
+                click.echo("   🔒 Security: Reviewing code...")
+                sec_result = security.run(worktree_path=worktree_path, ticket_id=ticket_id)
 
-                    # Extract project path from git URL
-                    if git_url.startswith("git@"):
-                        project_path = git_url.split(":")[1].replace(".git", "")
-                    elif git_url.startswith("https://"):
-                        project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
-                    else:
-                        project_path = f"{project.lower()}/backend"
-
-                    # Find the MR for this branch
-                    source_branch = f"feature/{ticket_id}"
-                    mrs = gitlab.list_merge_requests(
-                        project_id=project_path,
-                        source_branch=source_branch,
-                    )
-
-                    if mrs:
-                        mr_iid = mrs[0]["iid"]
-                        gitlab.mark_as_ready(project_id=project_path, mr_iid=mr_iid)
-                        click.echo("   ✓ MR marked as ready for review")
-
-                except Exception as e:
-                    logger.warning(f"Failed to mark MR as ready: {e}")
-                    # Non-fatal - just log and continue
-
-            else:
-                error_output = push_result.stderr
-                if "non-fast-forward" in error_output or "rejected" in error_output:
-                    click.echo("   ⚠️  Push rejected: remote branch has diverged")
-                    click.echo("   💡 Use --force flag to force-push and overwrite remote")
-                    click.echo(f"      Example: sentinel execute {ticket_id} --force")
+                if sec_result["approved"]:
+                    click.echo("      ✅ Security review PASSED")
+                    break
                 else:
-                    click.echo(f"   ⚠️  Push failed: {error_output}")
+                    issues_count = len(sec_result.get("findings", []))
+                    click.echo(f"      ⚠️  Found {issues_count} security issues")
 
-        except Exception as e:
-            logger.warning(f"Failed to push changes: {e}")
-            click.echo(f"   ⚠️  Push failed: {e}")
-            click.echo("   💡 You may need to push manually from the worktree")
+                    # Create beads tasks for security findings (for next iteration)
+                    if iteration < max_iterations:
+                        click.echo("      📝 Creating fix tasks for security findings...")
+                        for finding in sec_result.get("findings", []):
+                            try:
+                                task_title = f"Fix {finding['severity'].upper()} - {finding['category']}: {finding['file']}:{finding['line']}"
+                                task_description = f"{finding['description']}\n\nRecommendation: {finding['recommendation']}"
 
-        click.echo(f"\n✅ Execute workflow complete for {ticket_id}")
-        click.echo("   Code is ready for human review in the MR")
+                                beads_mgr.create_task(
+                                    title=task_title[:100],  # Limit title length
+                                    task_type="bug",
+                                    priority=0 if finding['severity'] == 'critical' else 1,  # P0 for critical, P1 for high
+                                    description=task_description,
+                                    working_dir=str(worktree_path),
+                                )
+                            except Exception as e:
+                                logger.warning(f"Could not create beads task for finding: {e}")
+
+                        click.echo(f"      ✓ Created {issues_count} fix tasks")
+                        click.echo("      ↻  Developer will address feedback...")
+                    else:
+                        click.echo("\n❌ Max iterations reached without approval", err=True)
+                        click.echo("   Manual review required. Check security findings.")
+                        sys.exit(1)
+
+            # Push changes to remote
+            click.echo("\n4️⃣  Pushing changes to remote...")
+            try:
+                import subprocess
+
+                # Get current branch name
+                branch_result = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                branch_name = branch_result.stdout.strip()
+
+                # Build push command
+                push_cmd = ["git", "push", "-u", "origin", branch_name]
+                if force:
+                    push_cmd.insert(2, "--force")
+                    click.echo("   ⚠️  Force-pushing (may overwrite remote commits)")
+
+                # Attempt push
+                push_result = subprocess.run(
+                    push_cmd,
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                )
+
+                if push_result.returncode == 0:
+                    click.echo(f"   ✓ Pushed to origin/{branch_name}")
+
+                    # Mark MR as ready for review (remove draft status)
+                    try:
+                        from src.gitlab_client import GitLabClient
+
+                        gitlab = GitLabClient()
+                        config = get_config()
+                        project_config = config.get_project_config(project)
+                        git_url = project_config.get("git_url", "")
+
+                        # Extract project path from git URL
+                        if git_url.startswith("git@"):
+                            project_path = git_url.split(":")[1].replace(".git", "")
+                        elif git_url.startswith("https://"):
+                            project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
+                        else:
+                            project_path = f"{project.lower()}/backend"
+
+                        # Find the MR for this branch
+                        source_branch = f"feature/{ticket_id}"
+                        mrs = gitlab.list_merge_requests(
+                            project_id=project_path,
+                            source_branch=source_branch,
+                        )
+
+                        if mrs:
+                            mr_iid = mrs[0]["iid"]
+                            gitlab.mark_as_ready(project_id=project_path, mr_iid=mr_iid)
+                            click.echo("   ✓ MR marked as ready for review")
+
+                    except Exception as e:
+                        logger.warning(f"Failed to mark MR as ready: {e}")
+                        # Non-fatal - just log and continue
+
+                else:
+                    error_output = push_result.stderr
+                    if "non-fast-forward" in error_output or "rejected" in error_output:
+                        click.echo("   ⚠️  Push rejected: remote branch has diverged")
+                        click.echo("   💡 Use --force flag to force-push and overwrite remote")
+                        click.echo(f"      Example: sentinel execute {ticket_id} --force")
+                    else:
+                        click.echo(f"   ⚠️  Push failed: {error_output}")
+
+            except Exception as e:
+                logger.warning(f"Failed to push changes: {e}")
+                click.echo(f"   ⚠️  Push failed: {e}")
+                click.echo("   💡 You may need to push manually from the worktree")
+
+            click.echo(f"\n✅ Execute workflow complete for {ticket_id}")
+            click.echo("   Code is ready for human review in the MR")
+
+        finally:
+            # Always clean up container environment
+            if env_info and env_info.active:
+                click.echo("\n🧹 Cleaning up container environment...")
+                if env_mgr.teardown(ticket_id):
+                    click.echo("   ✓ Containers stopped and removed")
+                else:
+                    click.echo("   ⚠️  Container cleanup may be incomplete")
 
     except Exception as e:
         logger.error(f"Execute command failed: {e}", exc_info=True)

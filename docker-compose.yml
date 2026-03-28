@@ -8,6 +8,12 @@ services:
     volumes:
       # Mount workspace directory for persistent workspaces
       - sentinel-workspaces:/workspaces
+      # Shared volume for project code — child containers mount this same volume
+      # to access worktree code (solves the DooD volume path problem)
+      - sentinel-projects:/workspace/projects
+      # Docker socket mount — DooD (Docker-out-of-Docker)
+      # Allows Sentinel to start sibling containers via the host Docker daemon
+      - /var/run/docker.sock:/var/run/docker.sock
       # Mount config for runtime configuration changes (read-only)
       - ./config:/app/config:ro
       # Mount .env.local as writable for sentinel auth configure
@@ -17,6 +23,8 @@ services:
     environment:
       # Workspace root (container path)
       - WORKSPACE_ROOT=/workspaces
+      # Docker host for DooD
+      - DOCKER_HOST=unix:///var/run/docker.sock
       # Note: Jira, GitLab, and LLM credentials are loaded from
       # the mounted config/.env file by the application
     # Interactive mode for CLI usage
@@ -39,12 +47,15 @@ services:
       # Mount source code for live development
       - .:/app
       - sentinel-workspaces:/workspaces
+      - sentinel-projects:/workspace/projects
+      - /var/run/docker.sock:/var/run/docker.sock
       # Mount .env.local as writable for sentinel auth configure
       - ./config/.env.local:/app/config/.env.local:rw
       # Uncomment below if using Claude Code subscription mode (not API key):
       # - ~/.claude:/root/.claude:ro
     environment:
       - WORKSPACE_ROOT=/workspaces
+      - DOCKER_HOST=unix:///var/run/docker.sock
     stdin_open: true
     tty: true
     entrypoint: []
@@ -55,4 +66,6 @@ services:
 
 volumes:
   sentinel-workspaces:
+    driver: local
+  sentinel-projects:
     driver: local

@@ -50,6 +50,17 @@ agent_sdk:
   - Grep
   - Glob
   - Bash
+environment:
+  # Container runtime: "dood" (Phase 1) or "sysbox" (Phase 2, future)
+  runtime: dood
+  # Timeout in seconds waiting for services to become healthy
+  health_timeout: 120
+  # Auto-detect .lando.yml and start container environment
+  auto_detect: true
+  # Cleanup containers after execute completes
+  auto_cleanup: true
+  # Named volume shared between Sentinel and child containers
+  volume_name: sentinel-projects
 logging:
   level: INFO
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

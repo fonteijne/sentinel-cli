@@ -236,6 +236,24 @@ class ConfigLoader:
 
         return {}
 
+    def get_environment_config(self) -> Dict[str, Any]:
+        """Get environment (container orchestration) configuration with defaults.
+
+        Returns:
+            Dictionary with environment config
+        """
+        defaults = {
+            "runtime": "dood",
+            "health_timeout": 120,
+            "auto_detect": True,
+            "auto_cleanup": True,
+            "volume_name": "sentinel-projects",
+        }
+        env_config = self.get("environment", {})
+        if isinstance(env_config, dict):
+            defaults.update(env_config)
+        return defaults
+
     def get_all_projects(self) -> Dict[str, Any]:
         """Get all configured projects.
 
