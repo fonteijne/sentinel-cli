@@ -683,16 +683,7 @@ Comment: {body}
         git_url = project_config.get("git_url", "")
 
         # Extract project path from git URL
-        # git@gitlab.com:acme/backend.git -> acme/backend
-        # https://gitlab.com/acme/backend.git -> acme/backend
-        if git_url.startswith("git@"):
-            # SSH URL: git@gitlab.com:acme/backend.git
-            project_path = git_url.split(":")[1].replace(".git", "")
-        elif git_url.startswith("https://"):
-            # HTTPS URL: https://gitlab.com/acme/backend.git
-            project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
-        else:
-            project_path = f"{project_key.lower()}/backend"
+        project_path = self.gitlab.extract_project_path(git_url)
 
         # Read plan content
         plan_content = plan_path.read_text()
@@ -769,16 +760,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         git_url = project_config.get("git_url", "")
 
         # Extract project path from git URL
-        # git@gitlab.com:acme/backend.git -> acme/backend
-        # https://gitlab.com/acme/backend.git -> acme/backend
-        if git_url.startswith("git@"):
-            # SSH URL: git@gitlab.com:acme/backend.git
-            project_path = git_url.split(":")[1].replace(".git", "")
-        elif git_url.startswith("https://"):
-            # HTTPS URL: https://gitlab.com/acme/backend.git
-            project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
-        else:
-            project_path = f"{project_key.lower()}/backend"
+        project_path = self.gitlab.extract_project_path(git_url)
 
         try:
             # Try to create a new MR
@@ -905,16 +887,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         git_url = project_config.get("git_url", "")
 
         # Extract project path from git URL
-        # git@gitlab.com:acme/backend.git -> acme/backend
-        # https://gitlab.com/acme/backend.git -> acme/backend
-        if git_url.startswith("git@"):
-            # SSH URL: git@gitlab.com:acme/backend.git
-            project_path = git_url.split(":")[1].replace(".git", "")
-        elif git_url.startswith("https://"):
-            # HTTPS URL: https://gitlab.com/acme/backend.git
-            project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
-        else:
-            project_path = f"{project_key.lower()}/backend"
+        project_path = self.gitlab.extract_project_path(git_url)
 
         source_branch = get_branch_name(ticket_id)
         mrs = self.gitlab.list_merge_requests(

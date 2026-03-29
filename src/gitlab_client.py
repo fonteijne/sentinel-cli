@@ -10,6 +10,33 @@ from src.config_loader import get_config
 class GitLabClient:
     """Client for interacting with GitLab API."""
 
+    @staticmethod
+    def extract_project_path(git_url: str) -> str:
+        """Extract GitLab project path from a git URL.
+
+        Handles both SSH and HTTPS URLs for any GitLab hostname.
+
+        Args:
+            git_url: Git URL (SSH or HTTPS format)
+
+        Returns:
+            Project path (e.g., "acme/backend")
+
+        Raises:
+            ValueError: If URL format is not recognized
+        """
+        if git_url.startswith("git@"):
+            # SSH: git@gitlab.example.com:acme/backend.git
+            return git_url.split(":", 1)[1].replace(".git", "")
+        elif git_url.startswith("https://"):
+            # HTTPS: https://gitlab.example.com/acme/backend.git
+            # Strip scheme + host, take everything after first /
+            from urllib.parse import urlparse
+            parsed = urlparse(git_url)
+            return parsed.path.lstrip("/").replace(".git", "")
+        else:
+            raise ValueError(f"Unrecognized git URL format: {git_url}")
+
     def __init__(self) -> None:
         """Initialize GitLab client."""
         self.config = get_config()

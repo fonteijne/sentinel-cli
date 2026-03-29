@@ -462,12 +462,7 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                         git_url = project_config.get("git_url", "")
 
                         # Extract project path from git URL
-                        if git_url.startswith("git@"):
-                            project_path = git_url.split(":")[1].replace(".git", "")
-                        elif git_url.startswith("https://"):
-                            project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
-                        else:
-                            project_path = f"{project.lower()}/backend"
+                        project_path = GitLabClient.extract_project_path(git_url)
 
                         # Find the MR for this branch
                         source_branch = get_branch_name(ticket_id)
@@ -908,6 +903,8 @@ def validate() -> None:
     - Jira API
     - GitLab API
     - LLM provider (custom proxy, direct API, or Claude Code subscription)
+    - Git SSH (for clone/push via SSH)
+    - Beads CLI
     """
     try:
         click.echo(f"🔐 Validating API Credentials (Sentinel v{_get_version()})\n")
@@ -1055,8 +1052,54 @@ def validate() -> None:
             all_valid = False
             llm_failed = True
 
+        # Test Git SSH connectivity
+        click.echo("\n4️⃣  Testing Git SSH...")
+        ssh_failed = False
+        try:
+            from urllib.parse import urlparse
+            from src.config_loader import get_config as _get_config
+            cfg = _get_config()
+            gitlab_cfg = cfg.get_gitlab_config()
+            gitlab_host = urlparse(gitlab_cfg["base_url"]).hostname or "unknown"
+
+            import subprocess as _sp
+            result = _sp.run(
+                ["ssh", "-T", "-o", "ConnectTimeout=10", f"git@{gitlab_host}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            # GitLab ssh -T returns exit code 0 with "Welcome to GitLab, @user!"
+            combined = (result.stdout + result.stderr).strip()
+            if "Welcome to GitLab" in combined:
+                click.echo(f"   ✅ SSH connected to {gitlab_host}")
+                # Extract username from welcome message
+                import re
+                match = re.search(r"@([\w.-]+)", combined)
+                if match:
+                    click.echo(f"      User: @{match.group(1)}")
+            elif result.returncode == 0:
+                click.echo(f"   ✅ SSH reachable: {gitlab_host}")
+            else:
+                click.echo(f"   ❌ SSH to {gitlab_host} failed")
+                click.echo(f"      {combined[:200]}")
+                all_valid = False
+                ssh_failed = True
+        except FileNotFoundError:
+            click.echo("   ❌ ssh not found — install openssh-client")
+            all_valid = False
+            ssh_failed = True
+        except _sp.TimeoutExpired:
+            click.echo(f"   ❌ SSH connection to {gitlab_host} timed out")
+            all_valid = False
+            ssh_failed = True
+        except Exception as e:
+            click.echo(f"   ❌ SSH test error: {e}")
+            all_valid = False
+            ssh_failed = True
+
         # Test Beads
-        click.echo("\n4️⃣  Testing Beads CLI...")
+        click.echo("\n5️⃣  Testing Beads CLI...")
         import subprocess as sp
         try:
             beads_mgr = BeadsManager()
@@ -1107,6 +1150,11 @@ def validate() -> None:
                     click.echo(f"{step}. Add Jira credentials (JIRA_API_TOKEN, JIRA_EMAIL, JIRA_BASE_URL) to sentinel/config/.env")
                 else:
                     click.echo(f"{step}. Add GitLab credentials (GITLAB_API_TOKEN) to sentinel/config/.env")
+                step += 1
+
+            # SSH instructions
+            if ssh_failed:
+                click.echo(f"{step}. Mount SSH keys: add '~/.ssh:/root/.ssh:ro' to docker-compose volumes")
                 step += 1
 
             # Beads instructions

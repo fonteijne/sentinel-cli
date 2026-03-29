@@ -18,6 +18,8 @@ services:
       - ./config:/app/config:ro
       # Mount .env.local as writable for sentinel auth configure
       - ./config/.env.local:/app/config/.env.local:rw
+      # Mount SSH keys for git operations over SSH (bypasses HTTP auth proxy)
+      - ~/.ssh:/root/.ssh:ro
       # Uncomment below if using Claude Code subscription mode (not API key):
       # - ~/.claude:/root/.claude:ro
     environment:
@@ -51,6 +53,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount .env.local as writable for sentinel auth configure
       - ./config/.env.local:/app/config/.env.local:rw
+      # Mount SSH keys for git operations over SSH (bypasses HTTP auth proxy)
+      - ~/.ssh:/root/.ssh:ro
       # Uncomment below if using Claude Code subscription mode (not API key):
       # - ~/.claude:/root/.claude:ro
     environment:

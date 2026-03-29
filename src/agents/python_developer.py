@@ -557,14 +557,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         git_url = project_config.get("git_url", "")
 
         # Extract project path from git URL
-        if git_url.startswith("git@"):
-            # SSH URL: git@gitlab.com:acme/backend.git -> acme/backend
-            project_path = git_url.split(":")[1].replace(".git", "")
-        elif git_url.startswith("https://"):
-            # HTTPS URL: https://gitlab.com/acme/backend.git -> acme/backend
-            project_path = git_url.split("gitlab.com/")[1].replace(".git", "")
-        else:
-            project_path = f"{project_key.lower()}/backend"
+        project_path = gitlab.extract_project_path(git_url)
 
         source_branch = get_branch_name(ticket_id)
         mrs = gitlab.list_merge_requests(
