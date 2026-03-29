@@ -27,9 +27,27 @@ ENV PATH="$POETRY_HOME/bin:$PATH"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
+    openssh-client \
     ca-certificates \
     gnupg \
     zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+# SSH config: accept host keys automatically for git clone over SSH
+RUN mkdir -p /root/.ssh \
+    && printf "Host *\n    StrictHostKeyChecking accept-new\n    UserKnownHostsFile /root/.ssh/known_hosts\n" \
+       > /root/.ssh/config \
+    && chmod 700 /root/.ssh \
+    && chmod 600 /root/.ssh/config
+
+# Install Docker CLI + Compose plugin (DooD — no daemon, talks to host via socket)
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+       > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Claude Code)
@@ -43,9 +61,14 @@ RUN curl -sSL https://install.python-poetry.org | python3 -
 # Install Claude Code and Beads globally via npm (slow - ~13 min)
 RUN npm install -g @anthropic-ai/claude-code @beads/bd
 
+# Git identity for commits made inside the container
+RUN git config --global user.email "sentinel@iodigital.com" \
+    && git config --global user.name "iO Sentinel"
+
 # Create Claude Code directory structure (prevents CLI issues in containers)
 RUN mkdir -p /etc/claude-code/.claude/skills \
-    && mkdir -p /root/.claude
+    && mkdir -p /root/.claude \
+    && echo '{}' > /root/.claude.json
 
 # =============================================================================
 # APP STAGE - Application code (rebuilds faster on code changes)

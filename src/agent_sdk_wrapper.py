@@ -50,6 +50,8 @@ class AgentSDKWrapper:
         # Set environment variables based on mode
         if self.llm_mode == "custom_proxy":
             # Custom proxy - use AUTH_TOKEN for proxy compatibility
+            # Clear API_KEY so Claude CLI doesn't pick it up instead of AUTH_TOKEN
+            os.environ.pop("ANTHROPIC_API_KEY", None)
             os.environ["ANTHROPIC_AUTH_TOKEN"] = llm_config["api_key"]
             os.environ["ANTHROPIC_BASE_URL"] = llm_config["base_url"]
             logger.info(f"Using custom proxy at {llm_config['base_url']}")

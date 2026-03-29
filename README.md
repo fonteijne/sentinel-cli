@@ -8,11 +8,14 @@ For running on your own machine:
 cd sentinel && source init.sh  # Install deps + activate environment
 ```
 
-For running the docker container
+For running the docker container:
 ```bash
 docker compose up -d
 docker compose exec sentinel zsh
 ```
+
+> **Note:** The Docker socket is mounted by default for container orchestration (DooD).
+> See [Container Environments](#container-environments) below.
 
 Edit config/.env with your API credentials
 ```bash
@@ -103,6 +106,84 @@ Sentinel uses a **multi-agent workflow** where specialized AI agents collaborate
 ```
 
 Each agent uses the **Claude Agent SDK** for autonomous tool use (Read, Write, Grep, Glob, Bash), enabling context-aware decision-making without manual intervention.
+
+---
+
+## Container Environments
+
+Sentinel can automatically spin up project-specific development environments (PHP, MySQL, Redis, etc.) for tickets that require it. This enables Sentinel to build, test, and validate code in the correct runtime environment.
+
+### How It Works
+
+1. When `sentinel execute` runs, the **EnvironmentManager** checks the project worktree for a `.lando.yml` file
+2. If found, it translates the Lando configuration into a `docker-compose.sentinel.yml`
+3. Starts the services as sibling containers via Docker Compose
+4. Agents can execute commands inside the containers (e.g., `composer install`, `drush cr`)
+5. After execution completes, containers are automatically cleaned up
+
+If no `.lando.yml` is found, Sentinel falls back to the default Python project workflow — no containers needed.
+
+### Architecture: Docker-out-of-Docker (DooD)
+
+Sentinel uses DooD for the pilot phase: it mounts the host's Docker socket and starts sibling containers on the same Docker daemon.
+
+```
+Host Machine (Docker Desktop / Docker Engine)
+  │
+  └── Docker Daemon
+        │
+        ├── sentinel (mounts /var/run/docker.sock)
+        │     ├── EnvironmentManager
+        │     ├── LandoTranslator (.lando.yml → compose)
+        │     └── ComposeRunner (docker compose up/down/exec)
+        │
+        ├── sentinel-PROJ-123-appserver (PHP/Apache)
+        ├── sentinel-PROJ-123-database (MySQL)
+        └── sentinel-PROJ-123-cache (Redis)
+```
+
+### Volume Sharing
+
+Child containers need access to the project code. Sentinel uses a **named volume** (`sentinel-projects`) shared between the Sentinel container and child containers, avoiding the DooD path-translation problem where Docker resolves mount paths on the host rather than inside the container.
+
+### Docker Socket Mount
+
+The `docker-compose.yml` mounts `/var/run/docker.sock` by default. This gives Sentinel **full Docker access** on the host — acceptable for developer machines in the pilot phase.
+
+**For production**, Sentinel is designed to support [Sysbox](https://github.com/nestybox/sysbox) as an alternative runtime, providing full container isolation without socket sharing. The EnvironmentManager interface is runtime-agnostic to support this swap.
+
+### Configuration
+
+Container environment settings in `config/config.yaml`:
+
+```yaml
+environment:
+  runtime: dood           # "dood" (Phase 1) or "sysbox" (future)
+  health_timeout: 120     # Seconds to wait for services to be healthy
+  auto_detect: true       # Auto-detect .lando.yml
+  auto_cleanup: true      # Clean up containers after execute
+  volume_name: sentinel-projects
+```
+
+### CLI Options
+
+```bash
+# Normal execution (auto-detects containers)
+sentinel execute PROJ-123
+
+# Skip container setup (Python-only projects or debugging)
+sentinel execute PROJ-123 --no-env
+```
+
+### Supported Project Types
+
+| Detection | Stack | Services |
+|-----------|-------|----------|
+| `.lando.yml` with Drupal recipe | PHP/Apache, MySQL, Redis | appserver, database, cache |
+| `.lando.yml` with Laravel recipe | PHP/Apache, MySQL, Redis | appserver, database, cache |
+| `.lando.yml` with WordPress recipe | PHP/Apache, MySQL | appserver, database |
+| `.lando.yml` with custom services | Depends on config | As defined |
+| No `.lando.yml` | Python (default) | None (no containers) |
 
 ---
 
@@ -266,7 +347,8 @@ After adding this, restart your shell or run `source ~/.bashrc` (or `~/.zshrc`).
 |---------|-------------|
 | `sentinel info PROJ-123` | View Jira ticket details |
 | `sentinel plan PROJ-123` | Generate implementation plan |
-| `sentinel execute PROJ-123` | Execute the plan |
+| `sentinel execute PROJ-123` | Execute the plan (auto-detects containers) |
+| `sentinel execute PROJ-123 --no-env` | Execute without container environment |
 | `sentinel reset PROJ-123` | Clean up worktree and branch |
 | `sentinel status` | Show active worktrees |
 | `sentinel validate` | Check API credentials |
@@ -461,6 +543,9 @@ sentinel/
 │   │   └── security_reviewer.py
 │   ├── cli.py           # Click-based CLI
 │   ├── config_loader.py
+│   ├── environment_manager.py  # Container lifecycle (DooD/Sysbox)
+│   ├── lando_translator.py     # .lando.yml → docker-compose
+│   ├── compose_runner.py       # Docker Compose subprocess wrapper
 │   ├── jira_client.py
 │   ├── gitlab_client.py
 │   ├── worktree_manager.py

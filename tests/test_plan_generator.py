@@ -297,7 +297,7 @@ class TestPlanGeneratorAgent:
         # and appends "/backend" when no colon delimiter is found in parsing
         assert "test" in call_kwargs["project_id"]
         assert call_kwargs["title"] == "TEST-123: Implement user authentication"
-        assert call_kwargs["source_branch"] == "feature/TEST-123"
+        assert call_kwargs["source_branch"] == "sentinel/feature/TEST-123"
         assert call_kwargs["target_branch"] == "main"
         assert call_kwargs["draft"] is True
 
