@@ -2,8 +2,10 @@
 
 import json
 import logging
+import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -12,6 +14,7 @@ from src.attachment_manager import AttachmentManager
 from src.jira_factory import get_jira_client
 from src.gitlab_client import GitLabClient
 from src.config_loader import get_config
+from src.stack_profiler import generate_profile_markdown
 from src.worktree_manager import get_branch_name
 from src.utils.adf_parser import parse_adf_to_text
 
@@ -269,11 +272,130 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
 
         return requirements
 
+    def _load_stack_context(self, ticket_id: str, worktree_path: Path) -> str:
+        """Load stack-specific context for plan generation.
+
+        Reads project-context.md and Drupal overlay prompts if the project
+        has been profiled as a Drupal stack.
+
+        Args:
+            ticket_id: Jira ticket ID (used to extract project key)
+            worktree_path: Path to the git worktree root
+
+        Returns:
+            Stack context string to inject into plan prompt, or empty string
+        """
+        project_key = ticket_id.split("-")[0]
+        project_config = self.config.get_project_config(project_key)
+        stack_type = project_config.get("stack_type", "")
+
+        if not stack_type:
+            return ""
+
+        context_parts: list[str] = []
+
+        # Load project context from worktree
+        context_path = worktree_path / ".sentinel" / "project-context.md"
+        if context_path.exists():
+            try:
+                content = context_path.read_text()
+                context_parts.append(f"\n## Project Context\n\n{content}")
+                logger.info(f"Loaded project context ({len(content)} chars)")
+            except OSError as e:
+                logger.warning(f"Failed to read project context: {e}")
+
+        # Load stack-specific overlay prompts from Sentinel's built-in prompts
+        if stack_type.startswith("drupal"):
+            overlays_dir = Path(__file__).parent.parent.parent / "prompts" / "overlays"
+            for overlay_name in ["drupal_plan_generator.md", "drupal_exploration.md"]:
+                overlay_path = overlays_dir / overlay_name
+                if overlay_path.exists():
+                    try:
+                        content = overlay_path.read_text()
+                        context_parts.append(f"\n{content}")
+                        logger.info(f"Loaded overlay: {overlay_name} ({len(content)} chars)")
+                    except OSError as e:
+                        logger.warning(f"Failed to read overlay {overlay_name}: {e}")
+
+        return "\n".join(context_parts)
+
+    def _auto_profile_if_needed(self, worktree_path: Path, project_key: str) -> None:
+        """Auto-generate project profile if none exists.
+
+        Args:
+            worktree_path: Path to the git worktree
+            project_key: Project key for config metadata
+        """
+        context_path = worktree_path / ".sentinel" / "project-context.md"
+        if context_path.exists():
+            content = context_path.read_text()
+            if len(content) > 100:
+                return
+            logger.warning(f"Existing profile looks invalid ({len(content)} chars), regenerating")
+
+        logger.info("No project profile found, auto-profiling...")
+
+        # Save LLM env vars — the profiler creates a separate agent that may
+        # reconfigure them (e.g., switching to subscription mode), which would
+        # wipe the plan_generator's custom_proxy credentials.
+        saved_env = {
+            k: os.environ.get(k)
+            for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
+        }
+
+        markdown, stack_type = generate_profile_markdown(worktree_path, project_key)
+
+        # Restore LLM env vars so the plan_generator can continue authenticating
+        for k, v in saved_env.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+        if not stack_type:
+            logger.info("Could not detect stack type, skipping auto-profile")
+            return
+
+        context_path.parent.mkdir(parents=True, exist_ok=True)
+        context_path.write_text(markdown)
+        logger.info(f"Project profile generated: {stack_type} ({len(markdown)} chars)")
+
+        # Commit the profile to the worktree branch
+        try:
+            subprocess.run(
+                ["git", "add", ".sentinel/project-context.md"],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", f"Add Sentinel project profile ({stack_type})"],
+                cwd=worktree_path,
+                check=True,
+                capture_output=True,
+            )
+            logger.info("Committed project profile to worktree branch")
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode() if e.stderr else ""
+            logger.warning(f"Could not commit project profile: {stderr}")
+
+        # Update config metadata
+        try:
+            self.config.update_project_metadata(
+                project_key,
+                stack_type=stack_type,
+                profiled_at=datetime.now(timezone.utc).isoformat(),
+            )
+            logger.info(f"Updated project metadata: stack_type={stack_type}")
+        except ValueError as e:
+            logger.warning(f"Could not update project metadata: {e}")
+
     def generate_plan(
         self,
         ticket_id: str,
         context: Dict[str, Any],
         output_path: Path,
+        worktree_path: Path | None = None,
     ) -> str:
         """Generate a detailed implementation plan.
 
@@ -281,6 +403,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
             ticket_id: Jira ticket ID
             context: Context from ticket analysis
             output_path: Path to write the plan file
+            worktree_path: Path to the git worktree root
 
         Returns:
             Plan content as markdown string
@@ -310,9 +433,14 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         priority = ticket_data.get('priority', 'Medium')
         priority_name = priority.get('name', 'Medium') if isinstance(priority, dict) else str(priority)
 
+        # Load stack-specific context if available
+        effective_worktree = worktree_path or output_path.parent.parent.parent
+        stack_context = self._load_stack_context(ticket_id, effective_worktree)
+
         # System prompt defines the detailed format - user prompt tells agent to write the file
         plan_file_path = str(output_path)
         plan_prompt = f"""Generate a comprehensive implementation plan for ticket {ticket_id}.
+{stack_context}
 
 **Ticket Context**:
 - **ID**: {ticket_id}
@@ -823,12 +951,15 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         project_key = ticket_id.split("-")[0]
         self.set_project(project_key)
 
+        # Step 0: Auto-profile project if no profile exists
+        self._auto_profile_if_needed(worktree_path, project_key)
+
         # Step 1: Analyze ticket (pass worktree so agent can explore codebase)
         analysis = self.analyze_ticket(ticket_id, worktree_path)
 
         # Step 2: Generate plan
         plan_path = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
-        plan_content = self.generate_plan(ticket_id, analysis, plan_path)
+        plan_content = self.generate_plan(ticket_id, analysis, plan_path, worktree_path)
 
         # Step 3: Commit and push plan (if changed)
         plan_updated = self.commit_and_push_plan(plan_path, ticket_id, worktree_path)
