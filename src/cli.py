@@ -1868,8 +1868,9 @@ def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) 
             capture_output=True,
         )
 
+        # Bare clones store branches as refs/heads/<name>, not refs/remotes/origin/<name>
         subprocess.run(
-            ["git", "worktree", "add", str(tmp_worktree_path), f"origin/{default_branch}", "--detach"],
+            ["git", "worktree", "add", str(tmp_worktree_path), default_branch, "--detach"],
             cwd=str(bare_clone_dir),
             capture_output=True,
             check=True,
@@ -1883,7 +1884,7 @@ def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) 
                 if context_path.exists():
                     click.echo(context_path.read_text())
                 else:
-                    click.echo("ℹ️  No profile found. Run without --show to generate one.")
+                    click.echo(f"ℹ️  No project-context.md found on {default_branch}.")
                 return
 
             # Check if profile already exists (skip if no --refresh)
