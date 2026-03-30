@@ -154,7 +154,10 @@ class ConfigLoader:
         Returns:
             Dictionary with mode and credentials
         """
-        api_key = self.get_env("ANTHROPIC_API_KEY")
+        # Check both API_KEY and AUTH_TOKEN — set_project() for custom_proxy
+        # clears API_KEY and sets AUTH_TOKEN, so subsequent agents need to
+        # detect proxy mode via AUTH_TOKEN as a fallback.
+        api_key = self.get_env("ANTHROPIC_API_KEY") or self.get_env("ANTHROPIC_AUTH_TOKEN")
         base_url = self.get_env("ANTHROPIC_BASE_URL")
 
         if api_key and base_url:
@@ -296,6 +299,27 @@ class ConfigLoader:
 
         self._save_config()
 
+    def _find_project_key(self, project_key: str) -> str:
+        """Find the actual config key for a project (case-insensitive).
+
+        Args:
+            project_key: Project key to look up
+
+        Returns:
+            The actual key as stored in config
+
+        Raises:
+            ValueError: If project does not exist
+        """
+        project_key_upper = project_key.upper()
+        projects = self.get("projects", {})
+        if isinstance(projects, dict):
+            for key in projects.keys():
+                if key.upper() == project_key_upper:
+                    return key
+
+        raise ValueError(f"Project '{project_key}' not found")
+
     def remove_project(self, project_key: str) -> None:
         """Remove a project from configuration.
 
@@ -305,20 +329,7 @@ class ConfigLoader:
         Raises:
             ValueError: If project does not exist
         """
-        project_key_upper = project_key.upper()
-
-        # Find the actual key (case-insensitive)
-        projects = self.get("projects", {})
-        actual_key = None
-        if isinstance(projects, dict):
-            for key in projects.keys():
-                if key.upper() == project_key_upper:
-                    actual_key = key
-                    break
-
-        if actual_key is None:
-            raise ValueError(f"Project '{project_key}' not found")
-
+        actual_key = self._find_project_key(project_key)
         del self._config["projects"][actual_key]
         self._save_config()
 
@@ -335,27 +346,30 @@ class ConfigLoader:
         Raises:
             ValueError: If project does not exist
         """
-        project_key_upper = project_key.upper()
-
-        # Find the actual key (case-insensitive)
-        projects = self.get("projects", {})
-        actual_key = None
-        if isinstance(projects, dict):
-            for key in projects.keys():
-                if key.upper() == project_key_upper:
-                    actual_key = key
-                    break
-
-        if actual_key is None:
-            raise ValueError(f"Project '{project_key}' not found")
-
-        # Update the project
+        actual_key = self._find_project_key(project_key)
         self._config["projects"][actual_key] = {
             "git_url": git_url,
             "default_branch": default_branch,
             "jira_project_key": actual_key,
         }
+        self._save_config()
 
+    def update_project_metadata(self, project_key: str, **kwargs: Any) -> None:
+        """Update project metadata (stack_type, profiled_at, etc.) in config.
+
+        Merges provided keyword arguments into the existing project config.
+        Saves to config.local.yaml.
+
+        Args:
+            project_key: Project key (case-insensitive)
+            **kwargs: Metadata keys to merge (e.g., stack_type="drupal9")
+
+        Raises:
+            ValueError: If project does not exist
+        """
+        actual_key = self._find_project_key(project_key)
+        for k, v in kwargs.items():
+            self._config["projects"][actual_key][k] = v
         self._save_config()
 
     def _save_config(self) -> None:

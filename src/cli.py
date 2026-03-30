@@ -11,6 +11,7 @@ import click
 
 
 from src.config_loader import get_config
+from src.stack_profiler import StackProfiler
 from src.worktree_manager import WorktreeManager, get_branch_name
 from src.environment_manager import EnvironmentManager
 from src.jira_factory import get_jira_client
@@ -968,15 +969,91 @@ def validate() -> None:
             llm_config = cfg.get_llm_config()
             llm_mode = llm_config["mode"]
 
-            if llm_mode == "custom_proxy":
-                click.echo("   Mode: Custom Proxy")
-                click.echo(f"      API Key: {'*' * 8}{llm_config['api_key'][-4:] if llm_config['api_key'] and len(llm_config['api_key']) > 4 else 'Not set'}")
-                click.echo(f"      Base URL: {llm_config['base_url']}")
-                click.echo("   ✅ Custom proxy configured")
-            elif llm_mode == "direct_api":
-                click.echo("   Mode: Direct Anthropic API")
-                click.echo(f"      API Key: {'*' * 8}{llm_config['api_key'][-4:] if llm_config['api_key'] and len(llm_config['api_key']) > 4 else 'Not set'}")
-                click.echo("   ✅ Direct API configured")
+            if llm_mode in ("custom_proxy", "direct_api"):
+                is_proxy = llm_mode == "custom_proxy"
+                mode_label = "Custom Proxy" if is_proxy else "Direct API"
+                click.echo(f"   Mode: {mode_label}")
+                api_key = llm_config["api_key"] or ""
+                masked = f"{'*' * 8}{api_key[-4:]}" if len(api_key) > 4 else "Not set"
+                click.echo(f"      API Key: {masked}")
+                if llm_config.get("base_url"):
+                    click.echo(f"      Base URL: {llm_config['base_url']}")
+
+                # Make a real API call to verify the key works
+                click.echo("      Testing connection...")
+                import requests
+                base_url = llm_config.get("base_url") or "https://api.anthropic.com"
+                try:
+                    if is_proxy:
+                        # Custom proxy uses OpenAI-compatible format
+                        resp = requests.post(
+                            f"{base_url}/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {api_key}",
+                                "Content-Type": "application/json",
+                                "User-Agent": "sentinel/1.0",
+                            },
+                            json={
+                                "model": "claude-haiku-4-5",
+                                "max_tokens": 1,
+                                "messages": [
+                                    {"role": "user", "content": "hi"},
+                                ],
+                            },
+                            timeout=15,
+                        )
+                    else:
+                        # Direct Anthropic API
+                        resp = requests.post(
+                            f"{base_url}/v1/messages",
+                            headers={
+                                "x-api-key": api_key,
+                                "anthropic-version": "2023-06-01",
+                                "content-type": "application/json",
+                            },
+                            json={
+                                "model": "claude-haiku-4-5",
+                                "max_tokens": 1,
+                                "messages": [{"role": "user", "content": "hi"}],
+                            },
+                            timeout=15,
+                        )
+                    if resp.status_code == 200:
+                        msg = f"{mode_label} connected (API key valid)"
+                        click.echo(f"   ✅ {msg}")
+                    elif resp.status_code in (401, 403):
+                        try:
+                            detail = resp.json()
+                        except Exception:
+                            detail = resp.text[:200]
+                        click.echo(
+                            f"   ❌ {mode_label}: "
+                            f"{resp.status_code} — {detail}"
+                        )
+                        all_valid = False
+                        llm_failed = True
+                    else:
+                        # 400, 429, etc. — key authenticated but something else failed
+                        err = resp.json().get("error", {})
+                        if err.get("type") == "authentication_error":
+                            click.echo(f"   ❌ {mode_label}: auth failed")
+                            all_valid = False
+                            llm_failed = True
+                        else:
+                            msg = f"{mode_label} connected (API key valid)"
+                            click.echo(f"   ✅ {msg}")
+                except requests.ConnectionError:
+                    click.echo(f"   ❌ Cannot reach {base_url}")
+                    all_valid = False
+                    llm_failed = True
+                except requests.Timeout:
+                    click.echo(f"   ❌ Connection to {base_url} timed out")
+                    all_valid = False
+                    llm_failed = True
+                except Exception as e:
+                    click.echo(f"   ⚠️  Could not verify API key: {e}")
+                    all_valid = False
+                    llm_failed = True
             else:  # subscription
                 click.echo("   Mode: Claude Code Subscription")
                 # Check if Claude CLI is authenticated
@@ -1722,6 +1799,184 @@ def projects_remove(project_key: str, yes: bool) -> None:
         sys.exit(1)
     except Exception as e:
         logger.error(f"Projects remove failed: {e}", exc_info=True)
+        click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@projects.command("profile")
+@click.argument("project_key")
+@click.option(
+    "--refresh",
+    is_flag=True,
+    help="Regenerate profile even if one exists.",
+)
+@click.option(
+    "--show",
+    is_flag=True,
+    help="Display existing profile without regenerating.",
+)
+@click.option(
+    "--no-llm",
+    is_flag=True,
+    help="Skip LLM enrichment, use deterministic profile only.",
+)
+def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) -> None:
+    """Analyze a project and generate a stack profile.
+
+    Detects the technology stack (e.g., Drupal 9/10/11), analyzes the codebase
+    with an LLM agent, and writes a .sentinel/project-context.md file that
+    specializes agent planning prompts.
+
+    By default, uses an LLM to enrich the profile with architectural insights.
+    Use --no-llm for a fast deterministic-only profile.
+
+    Args:
+        project_key: JIRA project key (e.g., DHL_EXPRESS)
+    """
+    try:
+        config = get_config()
+        project_config = config.get_project_config(project_key)
+        if not project_config:
+            click.echo(f"❌ Project '{project_key}' not found. Use 'sentinel projects add' first.", err=True)
+            sys.exit(1)
+
+        worktree_mgr = WorktreeManager()
+        project_key_upper = project_key.upper()
+
+        # Ensure bare clone exists
+        click.echo(f"🔍 Profiling project: {project_key_upper}\n")
+        bare_clone_dir = worktree_mgr.ensure_bare_clone(project_key)
+
+        # Create a temporary worktree for scanning (bare clones have no working tree)
+        default_branch = project_config.get("default_branch", "main")
+        tmp_worktree_path = bare_clone_dir / "_profile_tmp"
+
+        import subprocess
+
+        if tmp_worktree_path.exists():
+            # Clean up stale temp worktree
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(tmp_worktree_path)],
+                cwd=str(bare_clone_dir),
+                capture_output=True,
+            )
+
+        # Fetch latest before creating worktree
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=str(bare_clone_dir),
+            capture_output=True,
+        )
+
+        # Bare clones store branches as refs/heads/<name>, not refs/remotes/origin/<name>
+        subprocess.run(
+            ["git", "worktree", "add", str(tmp_worktree_path), default_branch, "--detach"],
+            cwd=str(bare_clone_dir),
+            capture_output=True,
+            check=True,
+        )
+
+        try:
+            context_path = tmp_worktree_path / ".sentinel" / "project-context.md"
+
+            # --show: display existing profile and exit
+            if show:
+                if context_path.exists():
+                    click.echo(context_path.read_text())
+                else:
+                    click.echo(f"ℹ️  No project-context.md found on {default_branch}.")
+                return
+
+            # Check if profile already exists (skip if no --refresh)
+            if context_path.exists() and not refresh:
+                click.echo("ℹ️  Profile already exists. Use --refresh to regenerate.")
+                click.echo("   Path: .sentinel/project-context.md\n")
+                # Show summary
+                profiler = StackProfiler()
+                stack = profiler.detect_stack(tmp_worktree_path)
+                click.echo(f"   Stack: {stack or 'unknown'}")
+                return
+
+            # Generate profile
+            if no_llm:
+                click.echo("   Generating deterministic profile...")
+            else:
+                click.echo("   Enriching with LLM analysis (this may take a moment)...")
+
+            from src.stack_profiler import generate_profile_markdown
+            markdown, stack_type = generate_profile_markdown(
+                tmp_worktree_path, project_key_upper, use_llm=not no_llm,
+            )
+
+            if stack_type:
+                click.echo(f"   ✓ Detected: {stack_type}")
+            else:
+                click.echo("   ⚠️  Could not detect stack type")
+
+            # Write .sentinel/project-context.md
+            context_path.parent.mkdir(parents=True, exist_ok=True)
+            context_path.write_text(markdown)
+            click.echo(f"   ✓ Wrote .sentinel/project-context.md ({len(markdown)} chars)")
+
+            # Commit the profile
+            click.echo("   Committing profile...")
+            subprocess.run(
+                ["git", "add", ".sentinel/project-context.md"],
+                cwd=str(tmp_worktree_path),
+                capture_output=True,
+                check=True,
+            )
+
+            commit_result = subprocess.run(
+                ["git", "commit", "-m", f"Add/update Sentinel project profile ({stack_type or 'unknown'})"],
+                cwd=str(tmp_worktree_path),
+                capture_output=True,
+            )
+
+            if commit_result.returncode == 0:
+                # Push the commit to the default branch
+                subprocess.run(
+                    ["git", "push", "origin", f"HEAD:{default_branch}"],
+                    cwd=str(tmp_worktree_path),
+                    capture_output=True,
+                    check=True,
+                )
+                click.echo(f"   ✓ Committed and pushed to {default_branch}")
+            else:
+                click.echo("   ℹ️  No changes to commit (profile unchanged)")
+
+            # Update project config with stack metadata
+            if stack_type:
+                from datetime import datetime, timezone
+                config.update_project_metadata(
+                    project_key,
+                    stack_type=stack_type,
+                    profiled_at=datetime.now(timezone.utc).isoformat(),
+                )
+                click.echo(f"   ✓ Updated project config (stack_type={stack_type})")
+
+            # Print summary
+            click.echo(f"\n✅ Profile complete for {project_key_upper}")
+            if stack_type:
+                click.echo(f"   Stack: {stack_type}")
+
+        finally:
+            # Clean up temporary worktree
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(tmp_worktree_path)],
+                cwd=str(bare_clone_dir),
+                capture_output=True,
+            )
+
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if e.stderr else ""
+        click.echo(f"❌ Git error: {stderr}", err=True)
+        sys.exit(1)
+    except ValueError as e:
+        click.echo(f"❌ {e}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Projects profile failed: {e}", exc_info=True)
         click.echo(f"❌ Error: {e}", err=True)
         sys.exit(1)
 

@@ -20,6 +20,9 @@ agents:
     temperature: 0.1
     strictness: 5
     veto_power: true
+  project_profiler:
+    model: claude-4-5-sonnet
+    temperature: 0.2
 attachments:
   enabled: true
   max_text_size: 102400     # 100KB per text file
