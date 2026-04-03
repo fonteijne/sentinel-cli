@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -61,6 +62,11 @@ class PlanGeneratorAgent(PlanningAgent):
         # Fetch ticket data
         ticket_data = self.jira.get_ticket(ticket_id)
 
+        # Fetch existing comments for re-entry context (e.g., PO answered triage questions)
+        comments = self.jira.get_ticket_comments(ticket_id)
+        if comments:
+            logger.info(f"Found {len(comments)} existing comment(s) on {ticket_id}")
+
         # Download attachments if worktree is available
         attachment_mgr = AttachmentManager()
         attachments_data = None
@@ -96,6 +102,14 @@ class PlanGeneratorAgent(PlanningAgent):
         priority = ticket_data.get('priority', 'Medium')
         priority_name = priority.get('name', 'Medium') if isinstance(priority, dict) else str(priority)
 
+        # Build comments context for re-entry
+        comments_context = ""
+        if comments:
+            comments_text = "\n".join(
+                f"- [{c['author']}]: {c['body']}" for c in comments
+            )
+            comments_context = f"\n**Existing Comments/Discussion**:\n{comments_text}\n\n"
+
         # Self-contained prompt for ticket analysis - returns JSON only, no tool use
         analysis_prompt = f"""Analyze this Jira ticket and return ONLY a JSON object.
 
@@ -110,6 +124,7 @@ class PlanGeneratorAgent(PlanningAgent):
 **Description**:
 {description}
 {attachment_context}
+{comments_context}
 **OUTPUT FORMAT** (return ONLY this JSON, no other text):
 ```json
 {{
@@ -151,6 +166,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
                 "risks": ai_analysis.get("risks", []),
                 "estimated_complexity": ai_analysis.get("estimated_complexity", "medium"),
                 "attachments_data": attachments_data,
+                "comments": comments,
             }
 
             logger.info(f"Ticket analysis complete: {len(analysis['requirements'])} requirements")
@@ -508,7 +524,7 @@ After writing the plan file, respond with ONLY: "Plan written to {plan_file_path
 
         for iteration in range(max_iterations):
             try:
-                response = self.send_message(plan_prompt, cwd=worktree_cwd)
+                response = self.send_message(plan_prompt, cwd=worktree_cwd, max_turns=30)
             except Exception as e:
                 error_msg = (
                     f"Failed to generate plan for {ticket_id} - LLM request failed.\n"
@@ -924,100 +940,129 @@ The detailed plan has been committed to the repository at `{plan_path}`.
                 # Some other error, re-raise
                 raise
 
-    def run(  # type: ignore[override]
+    def _detect_plan_state(
         self,
         ticket_id: str,
         worktree_path: Path,
-        **kwargs: Any,
+        project_key: str,
     ) -> Dict[str, Any]:
-        """Run the complete planning workflow.
+        """Detect the current state of a plan for a ticket.
+
+        Checks plan file, MR, discussions, and Jira comments to determine
+        what action to take.
 
         Args:
             ticket_id: Jira ticket ID
             worktree_path: Path to the git worktree
-            **kwargs: Additional parameters
+            project_key: Project key (e.g., "ACME")
 
         Returns:
             Dictionary with:
-                - plan_path: Path to generated plan
-                - mr_url: URL of created draft MR
-                - analysis: Ticket analysis results
-                - plan_updated: True if plan was changed and committed
-                - mr_created: True if new MR was created
+                - state: "initial", "has_feedback", "update", or "nothing_changed"
+                - existing_plan: Plan content if plan file exists
+                - mr_iid: MR IID if MR exists
+                - mr_url: MR URL if MR exists
+                - project_path: GitLab project path
+                - discussions: Unresolved discussions if any
         """
-        logger.info(f"Running plan generation for {ticket_id}")
-
-        # Extract project key and set for session tracking
-        project_key = ticket_id.split("-")[0]
-        self.set_project(project_key)
-
-        # Step 0: Auto-profile project if no profile exists
-        self._auto_profile_if_needed(worktree_path, project_key)
-
-        # Step 1: Analyze ticket (pass worktree so agent can explore codebase)
-        analysis = self.analyze_ticket(ticket_id, worktree_path)
-
-        # Step 2: Generate plan
         plan_path = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
-        plan_content = self.generate_plan(ticket_id, analysis, plan_path, worktree_path)
 
-        # Step 3: Commit and push plan (if changed)
-        plan_updated = self.commit_and_push_plan(plan_path, ticket_id, worktree_path)
+        # Check if plan file exists
+        if not plan_path.exists():
+            return {"state": "initial"}
 
-        # Step 4: Create draft MR (or get existing)
-        mr_url, mr_created = self.create_or_get_mr(ticket_id, plan_path, project_key)
+        existing_plan = plan_path.read_text()
 
+        # Check if MR exists
+        mr_info = self._get_mr_info(ticket_id, project_key)
+        if not mr_info:
+            # Plan exists but no MR — treat as fresh (previous failed run)
+            return {"state": "initial", "existing_plan": existing_plan}
+
+        project_path = mr_info["project_path"]
+        mr_iid = mr_info["mr_iid"]
+        mr_url = mr_info["mr_url"]
+
+        # Check for unresolved MR discussions
+        discussions = self.gitlab.get_merge_request_discussions(
+            project_id=project_path,
+            mr_iid=mr_iid,
+            unresolved_only=True,
+        )
+
+        if discussions:
+            return {
+                "state": "has_feedback",
+                "existing_plan": existing_plan,
+                "mr_iid": mr_iid,
+                "mr_url": mr_url,
+                "project_path": project_path,
+                "discussions": discussions,
+            }
+
+        # No discussions — check Jira for new context
+        comments = self.jira.get_ticket_comments(ticket_id)
+
+        # Find the last Sentinel confidence report comment
+        last_sentinel_idx = -1
+        for i, comment in enumerate(comments):
+            if "Sentinel Confidence Report" in comment.get("body", ""):
+                last_sentinel_idx = i
+
+        if last_sentinel_idx == -1:
+            # No Sentinel report posted yet — re-run with latest context
+            return {
+                "state": "update",
+                "existing_plan": existing_plan,
+                "mr_iid": mr_iid,
+                "mr_url": mr_url,
+                "project_path": project_path,
+                "discussions": [],
+            }
+
+        # Check if any non-Sentinel comments were posted after the last report
+        has_new_comments = False
+        for comment in comments[last_sentinel_idx + 1:]:
+            if "Sentinel Confidence Report" not in comment.get("body", ""):
+                has_new_comments = True
+                break
+
+        if has_new_comments:
+            return {
+                "state": "update",
+                "existing_plan": existing_plan,
+                "mr_iid": mr_iid,
+                "mr_url": mr_url,
+                "project_path": project_path,
+                "discussions": [],
+            }
+
+        # Nothing changed since last run
         return {
-            "plan_path": str(plan_path),
+            "state": "nothing_changed",
+            "existing_plan": existing_plan,
+            "mr_iid": mr_iid,
             "mr_url": mr_url,
-            "analysis": analysis,
-            "plan_content": plan_content,
-            "plan_updated": plan_updated,
-            "mr_created": mr_created,
+            "project_path": project_path,
+            "discussions": [],
         }
 
-    def run_revision(  # type: ignore[override]
+    def _get_mr_info(
         self,
         ticket_id: str,
-        worktree_path: Path,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Revise an existing plan based on MR feedback.
+        project_key: str,
+    ) -> Dict[str, Any] | None:
+        """Look up an existing MR for a ticket.
 
         Args:
             ticket_id: Jira ticket ID
-            worktree_path: Path to the git worktree
-            **kwargs: Additional parameters
+            project_key: Project key (e.g., "ACME")
 
         Returns:
-            Dictionary with:
-                - plan_path: Path to revised plan
-                - mr_url: URL of the MR
-                - revision_type: "incremental" or "full_rewrite"
-                - feedback_count: Number of feedback items addressed
-                - plan_updated: Whether plan was updated
+            Dictionary with project_path, mr_iid, mr_url, or None if no MR exists.
         """
-        logger.info(f"Running plan revision for {ticket_id}")
-
-        # Extract project key and set for session tracking
-        project_key = ticket_id.split("-")[0]
-        self.set_project(project_key)
-
-        # Step 1: Get existing plan
-        plan_path = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
-        if not plan_path.exists():
-            raise FileNotFoundError(
-                f"No existing plan found at {plan_path}. "
-                f"Run 'sentinel plan {ticket_id}' first."
-            )
-
-        current_plan = plan_path.read_text()
-
-        # Step 2: Find the MR
         project_config = self.config.get_project_config(project_key)
         git_url = project_config.get("git_url", "")
-
-        # Extract project path from git URL
         project_path = self.gitlab.extract_project_path(git_url)
 
         source_branch = get_branch_name(ticket_id)
@@ -1027,56 +1072,109 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         )
 
         if not mrs:
-            raise ValueError(
-                f"No MR found for branch {source_branch}. "
-                f"Run 'sentinel plan {ticket_id}' first to create the initial plan and MR."
-            )
+            return None
 
-        mr_data = mrs[0]
-        mr_iid = mr_data["iid"]
-        mr_url = mr_data["web_url"]
+        return {
+            "project_path": project_path,
+            "mr_iid": mrs[0]["iid"],
+            "mr_url": mrs[0]["web_url"],
+        }
 
-        logger.info(f"Found MR: {mr_url}")
+    def _post_confidence_report(
+        self,
+        ticket_id: str,
+        evaluation: Dict[str, Any],
+    ) -> None:
+        """Post a confidence report to Jira.
 
-        # Step 3: Fetch unresolved discussions
-        discussions = self.gitlab.get_merge_request_discussions(
-            project_id=project_path,
-            mr_iid=mr_iid,
-            unresolved_only=True,
-        )
+        Supports both Jira Cloud (ADF) and Jira Server (wiki markup).
 
-        if not discussions:
-            logger.info("No unresolved discussions found - nothing to revise")
-            return {
-                "plan_path": str(plan_path),
-                "mr_url": mr_url,
-                "revision_type": "none",
-                "feedback_count": 0,
-                "plan_updated": False,
-                "message": "No unresolved discussions to address",
-            }
+        Args:
+            ticket_id: Jira ticket ID
+            evaluation: Full evaluation result from ConfidenceEvaluatorAgent
+        """
+        score = evaluation.get("confidence_score", 0)
+        threshold = evaluation.get("threshold", 95)
+        assumptions = evaluation.get("assumptions", [])
+        questions = evaluation.get("questions", [])
+        gaps = evaluation.get("gaps", [])
+        invest = evaluation.get("invest_evaluation", {})
+        scope_suggestion = evaluation.get("scope_suggestion")
+        summary_text = evaluation.get("summary", "")
 
-        logger.info(f"Found {len(discussions)} unresolved discussions")
+        # Build wiki markup (works on both Jira Server and Cloud)
+        lines: list[str] = []
+        lines.append(f"h2. \U0001f916 Sentinel Confidence Report \u2014 {score}/100 (threshold: {threshold})")
+        lines.append("")
 
-        # Step 4: Revise plan based on feedback
-        revision_result = self.revise_plan(
-            ticket_id=ticket_id,
-            current_plan=current_plan,
-            feedback=discussions,
-            output_path=plan_path,
-        )
+        if summary_text:
+            lines.append(summary_text)
+            lines.append("")
 
-        # Step 5: Commit and push revised plan
-        plan_updated = self.commit_and_push_plan(plan_path, ticket_id, worktree_path)
+        if assumptions:
+            lines.append("h3. Assumptions Made")
+            for a in assumptions:
+                lines.append(f"* {a}")
+            lines.append("")
 
-        # Step 6: Reply to discussions with explanations
-        feedback_responses = revision_result.get("feedback_responses", [])
+        if gaps:
+            lines.append("h3. Information Gaps")
+            for g in gaps:
+                lines.append(f"* {g}")
+            lines.append("")
+
+        if questions:
+            lines.append("h3. Questions to Clarify")
+            for i, q in enumerate(questions, 1):
+                lines.append(f"# {q}")
+            lines.append("")
+
+        if invest:
+            lines.append("h3. INVEST Assessment")
+            for criterion in ["independent", "negotiable", "valuable", "estimatable", "small", "testable"]:
+                data = invest.get(criterion, {})
+                score_val = data.get("score", "?")
+                note = data.get("note", "")
+                lines.append(f"* *{criterion.capitalize()}*: {score_val}/5 \u2014 {note}")
+            lines.append("")
+
+        if scope_suggestion:
+            lines.append("h3. Suggested Scope")
+            lines.append(scope_suggestion)
+            lines.append("")
+
+        lines.append(f"_Reply here with answers, then re-run:_ {{code}}sentinel plan {ticket_id}{{code}}")
+
+        comment_body = "\n".join(lines)
+
+        try:
+            logger.info(f"Posting confidence report to Jira {ticket_id} ({len(lines)} lines)")
+            self.jira.add_comment(ticket_id, comment_body)
+            logger.info(f"Posted confidence report to Jira {ticket_id}")
+        except Exception as e:
+            logger.error(f"Failed to post confidence report to Jira {ticket_id}: {e}", exc_info=True)
+
+    def _reply_to_discussions(
+        self,
+        discussions: list[Dict[str, Any]],
+        feedback_responses: list[Dict[str, Any]],
+        project_path: str,
+        mr_iid: int,
+    ) -> None:
+        """Reply to MR discussions with revision explanations.
+
+        Args:
+            discussions: Unresolved discussions from GitLab
+            feedback_responses: LLM-generated responses for each feedback item
+            project_path: GitLab project path
+            mr_iid: Merge request IID
+        """
         for response in feedback_responses:
             discussion_id = response.get("discussion_id", "")
             changes_made = response.get("changes_made", "")
             section_affected = response.get("section_affected", "")
 
-            # Find the discussion
+            # Find the matching discussion
             matching_discussion = None
             for disc in discussions:
                 if disc.get("id") == discussion_id:
@@ -1084,34 +1182,28 @@ The detailed plan has been committed to the repository at `{plan_path}`.
                     break
 
             if matching_discussion:
-                # Get the latest note in the discussion to add reaction
+                # Add emoji reaction to the latest note
                 notes = matching_discussion.get("notes", [])
                 if notes:
-                    latest_note = notes[-1]  # Get the most recent comment
-                    latest_note_id = latest_note.get("id")
-
-                    # Add emoji reaction to acknowledge the feedback
+                    latest_note_id = notes[-1].get("id")
                     if latest_note_id:
                         try:
                             self.gitlab.add_emoji_reaction(
                                 project_id=project_path,
                                 mr_iid=mr_iid,
                                 note_id=latest_note_id,
-                                emoji="eyes",  # 👀 to show we've read it
-                                discussion_id=discussion_id,  # Pass discussion ID for proper endpoint
+                                emoji="eyes",
+                                discussion_id=discussion_id,
                             )
-                            logger.info(f"Added reaction to note {latest_note_id}")
                         except Exception as e:
                             logger.warning(f"Failed to add reaction to note {latest_note_id}: {e}")
 
                 # Reply to the discussion
-                reply_body = f"""**Plan Updated** 🤖
+                reply_body = f"""**Plan Updated** \U0001f916
 
 {changes_made}
 
 **Section(s) affected:** {section_affected}
-
-**Revision type:** {revision_result.get('revision_type', 'incremental')}
 """
 
                 try:
@@ -1120,41 +1212,221 @@ The detailed plan has been committed to the repository at `{plan_path}`.
                         mr_iid=mr_iid,
                         discussion_id=discussion_id,
                         body=reply_body,
-                        resolve=False,  # Don't auto-resolve, let reviewers confirm
+                        resolve=False,
                     )
                     logger.info(f"Replied to discussion {discussion_id}")
                 except Exception as e:
                     logger.error(f"Failed to reply to discussion {discussion_id}: {e}")
 
-        # Step 7: Add summary comment to MR
-        summary = f"""## Plan Revision Summary 🔄
+    def run(  # type: ignore[override]
+        self,
+        ticket_id: str,
+        worktree_path: Path,
+        force: bool = False,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Run the unified planning workflow.
 
-**Revision Type:** {revision_result.get('revision_type', 'incremental').replace('_', ' ').title()}
+        Auto-detects plan state (initial, has_feedback, update, nothing_changed)
+        and takes the appropriate action. Always creates MR, always includes
+        confidence report.
 
-**Rationale:** {revision_result.get('rationale', 'N/A')}
+        Args:
+            ticket_id: Jira ticket ID
+            worktree_path: Path to the git worktree
+            force: Skip confidence evaluation (no report generated)
+            **kwargs: Additional parameters
 
-**Feedback Addressed:** {len(feedback_responses)} discussion(s)
+        Returns:
+            Dictionary with:
+                - action: State that was detected
+                - plan_path: Path to generated plan
+                - mr_url: URL of the MR
+                - plan_content: Plan content
+                - plan_updated: True if plan was changed and committed
+                - mr_created: True if new MR was created
+                - confidence_score: Evaluator's confidence score (None if --force)
+                - evaluation: Full evaluation result (None if --force)
+                - feedback_count: Number of discussions addressed
+                - revision_type: Revision type if revised
+        """
+        run_start = time.monotonic()
+        logger.info(f"[RUN] Starting plan generation for {ticket_id} (force={force})")
 
-The plan has been updated based on team feedback. Please review the changes and let me know if further revisions are needed.
+        # Extract project key and set for session tracking
+        project_key = ticket_id.split("-")[0]
+        self.set_project(project_key)
 
----
-🤖 Updated by Sentinel Plan Generator
-"""
+        # Step 0: Auto-profile project if no profile exists
+        t0 = time.monotonic()
+        logger.info(f"[RUN] Step 0: Auto-profile check...")
+        self._auto_profile_if_needed(worktree_path, project_key)
+        logger.info(f"[RUN] Step 0: Auto-profile done ({time.monotonic() - t0:.1f}s)")
 
-        try:
-            self.gitlab.add_merge_request_comment(
-                project_id=project_path,
-                mr_iid=mr_iid,
-                body=summary,
+        # Step 1: Detect current state
+        t0 = time.monotonic()
+        logger.info(f"[RUN] Step 1: Detecting plan state...")
+        state_info = self._detect_plan_state(ticket_id, worktree_path, project_key)
+        state = state_info["state"]
+        logger.info(f"[RUN] Step 1: State = {state} ({time.monotonic() - t0:.1f}s)")
+
+        if state == "nothing_changed":
+            logger.info(f"[RUN] Nothing changed — returning early ({time.monotonic() - run_start:.1f}s total)")
+            plan_path = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
+            return {
+                "action": "nothing_changed",
+                "plan_path": str(plan_path),
+                "mr_url": state_info.get("mr_url"),
+                "plan_content": state_info.get("existing_plan"),
+                "plan_updated": False,
+                "mr_created": False,
+                "confidence_score": None,
+                "evaluation": None,
+                "feedback_count": 0,
+                "revision_type": None,
+            }
+
+        # Step 2: Generate or revise plan based on state
+        plan_path = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
+        revision_result = None
+
+        if state == "has_feedback":
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 2a: Revising plan based on {len(state_info['discussions'])} discussion(s)...")
+            revision_result = self.revise_plan(
+                ticket_id, state_info["existing_plan"],
+                state_info["discussions"], plan_path,
             )
-        except Exception as e:
-            logger.error(f"Failed to add summary comment: {e}")
+            logger.info(f"[RUN] Step 2a: Revision done ({time.monotonic() - t0:.1f}s)")
+            plan_content = revision_result["revised_plan"]
+
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 2b: Analyzing ticket (post-revision)...")
+            analysis = self.analyze_ticket(ticket_id, worktree_path)
+            logger.info(f"[RUN] Step 2b: Analysis done ({time.monotonic() - t0:.1f}s)")
+        else:
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 2a: Analyzing ticket...")
+            analysis = self.analyze_ticket(ticket_id, worktree_path)
+            logger.info(f"[RUN] Step 2a: Analysis done ({time.monotonic() - t0:.1f}s)")
+
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 2b: Generating plan...")
+            plan_content = self.generate_plan(ticket_id, analysis, plan_path, worktree_path)
+            logger.info(f"[RUN] Step 2b: Plan generation done ({time.monotonic() - t0:.1f}s, {len(plan_content)} chars)")
+
+        # Step 3: Confidence evaluation (unless --force)
+        evaluation = None
+        if not force:
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 3: Running confidence evaluation...")
+            evaluation = self._evaluate_confidence(
+                plan_content, analysis, ticket_id, project_key
+            )
+            logger.info(f"[RUN] Step 3: Confidence = {evaluation['confidence_score']}/100 ({time.monotonic() - t0:.1f}s)")
+        else:
+            logger.info(f"[RUN] Step 3: Skipped (--force)")
+
+        # Step 4: Commit and push
+        t0 = time.monotonic()
+        logger.info(f"[RUN] Step 4: Committing and pushing...")
+        plan_updated = self.commit_and_push_plan(plan_path, ticket_id, worktree_path)
+        logger.info(f"[RUN] Step 4: Commit/push done (updated={plan_updated}, {time.monotonic() - t0:.1f}s)")
+
+        # Step 5: Create or get MR
+        t0 = time.monotonic()
+        logger.info(f"[RUN] Step 5: Creating/getting MR...")
+        mr_url, mr_created = self.create_or_get_mr(ticket_id, plan_path, project_key)
+        logger.info(f"[RUN] Step 5: MR done (created={mr_created}, {time.monotonic() - t0:.1f}s)")
+
+        # Step 6: Post confidence report to Jira
+        if evaluation:
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 6: Posting confidence report to Jira...")
+            self._post_confidence_report(ticket_id, evaluation)
+            logger.info(f"[RUN] Step 6: Report posted ({time.monotonic() - t0:.1f}s)")
+
+        # Step 7: If revision, reply to discussions
+        if state == "has_feedback" and revision_result:
+            t0 = time.monotonic()
+            logger.info(f"[RUN] Step 7: Replying to discussions...")
+            self._reply_to_discussions(
+                state_info["discussions"],
+                revision_result.get("feedback_responses", []),
+                state_info["project_path"],
+                state_info["mr_iid"],
+            )
+            logger.info(f"[RUN] Step 7: Replies done ({time.monotonic() - t0:.1f}s)")
+
+        logger.info(f"[RUN] Complete for {ticket_id} — total {time.monotonic() - run_start:.1f}s")
 
         return {
+            "action": state,
             "plan_path": str(plan_path),
             "mr_url": mr_url,
-            "revision_type": revision_result.get("revision_type", "incremental"),
-            "feedback_count": len(discussions),
+            "plan_content": plan_content,
             "plan_updated": plan_updated,
-            "responses_posted": len(feedback_responses),
+            "mr_created": mr_created,
+            "confidence_score": evaluation["confidence_score"] if evaluation else None,
+            "evaluation": evaluation,
+            "feedback_count": len(state_info.get("discussions", [])),
+            "revision_type": revision_result.get("revision_type") if revision_result else None,
         }
+
+    def run_revision(  # type: ignore[override]
+        self,
+        ticket_id: str,
+        worktree_path: Path,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Deprecated — run() now auto-detects state and handles revisions.
+
+        Args:
+            ticket_id: Jira ticket ID
+            worktree_path: Path to the git worktree
+            **kwargs: Additional parameters
+
+        Returns:
+            Result from run()
+        """
+        logger.warning("run_revision() is deprecated — run() now auto-detects state")
+        return self.run(ticket_id, worktree_path, **kwargs)
+
+    def _evaluate_confidence(
+        self,
+        plan_content: str,
+        analysis: Dict[str, Any],
+        ticket_id: str,
+        project_key: str,
+    ) -> Dict[str, Any]:
+        """Evaluate plan confidence using the ConfidenceEvaluatorAgent.
+
+        Args:
+            plan_content: Generated plan markdown
+            analysis: Ticket analysis results
+            ticket_id: Jira ticket ID
+            project_key: Project key for threshold lookup
+
+        Returns:
+            Evaluation dict with 'passed' and 'threshold' added
+        """
+        from src.agents.confidence_evaluator import ConfidenceEvaluatorAgent
+
+        logger.info(f"Running confidence evaluation for {ticket_id}")
+        evaluator = ConfidenceEvaluatorAgent()
+        evaluator.set_project(project_key)
+        result = evaluator.evaluate(plan_content, analysis["ticket_data"], analysis)
+
+        # Look up threshold (per-project override or global default)
+        project_config = self.config.get_project_config(project_key)
+        threshold = project_config.get(
+            "confidence_threshold",
+            self.config.get("confidence.default_threshold", 95),
+        )
+
+        return {
+            **result,
+            "passed": result["confidence_score"] >= threshold,
+            "threshold": threshold,
+        }
+

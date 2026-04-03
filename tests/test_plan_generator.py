@@ -1,5 +1,6 @@
 """Unit tests for PlanGeneratorAgent."""
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -476,3 +477,286 @@ class TestPlanGeneratorAgent:
         call_kwargs = mock_gitlab.return_value.create_merge_request.call_args[1]
         # Should fall back to project_key/backend
         assert call_kwargs["project_id"] == "acme/backend"
+
+
+class TestUnifiedPlanFlow:
+    """Tests for the unified plan workflow with state detection and confidence reports."""
+
+    SAMPLE_EVAL = {
+        "confidence_score": 98,
+        "gaps": [],
+        "assumptions": [],
+        "questions": [],
+        "invest_evaluation": {
+            "independent": {"score": 5, "note": "Good"},
+            "negotiable": {"score": 5, "note": "Good"},
+            "valuable": {"score": 5, "note": "Good"},
+            "estimatable": {"score": 5, "note": "Good"},
+            "small": {"score": 4, "note": "Good"},
+            "testable": {"score": 5, "note": "Good"},
+        },
+        "summary": "Ready",
+        "scope_suggestion": None,
+        "passed": True,
+        "threshold": 95,
+    }
+
+    def test_run_initial_state(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test first run: no plan → generate, create MR, post confidence report."""
+        agent = PlanGeneratorAgent()
+
+        with patch.object(agent, "_detect_plan_state") as mock_state, \
+             patch.object(agent, "analyze_ticket") as mock_analyze, \
+             patch.object(agent, "generate_plan") as mock_gen, \
+             patch.object(agent, "commit_and_push_plan") as mock_commit, \
+             patch.object(agent, "create_or_get_mr") as mock_mr, \
+             patch.object(agent, "_auto_profile_if_needed"), \
+             patch.object(agent, "_evaluate_confidence") as mock_eval, \
+             patch.object(agent, "_get_mr_info") as mock_mr_info, \
+             patch.object(agent, "_post_confidence_report") as mock_report:
+
+            mock_state.return_value = {"state": "initial"}
+            mock_analyze.return_value = {
+                "ticket_data": {"key": "TEST-123", "summary": "Test"},
+                "requirements": [], "risks": [],
+                "estimated_complexity": "low", "comments": [],
+            }
+            mock_gen.return_value = "# Plan content"
+            mock_commit.return_value = True
+            mock_mr.return_value = ("https://gitlab.com/mr/1", True)
+            mock_eval.return_value = self.SAMPLE_EVAL
+            mock_mr_info.return_value = {
+                "project_path": "test/project", "mr_iid": 42,
+                "mr_url": "https://gitlab.com/mr/1",
+            }
+
+            result = agent.run(ticket_id="TEST-123", worktree_path=temp_worktree)
+
+            assert result["action"] == "initial"
+            assert result["mr_url"] is not None
+            assert result["mr_created"] is True
+            assert result["confidence_score"] == 98
+            mock_gen.assert_called_once()
+            mock_report.assert_called_once()
+
+    def test_run_has_feedback_state(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test revision: existing plan + MR + discussions → revise, reply, post report."""
+        agent = PlanGeneratorAgent()
+
+        discussions = [
+            {"id": "disc-1", "notes": [{"id": 1, "author": {"name": "Dev"}, "body": "Fix section 3"}]},
+        ]
+
+        with patch.object(agent, "_detect_plan_state") as mock_state, \
+             patch.object(agent, "analyze_ticket") as mock_analyze, \
+             patch.object(agent, "revise_plan") as mock_revise, \
+             patch.object(agent, "commit_and_push_plan") as mock_commit, \
+             patch.object(agent, "create_or_get_mr") as mock_mr, \
+             patch.object(agent, "_auto_profile_if_needed"), \
+             patch.object(agent, "_evaluate_confidence") as mock_eval, \
+             patch.object(agent, "_get_mr_info") as mock_mr_info, \
+             patch.object(agent, "_post_confidence_report"), \
+             patch.object(agent, "_reply_to_discussions") as mock_reply:
+
+            mock_state.return_value = {
+                "state": "has_feedback",
+                "existing_plan": "# Old plan",
+                "mr_iid": 42, "mr_url": "https://gitlab.com/mr/1",
+                "project_path": "test/project",
+                "discussions": discussions,
+            }
+            mock_revise.return_value = {
+                "revised_plan": "# Revised plan",
+                "revision_type": "incremental",
+                "feedback_responses": [{"discussion_id": "disc-1", "changes_made": "Fixed"}],
+            }
+            mock_analyze.return_value = {
+                "ticket_data": {"key": "TEST-123"}, "requirements": [],
+                "risks": [], "estimated_complexity": "low", "comments": [],
+            }
+            mock_commit.return_value = True
+            mock_mr.return_value = ("https://gitlab.com/mr/1", False)
+            mock_eval.return_value = self.SAMPLE_EVAL
+            mock_mr_info.return_value = {
+                "project_path": "test/project", "mr_iid": 42,
+                "mr_url": "https://gitlab.com/mr/1",
+            }
+
+            result = agent.run(ticket_id="TEST-123", worktree_path=temp_worktree)
+
+            assert result["action"] == "has_feedback"
+            assert result["feedback_count"] == 1
+            assert result["revision_type"] == "incremental"
+            mock_revise.assert_called_once()
+            mock_reply.assert_called_once()
+
+    def test_run_update_state(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test update: existing plan + MR + new Jira comments → re-generate."""
+        agent = PlanGeneratorAgent()
+
+        with patch.object(agent, "_detect_plan_state") as mock_state, \
+             patch.object(agent, "analyze_ticket") as mock_analyze, \
+             patch.object(agent, "generate_plan") as mock_gen, \
+             patch.object(agent, "commit_and_push_plan") as mock_commit, \
+             patch.object(agent, "create_or_get_mr") as mock_mr, \
+             patch.object(agent, "_auto_profile_if_needed"), \
+             patch.object(agent, "_evaluate_confidence") as mock_eval, \
+             patch.object(agent, "_get_mr_info") as mock_mr_info, \
+             patch.object(agent, "_post_confidence_report"):
+
+            mock_state.return_value = {
+                "state": "update",
+                "existing_plan": "# Old plan",
+                "mr_iid": 42, "mr_url": "https://gitlab.com/mr/1",
+                "project_path": "test/project", "discussions": [],
+            }
+            mock_analyze.return_value = {
+                "ticket_data": {"key": "TEST-123"}, "requirements": [],
+                "risks": [], "estimated_complexity": "low", "comments": [],
+            }
+            mock_gen.return_value = "# Updated plan"
+            mock_commit.return_value = True
+            mock_mr.return_value = ("https://gitlab.com/mr/1", False)
+            mock_eval.return_value = self.SAMPLE_EVAL
+            mock_mr_info.return_value = {
+                "project_path": "test/project", "mr_iid": 42,
+                "mr_url": "https://gitlab.com/mr/1",
+            }
+
+            result = agent.run(ticket_id="TEST-123", worktree_path=temp_worktree)
+
+            assert result["action"] == "update"
+            mock_gen.assert_called_once()
+
+    def test_run_nothing_changed(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test nothing_changed: no new info → early return, no LLM calls."""
+        agent = PlanGeneratorAgent()
+
+        with patch.object(agent, "_detect_plan_state") as mock_state, \
+             patch.object(agent, "analyze_ticket") as mock_analyze, \
+             patch.object(agent, "_auto_profile_if_needed"):
+
+            mock_state.return_value = {
+                "state": "nothing_changed",
+                "existing_plan": "# Existing plan",
+                "mr_url": "https://gitlab.com/mr/1",
+            }
+
+            result = agent.run(ticket_id="TEST-123", worktree_path=temp_worktree)
+
+            assert result["action"] == "nothing_changed"
+            assert result["mr_url"] == "https://gitlab.com/mr/1"
+            assert result["confidence_score"] is None
+            # No LLM calls should be made
+            mock_analyze.assert_not_called()
+
+    def test_run_force_skips_evaluation(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test that --force skips the confidence evaluator entirely."""
+        agent = PlanGeneratorAgent()
+
+        with patch.object(agent, "_detect_plan_state") as mock_state, \
+             patch.object(agent, "analyze_ticket") as mock_analyze, \
+             patch.object(agent, "generate_plan") as mock_gen, \
+             patch.object(agent, "commit_and_push_plan") as mock_commit, \
+             patch.object(agent, "create_or_get_mr") as mock_mr, \
+             patch.object(agent, "_auto_profile_if_needed"), \
+             patch.object(agent, "_evaluate_confidence") as mock_eval:
+
+            mock_state.return_value = {"state": "initial"}
+            mock_analyze.return_value = {
+                "ticket_data": {"key": "TEST-123"}, "requirements": [],
+                "risks": [], "estimated_complexity": "low", "comments": [],
+            }
+            mock_gen.return_value = "# Plan content"
+            mock_commit.return_value = True
+            mock_mr.return_value = ("https://gitlab.com/mr/1", True)
+
+            result = agent.run(
+                ticket_id="TEST-123", worktree_path=temp_worktree, force=True,
+            )
+
+            assert result["confidence_score"] is None
+            assert result["mr_url"] is not None
+            mock_eval.assert_not_called()
+
+    def test_confidence_report_posted_to_jira_only(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test that confidence report is posted to Jira only, not GitLab MR."""
+        agent = PlanGeneratorAgent()
+
+        eval_with_questions = {
+            **self.SAMPLE_EVAL,
+            "confidence_score": 60,
+            "questions": ["What API format?"],
+            "gaps": ["Missing spec"],
+        }
+
+        with patch.object(agent, "_detect_plan_state") as mock_state, \
+             patch.object(agent, "analyze_ticket") as mock_analyze, \
+             patch.object(agent, "generate_plan") as mock_gen, \
+             patch.object(agent, "commit_and_push_plan"), \
+             patch.object(agent, "create_or_get_mr") as mock_mr, \
+             patch.object(agent, "_auto_profile_if_needed"), \
+             patch.object(agent, "_evaluate_confidence") as mock_eval:
+
+            mock_state.return_value = {"state": "initial"}
+            mock_analyze.return_value = {
+                "ticket_data": {"key": "TEST-123"}, "requirements": [],
+                "risks": [], "estimated_complexity": "low", "comments": [],
+            }
+            mock_gen.return_value = "# Plan"
+            mock_mr.return_value = ("https://gitlab.com/mr/1", True)
+            mock_eval.return_value = eval_with_questions
+
+            agent.run(ticket_id="TEST-123", worktree_path=temp_worktree)
+
+            # Verify Jira structured comment was called
+            mock_jira.return_value.add_structured_comment.assert_called_once()
+            # Verify GitLab MR comment was NOT called for confidence report
+            mock_gitlab.return_value.add_merge_request_comment.assert_not_called()
+
+    def test_revise_flag_deprecated(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Test that run_revision() delegates to run() with deprecation warning."""
+        agent = PlanGeneratorAgent()
+
+        with patch.object(agent, "run") as mock_run:
+            mock_run.return_value = {"action": "initial", "confidence_score": 98}
+
+            result = agent.run_revision(
+                ticket_id="TEST-123", worktree_path=temp_worktree,
+            )
+
+            mock_run.assert_called_once_with("TEST-123", temp_worktree)
+            assert result == {"action": "initial", "confidence_score": 98}
+
+    def test_analyze_ticket_includes_comments(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab
+    ):
+        """Test that analyze_ticket fetches and includes Jira comments."""
+        mock_jira.return_value.get_ticket_comments.return_value = [
+            {"author": "PO User", "body": "We should use SendGrid", "created": "2026-03-30"},
+        ]
+
+        agent = PlanGeneratorAgent()
+        analysis = agent.analyze_ticket("TEST-123")
+
+        # Comments should be in the analysis result
+        assert "comments" in analysis
+        assert len(analysis["comments"]) == 1
+        assert analysis["comments"][0]["author"] == "PO User"
+
+        # get_ticket_comments should have been called
+        mock_jira.return_value.get_ticket_comments.assert_called_once_with("TEST-123")
