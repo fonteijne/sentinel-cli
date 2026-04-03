@@ -69,101 +69,96 @@ def cli() -> None:
 @click.option(
     "--revise",
     is_flag=True,
-    help="Revise existing plan based on MR feedback",
+    hidden=True,
+    help="Deprecated — plan now auto-detects state",
 )
-def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False) -> None:
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Skip confidence evaluation (no report generated)",
+)
+def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False, force: bool = False) -> None:
     """Generate implementation plan for a Jira ticket.
 
     Creates a git worktree, analyzes the ticket, generates a detailed plan,
-    and creates a draft merge request.
+    and creates a draft merge request with a confidence report.
 
-    Use --revise to update an existing plan based on MR feedback.
+    Auto-detects state: first run generates from scratch, subsequent runs
+    pick up MR feedback or new Jira comments automatically.
+
+    Use --force to skip the confidence evaluation entirely.
 
     Args:
         ticket_id: Jira ticket ID (e.g., ACME-123)
         project: Project key (optional, extracted from ticket if not provided)
-        revise: Revise existing plan based on MR feedback
+        revise: Deprecated — ignored, state is auto-detected
+        force: Skip confidence evaluation (no report generated)
     """
     try:
+        if revise:
+            click.echo("⚠️  --revise is deprecated. 'sentinel plan' now auto-detects state.")
+
         # Extract project key from ticket ID if not provided
         if project is None:
             project = ticket_id.split("-")[0]
 
         # Initialize managers
         worktree_mgr = WorktreeManager()
+        jira_client = get_jira_client()
 
-        # Run revision workflow if --revise flag is set
-        if revise:
-            # For revision, worktree must already exist
-            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
-            click.echo(f"🔄 Revising plan for: {ticket_id}")
-            click.echo(f"🏗️  Project: {project}")
+        click.echo(f"📋 Planning ticket: {ticket_id}")
+        click.echo(f"🏗️  Project: {project}")
 
-            click.echo("\n1️⃣  Fetching MR feedback...")
-            plan_agent = PlanGeneratorAgent()
-            result = plan_agent.run_revision(ticket_id=ticket_id, worktree_path=worktree_path)
+        # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
+        click.echo("\n1️⃣  Fetching Jira ticket...")
+        ticket_data = jira_client.get_ticket(ticket_id)
+        click.echo(f"   ✓ {ticket_data['summary']}")
 
-            if result.get("feedback_count", 0) == 0:
-                click.echo("   ℹ No unresolved discussions found")
-                click.echo(f"\n✅ Nothing to revise for {ticket_id}")
-                return
+        # Step 2: Create git worktree (only after ticket is validated)
+        click.echo("\n2️⃣  Creating git worktree...")
+        worktree_path = worktree_mgr.create_worktree(ticket_id, project)
+        click.echo(f"   ✓ {worktree_path}")
 
-            click.echo(f"   ✓ Found {result['feedback_count']} unresolved discussion(s)")
+        # Step 3: Run unified plan workflow
+        click.echo("\n3️⃣  Generating implementation plan...")
+        plan_agent = PlanGeneratorAgent()
+        result = plan_agent.run(ticket_id=ticket_id, worktree_path=worktree_path, force=force)
 
-            click.echo("\n2️⃣  Revising plan based on feedback...")
-            revision_type = result.get("revision_type", "incremental")
-            click.echo(f"   ✓ Revision type: {revision_type.replace('_', ' ').title()}")
+        action = result.get("action")
 
-            click.echo("\n3️⃣  Updating MR...")
-            if result.get("plan_updated"):
-                click.echo("   ✓ Revised plan committed and pushed")
-            else:
-                click.echo("   ℹ Plan unchanged")
-
-            responses_posted = result.get("responses_posted", 0)
-            click.echo(f"   ✓ Posted {responses_posted} response(s) to discussions")
-            click.echo("   ✓ Added revision summary to MR")
-
-            click.echo(f"\n✅ Plan revision complete for {ticket_id}")
+        if action == "nothing_changed":
+            click.echo(f"\nℹ️  Nothing new for {ticket_id}")
+            click.echo("   No new Jira comments or MR discussions since last run.")
             click.echo(f"   MR: {result['mr_url']}")
-            click.echo("   Next: Review the updated plan and address any remaining feedback")
+            return
 
+        # Plan status
+        click.echo(f"   ✓ Plan saved: {result['plan_path']}")
+
+        # Confidence (if evaluated)
+        if result.get("confidence_score") is not None:
+            score = result["confidence_score"]
+            threshold = result["evaluation"]["threshold"]
+            click.echo(f"   ✓ Confidence: {score}/100 (threshold: {threshold})")
+            questions = result["evaluation"].get("questions", [])
+            if questions:
+                click.echo(f"   ✓ Posted {len(questions)} question(s) to Jira")
+
+        # Revision info
+        if action == "has_feedback":
+            click.echo(f"   ✓ Revised based on {result['feedback_count']} discussion(s)")
+
+        # Commit/MR status
+        if result.get("plan_updated"):
+            click.echo("   ✓ Plan committed and pushed")
+
+        if result.get("mr_created"):
+            click.echo(f"   ✓ Draft MR created: {result['mr_url']}")
         else:
-            # Normal plan generation workflow
-            jira_client = get_jira_client()
+            click.echo(f"   ✓ MR: {result['mr_url']}")
 
-            click.echo(f"📋 Planning ticket: {ticket_id}")
-            click.echo(f"🏗️  Project: {project}")
-
-            # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
-            click.echo("\n1️⃣  Fetching Jira ticket...")
-            ticket_data = jira_client.get_ticket(ticket_id)
-            click.echo(f"   ✓ {ticket_data['summary']}")
-
-            # Step 2: Create git worktree (only after ticket is validated)
-            click.echo("\n2️⃣  Creating git worktree...")
-            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
-            click.echo(f"   ✓ {worktree_path}")
-
-            # Step 3: Generate plan
-            click.echo("\n3️⃣  Generating implementation plan...")
-            plan_agent = PlanGeneratorAgent()
-            result = plan_agent.run(ticket_id=ticket_id, worktree_path=worktree_path)
-
-            click.echo(f"   ✓ Plan saved: {result['plan_path']}")
-
-            if result.get("plan_updated"):
-                click.echo("   ✓ Plan committed and pushed")
-            else:
-                click.echo("   ℹ Plan unchanged - skipped commit")
-
-            if result.get("mr_created"):
-                click.echo(f"   ✓ Draft MR created: {result['mr_url']}")
-            else:
-                click.echo(f"   ℹ Using existing MR: {result['mr_url']}")
-
-            click.echo(f"\n✅ Plan workflow complete for {ticket_id}")
-            click.echo(f"   Next: Review draft MR, then run 'sentinel execute {ticket_id}'")
+        click.echo(f"\n✅ Plan complete for {ticket_id}")
+        click.echo(f"   Next: Review draft MR, then run 'sentinel execute {ticket_id}'")
 
     except ValueError as e:
         if "not found" in str(e):
