@@ -412,6 +412,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         context: Dict[str, Any],
         output_path: Path,
         worktree_path: Path | None = None,
+        investigation_findings: str | None = None,
     ) -> str:
         """Generate a detailed implementation plan.
 
@@ -420,6 +421,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
             context: Context from ticket analysis
             output_path: Path to write the plan file
             worktree_path: Path to the git worktree root
+            investigation_findings: Pre-research findings from investigate_comments()
 
         Returns:
             Plan content as markdown string
@@ -453,6 +455,18 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         effective_worktree = worktree_path or output_path.parent.parent.parent
         stack_context = self._load_stack_context(ticket_id, effective_worktree)
 
+        # Build optional sections
+        attachments_section = AttachmentManager().format_for_prompt(attachments_data) if attachments_data else ""
+
+        findings_section = ""
+        if investigation_findings:
+            findings_section = (
+                "## Pre-Research Findings\n\n"
+                "The following findings were verified by searching the codebase based on client feedback.\n"
+                "Use these as VERIFIED FACTS - do not re-investigate these items.\n\n"
+                f"{investigation_findings}\n\n"
+            )
+
         # System prompt defines the detailed format - user prompt tells agent to write the file
         plan_file_path = str(output_path)
         plan_prompt = f"""Generate a comprehensive implementation plan for ticket {ticket_id}.
@@ -473,8 +487,8 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
 {risks_text}
 
 **Estimated Complexity**: {complexity}
-{AttachmentManager().format_for_prompt(attachments_data) if attachments_data else ""}
-## OUTPUT FILE PATH
+{attachments_section}
+{findings_section}## OUTPUT FILE PATH
 
 Use the Write tool to save the implementation plan to: `{plan_file_path}`
 
@@ -940,6 +954,145 @@ The detailed plan has been committed to the repository at `{plan_path}`.
                 # Some other error, re-raise
                 raise
 
+    def investigate_comments(
+        self,
+        ticket_id: str,
+        new_comments: list[Dict[str, Any]],
+        existing_plan: str,
+        worktree_path: Path,
+    ) -> str:
+        """Investigate actionable claims from Jira comments by searching the codebase.
+
+        Called when the client has replied to Sentinel's confidence report with
+        new context. Uses Read/Grep/Glob to verify claims and locate referenced
+        code before plan generation.
+
+        Args:
+            ticket_id: Jira ticket ID
+            new_comments: New comment dicts with 'author', 'created', 'body'
+            existing_plan: Current plan content (for context)
+            worktree_path: Path to the git worktree (enables tool access)
+
+        Returns:
+            Investigation report as markdown
+        """
+        logger.info(f"Investigating {len(new_comments)} new comment(s) for {ticket_id}")
+
+        # Fresh session to avoid context contamination
+        self.session_id = None
+        self.messages.clear()
+
+        comments_text = "\n".join(
+            f"### Comment by {c['author']} ({c.get('created', 'unknown')})\n{c['body']}\n"
+            for c in new_comments
+        )
+
+        investigation_prompt = f"""You are investigating new client feedback for ticket {ticket_id}.
+
+The client replied to Sentinel's confidence report with new information. Your job is to
+SEARCH THE CODEBASE to verify and locate anything the client mentions, then report your findings.
+
+## New Comments from Client
+
+{comments_text}
+
+## Current Plan (for context only — do NOT rewrite it)
+
+{existing_plan}
+
+## Your Task
+
+1. **Extract actionable claims** from the comments above. These are statements like:
+   - "There's already a [thing] in the project"
+   - "Look at [file/module/pattern]"
+   - "We use [library/approach] for this"
+   - Answers to specific questions from the confidence report
+
+2. **For each claim, search the codebase** using your tools:
+   - Use Grep to search for keywords, function names, class names mentioned
+   - Use Glob to find files matching described patterns
+   - Use Read to examine relevant files you find
+
+3. **Write your findings** in this exact format:
+
+## Investigation Report
+
+### Claims Investigated
+
+#### Claim 1: [paraphrase of what client said]
+- **Search performed**: [what you searched for]
+- **Found**: [what you actually found, with file paths and line numbers]
+- **Relevance to plan**: [how this affects the implementation approach]
+
+[repeat for each actionable claim]
+
+### Summary of Findings
+[2-3 sentences summarizing what was found and how it should influence the plan]
+
+### Items NOT Found
+[Any claims that could not be verified in the codebase, or "None" if all verified]
+
+## RULES
+- Do NOT rewrite or generate a plan. You are ONLY investigating.
+- Do NOT explore the entire codebase. Only search for things mentioned in comments.
+- Keep your investigation focused: max 2-3 searches per claim.
+- Include exact file paths and line numbers for everything you find.
+- If a comment is just acknowledgment ("thanks", "ok") with no actionable content, note it and move on.
+"""
+
+        response = self.send_message(
+            investigation_prompt,
+            cwd=str(worktree_path),
+            max_turns=15,
+        )
+
+        # Extract the report section if present
+        if "## Investigation Report" in response:
+            report = response[response.index("## Investigation Report"):]
+        else:
+            report = response
+
+        logger.info(f"Investigation complete for {ticket_id}: {len(report)} chars")
+        return report
+
+    def _post_investigation_report(
+        self,
+        ticket_id: str,
+        investigation_report: str,
+    ) -> None:
+        """Post investigation findings to Jira so the client sees the research.
+
+        Args:
+            ticket_id: Jira ticket ID
+            investigation_report: Markdown investigation findings
+        """
+        # Convert markdown to Jira wiki markup
+        body = investigation_report
+        if body.startswith("## Investigation Report"):
+            body = body[len("## Investigation Report"):].strip()
+
+        body = re.sub(r'^#### (.+)$', r'h4. \1', body, flags=re.MULTILINE)
+        body = re.sub(r'^### (.+)$', r'h3. \1', body, flags=re.MULTILINE)
+        body = re.sub(r'\*\*(.+?)\*\*', r'*\1*', body)
+
+        lines: list[str] = [
+            "h2. \U0001f50d Sentinel Investigation Report",
+            "",
+            "_Sentinel investigated the codebase based on your feedback:_",
+            "",
+            body,
+            "",
+            f"_This research will be incorporated into the updated plan._",
+        ]
+        comment_body = "\n".join(lines)
+
+        try:
+            logger.info(f"Posting investigation report to Jira {ticket_id}")
+            self.jira.add_comment(ticket_id, comment_body)
+            logger.info(f"Posted investigation report to Jira {ticket_id}")
+        except Exception as e:
+            logger.error(f"Failed to post investigation report: {e}", exc_info=True)
+
     def _detect_plan_state(
         self,
         ticket_id: str,
@@ -1003,14 +1156,20 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         # No discussions — check Jira for new context
         comments = self.jira.get_ticket_comments(ticket_id)
 
-        # Find the last Sentinel confidence report comment
+        # Find the last Sentinel-authored comment (confidence or investigation report)
         last_sentinel_idx = -1
         for i, comment in enumerate(comments):
-            if "Sentinel Confidence Report" in comment.get("body", ""):
+            if self._is_sentinel_comment(comment.get("body", "")):
                 last_sentinel_idx = i
 
-        if last_sentinel_idx == -1:
-            # No Sentinel report posted yet — re-run with latest context
+        # Collect non-Sentinel comments posted after the last report
+        comment_pool = comments if last_sentinel_idx == -1 else comments[last_sentinel_idx + 1:]
+        new_comments = [
+            c for c in comment_pool
+            if not self._is_sentinel_comment(c.get("body", ""))
+        ]
+
+        if new_comments:
             return {
                 "state": "update",
                 "existing_plan": existing_plan,
@@ -1018,23 +1177,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
                 "mr_url": mr_url,
                 "project_path": project_path,
                 "discussions": [],
-            }
-
-        # Check if any non-Sentinel comments were posted after the last report
-        has_new_comments = False
-        for comment in comments[last_sentinel_idx + 1:]:
-            if "Sentinel Confidence Report" not in comment.get("body", ""):
-                has_new_comments = True
-                break
-
-        if has_new_comments:
-            return {
-                "state": "update",
-                "existing_plan": existing_plan,
-                "mr_iid": mr_iid,
-                "mr_url": mr_url,
-                "project_path": project_path,
-                "discussions": [],
+                "new_comments": new_comments,
             }
 
         # Nothing changed since last run
@@ -1046,6 +1189,14 @@ The detailed plan has been committed to the repository at `{plan_path}`.
             "project_path": project_path,
             "discussions": [],
         }
+
+    @staticmethod
+    def _is_sentinel_comment(body: str) -> bool:
+        """Check if a Jira comment was posted by Sentinel."""
+        return (
+            "Sentinel Confidence Report" in body
+            or "Sentinel Investigation Report" in body
+        )
 
     def _get_mr_info(
         self,
@@ -1310,9 +1461,25 @@ The detailed plan has been committed to the repository at `{plan_path}`.
             analysis = self.analyze_ticket(ticket_id, worktree_path)
             logger.info(f"[RUN] Step 2a: Analysis done ({time.monotonic() - t0:.1f}s)")
 
+            # Step 2a.5: Investigate client comments (update re-entry only)
+            investigation_findings = None
+            new_comments = state_info.get("new_comments", [])
+            if state == "update" and new_comments:
+                t0 = time.monotonic()
+                logger.info(f"[RUN] Step 2a.5: Investigating {len(new_comments)} new comment(s)...")
+                investigation_findings = self.investigate_comments(
+                    ticket_id, new_comments,
+                    state_info.get("existing_plan", ""), worktree_path,
+                )
+                self._post_investigation_report(ticket_id, investigation_findings)
+                logger.info(f"[RUN] Step 2a.5: Investigation done ({time.monotonic() - t0:.1f}s)")
+
             t0 = time.monotonic()
             logger.info(f"[RUN] Step 2b: Generating plan...")
-            plan_content = self.generate_plan(ticket_id, analysis, plan_path, worktree_path)
+            plan_content = self.generate_plan(
+                ticket_id, analysis, plan_path, worktree_path,
+                investigation_findings=investigation_findings,
+            )
             logger.info(f"[RUN] Step 2b: Plan generation done ({time.monotonic() - t0:.1f}s, {len(plan_content)} chars)")
 
         # Step 3: Confidence evaluation (unless --force)
@@ -1371,6 +1538,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
             "evaluation": evaluation,
             "feedback_count": len(state_info.get("discussions", [])),
             "revision_type": revision_result.get("revision_type") if revision_result else None,
+            "investigation_findings": investigation_findings if state != "has_feedback" else None,
         }
 
     def run_revision(  # type: ignore[override]

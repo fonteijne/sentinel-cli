@@ -760,3 +760,124 @@ class TestUnifiedPlanFlow:
 
         # get_ticket_comments should have been called
         mock_jira.return_value.get_ticket_comments.assert_called_once_with("TEST-123")
+
+    def test_is_sentinel_comment(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab
+    ):
+        """Test _is_sentinel_comment identifies Sentinel-authored comments."""
+        assert PlanGeneratorAgent._is_sentinel_comment(
+            "h2. Sentinel Confidence Report\n..."
+        ) is True
+        assert PlanGeneratorAgent._is_sentinel_comment(
+            "h2. Sentinel Investigation Report\n..."
+        ) is True
+        assert PlanGeneratorAgent._is_sentinel_comment(
+            "Er zit al een modulo-7 integratie in het project"
+        ) is False
+        assert PlanGeneratorAgent._is_sentinel_comment("") is False
+
+    def test_detect_plan_state_filters_investigation_reports(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Investigation reports should not trigger re-entry."""
+        agent = PlanGeneratorAgent()
+
+        # Create existing plan
+        plan_dir = temp_worktree / ".agents" / "plans"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "TEST-123.md").write_text("# Existing plan")
+
+        # Mock MR exists
+        agent._get_mr_info = Mock(return_value={
+            "project_path": "test/project",
+            "mr_iid": 42,
+            "mr_url": "https://gitlab.com/test/project/-/merge_requests/42",
+        })
+
+        # No unresolved MR discussions
+        agent.gitlab.get_merge_request_discussions.return_value = []
+
+        # Jira comments: Sentinel report followed by Sentinel investigation — no human reply
+        mock_jira.return_value.get_ticket_comments.return_value = [
+            {"author": "sentinel", "body": "h2. Sentinel Confidence Report\nScore: 68/100"},
+            {"author": "sentinel", "body": "h2. Sentinel Investigation Report\nFindings..."},
+        ]
+
+        state_info = agent._detect_plan_state("TEST-123", temp_worktree, "TEST")
+        assert state_info["state"] == "nothing_changed"
+
+    def test_run_update_with_investigation(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """In update state, investigation runs between analysis and plan generation."""
+        agent = PlanGeneratorAgent()
+
+        new_comments = [
+            {"author": "Client", "body": "Er zit al een modulo-7 integratie", "created": "2026-04-03"},
+        ]
+
+        # Mock _detect_plan_state to return "update" with new comments
+        agent._detect_plan_state = Mock(return_value={
+            "state": "update",
+            "existing_plan": "# Old plan",
+            "mr_iid": 42,
+            "mr_url": "https://gitlab.com/test/project/-/merge_requests/42",
+            "project_path": "test/project",
+            "discussions": [],
+            "new_comments": new_comments,
+        })
+
+        agent._auto_profile_if_needed = Mock()
+
+        # Track call order
+        call_order = []
+
+        original_analyze = agent.analyze_ticket
+        def mock_analyze(*args, **kwargs):
+            call_order.append("analyze")
+            return {
+                "ticket_data": {"key": "TEST-123", "summary": "Test"},
+                "requirements": ["Req 1"],
+                "risks": [],
+                "estimated_complexity": "medium",
+            }
+        agent.analyze_ticket = mock_analyze
+
+        def mock_investigate(*args, **kwargs):
+            call_order.append("investigate")
+            return "## Findings\nFound modulo-7 integration in src/modules/custom_math"
+        agent.investigate_comments = mock_investigate
+
+        def mock_post_investigation(*args, **kwargs):
+            call_order.append("post_investigation")
+        agent._post_investigation_report = mock_post_investigation
+
+        def mock_generate(*args, **kwargs):
+            call_order.append("generate")
+            # Verify investigation_findings was passed
+            assert kwargs.get("investigation_findings") is not None
+            assert "modulo-7" in kwargs["investigation_findings"]
+            return "# Updated plan with modulo-7 context"
+        agent.generate_plan = mock_generate
+
+        agent._evaluate_confidence = Mock(return_value={
+            "confidence_score": 85,
+            "gaps": [],
+            "assumptions": [],
+            "questions": [],
+        })
+        agent.commit_and_push_plan = Mock(return_value=True)
+        agent.create_or_get_mr = Mock(return_value=(
+            "https://gitlab.com/test/project/-/merge_requests/42", False
+        ))
+        agent._post_confidence_report = Mock()
+
+        result = agent.run("TEST-123", temp_worktree)
+
+        # Verify correct execution order
+        assert call_order == ["analyze", "investigate", "post_investigation", "generate"]
+
+        # Verify result includes investigation findings
+        assert result["investigation_findings"] is not None
+        assert "modulo-7" in result["investigation_findings"]
+        assert result["action"] == "update"
