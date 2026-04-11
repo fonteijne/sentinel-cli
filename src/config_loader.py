@@ -121,7 +121,9 @@ class ConfigLoader:
         return os.environ.get(env_key, default)
 
     def get_jira_config(self) -> Dict[str, Any]:
-        """Get Jira configuration from environment variables.
+        """Get Jira configuration from environment variables and YAML config.
+
+        Environment variables take precedence over YAML config values.
 
         Returns:
             Dictionary with Jira configuration
@@ -130,6 +132,10 @@ class ConfigLoader:
             "base_url": self.get_env("JIRA_BASE_URL", ""),
             "api_token": self.get_env("JIRA_API_TOKEN"),
             "email": self.get_env("JIRA_EMAIL"),
+            "comment_visibility_role": (
+                self.get_env("JIRA_COMMENT_VISIBILITY_ROLE")
+                or self.get("jira.comment_visibility_role")
+            ),
         }
 
     def get_gitlab_config(self) -> Dict[str, Any]:

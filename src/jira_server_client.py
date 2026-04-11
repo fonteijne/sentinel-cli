@@ -28,6 +28,9 @@ class JiraServerClient:
                 "and JIRA_BASE_URL in config."
             )
 
+        # Comment visibility restriction (project role name, e.g., "employees")
+        self.comment_visibility_role = jira_config.get("comment_visibility_role")
+
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {self.api_token}",
@@ -116,9 +119,32 @@ class JiraServerClient:
         if link_text and link_url:
             body += f" [{link_text}|{link_url}]"
 
-        payload = {"body": body}
+        payload: Dict[str, Any] = {"body": body}
 
+        # Restrict visibility to a project role if configured
+        if self.comment_visibility_role:
+            payload["visibility"] = {
+                "type": "role",
+                "value": self.comment_visibility_role,
+            }
+
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        _logger.debug(f"Posting comment to {ticket_id}, payload keys: {list(payload.keys())}")
         response = self.session.post(url, json=payload)
+
+        if response.status_code >= 400 and self.comment_visibility_role:
+            # Log the response body for debugging visibility issues
+            _logger.warning(
+                f"Comment with visibility role '{self.comment_visibility_role}' "
+                f"failed ({response.status_code}): {response.text[:500]}"
+            )
+            # Retry without visibility restriction rather than losing the comment
+            _logger.info("Retrying comment without visibility restriction")
+            payload.pop("visibility", None)
+            response = self.session.post(url, json=payload)
+
         response.raise_for_status()
 
         result: Dict[str, Any] = response.json()
@@ -299,3 +325,23 @@ class JiraServerClient:
             })
 
         return results
+
+    def get_project_roles(self, project_key: str) -> Dict[str, str]:
+        """Get available project roles for a Jira project.
+
+        Useful for debugging comment visibility restrictions.
+
+        Args:
+            project_key: Project key (e.g., "ACME")
+
+        Returns:
+            Dictionary mapping role name to role URL
+
+        Raises:
+            requests.HTTPError: If API request fails
+        """
+        url = f"{self.base_url}/rest/api/2/project/{project_key}/role"
+        response = self.session.get(url)
+        response.raise_for_status()
+        result: Dict[str, str] = response.json()
+        return result
