@@ -17,6 +17,7 @@ from src.environment_manager import EnvironmentManager
 from src.jira_factory import get_jira_client
 from src.beads_manager import BeadsManager
 from src.session_tracker import SessionTracker
+from src.agents.functional_debrief import FunctionalDebriefAgent
 from src.agents.plan_generator import PlanGeneratorAgent
 from src.agents.python_developer import PythonDeveloperAgent
 from src.agents.security_reviewer import SecurityReviewerAgent
@@ -169,6 +170,99 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False, fo
     except Exception as e:
         logger.error(f"Plan command failed: {e}", exc_info=True)
         click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("ticket_id")
+@click.option(
+    "--project",
+    "-p",
+    help="Project key (e.g., ACME). If not provided, extracted from ticket ID.",
+)
+def debrief(ticket_id: str, project: Optional[str] = None) -> None:
+    """Run a functional debrief for a Jira ticket.
+
+    Analyzes the ticket from a functional perspective and posts a
+    conversational debrief comment to Jira. Re-running detects client
+    replies and continues the conversation until understanding is validated.
+
+    This is a VOLUNTARY step before 'sentinel plan'. It ensures
+    functional understanding before technical planning begins.
+
+    Args:
+        ticket_id: Jira ticket ID (e.g., ACME-123)
+        project: Project key (optional, extracted from ticket if not provided)
+    """
+    try:
+        # Extract project key from ticket ID if not provided
+        if project is None:
+            project = ticket_id.split("-")[0]
+
+        click.echo(f"\U0001f4ac Functional Debrief: {ticket_id}")
+        click.echo(f"\U0001f3d7\ufe0f  Project: {project}")
+
+        # Step 1: Create git worktree for codebase access
+        worktree_path = None
+        try:
+            worktree_mgr = WorktreeManager()
+            click.echo("\n1\ufe0f\u20e3  Creating git worktree...")
+            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
+            click.echo(f"   \u2713 {worktree_path}")
+        except Exception as e:
+            click.echo(f"   \u26a0\ufe0f  No codebase access: {e}")
+            click.echo("   Continuing with text-only analysis...")
+
+        # Step 2: Run debrief agent
+        click.echo("\n2\ufe0f\u20e3  Analyzing ticket...")
+        agent = FunctionalDebriefAgent()
+        result = agent.run(ticket_id=ticket_id, project=project, worktree_path=worktree_path)
+
+        action = result.get("action")
+        iteration_count = result.get("iteration_count", 1)
+
+        if action == "posted":
+            click.echo("   \u2713 Debrief generated and posted to Jira")
+            click.echo(f"\n\u2705 Debrief posted for {ticket_id}")
+            click.echo("   Next: Wait for client to reply on Jira, then re-run:")
+            click.echo(f"         sentinel debrief {ticket_id}")
+
+        elif action == "awaiting_reply":
+            posted_at = result.get("posted_at", "unknown")
+            click.echo(f"   \u2139\ufe0f  Debrief posted (at {posted_at}), no client reply yet.")
+            click.echo(f"\n\u23f3 Waiting for client response on {ticket_id}")
+            click.echo("   Check Jira and ask the client to reply to the debrief comment.")
+
+        elif action == "followed_up":
+            click.echo(f"   \u2713 Follow-up posted (iteration {iteration_count})")
+            click.echo(f"\n\u2705 Follow-up posted for {ticket_id}")
+            click.echo("   Next: Wait for client to reply, then re-run:")
+            click.echo(f"         sentinel debrief {ticket_id}")
+
+        elif action == "proposed_closure":
+            click.echo(f"   \u2713 Summary posted (iteration {iteration_count})")
+            click.echo(f"\n\u2705 Summary posted for {ticket_id}")
+            click.echo("   Next: Wait for client to confirm, then re-run:")
+            click.echo(f"         sentinel debrief {ticket_id}")
+
+        elif action == "pending_confirmation":
+            click.echo("   \u2139\ufe0f  Summary posted, waiting for client confirmation.")
+            click.echo(f"\n\u23f3 Waiting for client to confirm on {ticket_id}")
+
+        elif action == "validated":
+            click.echo("   \u2713 Client confirmed the debrief")
+            click.echo(f"\n\u2705 Debrief validated for {ticket_id}")
+            click.echo(f"   Next: Run 'sentinel plan {ticket_id}' to start technical planning")
+
+    except ValueError as e:
+        if "not found" in str(e):
+            click.echo(f"\n\u274c {e}", err=True)
+            click.echo("   Check that the ticket ID is correct and exists in Jira.")
+            sys.exit(1)
+        raise
+    except Exception as e:
+        logger.error(f"Debrief command failed: {e}", exc_info=True)
+        click.echo(f"\n\u274c Error: {e}", err=True)
         sys.exit(1)
 
 

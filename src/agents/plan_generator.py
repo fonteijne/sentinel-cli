@@ -1196,6 +1196,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         return (
             "Sentinel Confidence Report" in body
             or "Sentinel Investigation Report" in body
+            or "Sentinel Functional Debrief" in body
         )
 
     def _get_mr_info(
