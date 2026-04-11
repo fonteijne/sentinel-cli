@@ -31,8 +31,35 @@ class WorktreeManager:
         self.config = get_config()
         self.workspace_root = self.config.workspace_root
 
+    def _find_existing_clone(self, git_url: str, exclude_key: str) -> Optional[Path]:
+        """Find an existing bare clone for the same git URL under a different project.
+
+        Multiple Jira projects can share the same git repo. When one project
+        already has a bare clone, other projects can symlink to it instead
+        of cloning again.
+
+        Args:
+            git_url: Git URL to match
+            exclude_key: Project key to skip (the one we're creating for)
+
+        Returns:
+            Path to existing bare clone, or None
+        """
+        all_projects = self.config.get_all_projects()
+        for key, cfg in all_projects.items():
+            if key.upper() == exclude_key.upper():
+                continue
+            if cfg.get("git_url") == git_url:
+                candidate = self.workspace_root / key.lower()
+                if candidate.exists() and (candidate / "config").exists():
+                    return candidate
+        return None
+
     def ensure_bare_clone(self, project_key: str) -> Path:
         """Ensure a bare clone exists for the project.
+
+        If another project shares the same git_url and already has a bare
+        clone, creates a symlink instead of cloning again.
 
         Args:
             project_key: Project key (e.g., "ACME")
@@ -57,6 +84,18 @@ class WorktreeManager:
 
         # Bare clone directory
         bare_clone_dir = self.workspace_root / project_key.lower()
+
+        # If no bare clone exists, check if another project shares the same
+        # git_url and already has one — symlink to it instead of re-cloning.
+        if not bare_clone_dir.exists():
+            existing_clone = self._find_existing_clone(git_url, project_key)
+            if existing_clone:
+                bare_clone_dir.symlink_to(existing_clone)
+                import logging
+                logging.getLogger(__name__).info(
+                    f"Reusing bare clone {existing_clone} for project {project_key} "
+                    f"(same git_url)"
+                )
 
         # Check if bare clone already exists
         if (bare_clone_dir / "config").exists():
