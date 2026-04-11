@@ -154,6 +154,37 @@ class JiraClient:
         result: Dict[str, Any] = response.json()
         return result
 
+    def add_structured_comment(
+        self,
+        ticket_id: str,
+        adf_content: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Add a comment with structured ADF content (headings, lists, paragraphs).
+
+        Args:
+            ticket_id: Ticket ID
+            adf_content: List of ADF content blocks (use adf_* helpers to build)
+
+        Returns:
+            Comment data from API response
+
+        Raises:
+            requests.HTTPError: If API request fails
+        """
+        url = f"{self.base_url}/rest/api/3/issue/{ticket_id}/comment"
+        payload = {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": adf_content,
+            }
+        }
+        response = self.session.post(url, json=payload)
+        response.raise_for_status()
+
+        result: Dict[str, Any] = response.json()
+        return result
+
     def update_status(self, ticket_id: str, status: str) -> Dict[str, Any]:
         """Update the status of a Jira ticket.
 
@@ -352,3 +383,69 @@ class JiraClient:
             })
 
         return results
+
+
+# --- ADF (Atlassian Document Format) builder helpers ---
+
+
+def adf_heading(text: str, level: int = 3) -> Dict[str, Any]:
+    """Create an ADF heading node."""
+    return {
+        "type": "heading",
+        "attrs": {"level": level},
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def adf_paragraph(text: str) -> Dict[str, Any]:
+    """Create an ADF paragraph node."""
+    return {
+        "type": "paragraph",
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def adf_bullet_list(items: List[str]) -> Dict[str, Any]:
+    """Create an ADF bullet list node."""
+    return {
+        "type": "bulletList",
+        "content": [
+            {
+                "type": "listItem",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": item}],
+                    }
+                ],
+            }
+            for item in items
+        ],
+    }
+
+
+def adf_ordered_list(items: List[str]) -> Dict[str, Any]:
+    """Create an ADF ordered list node."""
+    return {
+        "type": "orderedList",
+        "content": [
+            {
+                "type": "listItem",
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": item}],
+                    }
+                ],
+            }
+            for item in items
+        ],
+    }
+
+
+def adf_code_block(text: str) -> Dict[str, Any]:
+    """Create an ADF code block node."""
+    return {
+        "type": "codeBlock",
+        "content": [{"type": "text", "text": text}],
+    }

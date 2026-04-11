@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -126,7 +127,8 @@ class BaseAgent(ABC):
         return ""
 
     async def _send_message_async(
-        self, content: str, role: str = "user", cwd: str | None = None
+        self, content: str, role: str = "user", cwd: str | None = None,
+        max_turns: int | None = None,
     ) -> str:
         """Internal async implementation using Agent SDK.
 
@@ -134,6 +136,7 @@ class BaseAgent(ABC):
             content: Message content
             role: Message role ("user" or "assistant")
             cwd: Working directory for tool execution
+            max_turns: Optional max agentic turns
 
         Returns:
             Agent's response text
@@ -145,11 +148,22 @@ class BaseAgent(ABC):
         user_prompt = self._build_user_prompt()
 
         # Execute via Agent SDK with system prompt passed separately
+        t0 = time.monotonic()
+        logger.info(
+            f"[LLM] {self.agent_name}: sending request "
+            f"(prompt={len(content)} chars, cwd={cwd}, session={self.session_id}, max_turns={max_turns})"
+        )
         response = await self.agent_sdk.execute_with_tools(
             prompt=user_prompt,
             session_id=self.session_id,
             system_prompt=self.system_prompt if self.system_prompt else None,
             cwd=cwd,
+            max_turns=max_turns,
+        )
+        elapsed = time.monotonic() - t0
+        logger.info(
+            f"[LLM] {self.agent_name}: response received "
+            f"({len(str(response['content']))} chars, {len(response.get('tool_uses', []))} tools, {elapsed:.1f}s)"
         )
 
         # Extract text content
@@ -164,7 +178,8 @@ class BaseAgent(ABC):
         return content_text
 
     def send_message(
-        self, content: str, role: str = "user", cwd: str | None = None
+        self, content: str, role: str = "user", cwd: str | None = None,
+        max_turns: int | None = None,
     ) -> str:
         """Send a message to the agent and get a response.
 
@@ -175,12 +190,14 @@ class BaseAgent(ABC):
             content: Message content
             role: Message role ("user" or "assistant")
             cwd: Working directory for tool execution (important for agents with tools)
+            max_turns: Optional max agentic turns
 
         Returns:
             Agent's response text
         """
         # Run async execution in sync context
-        result = asyncio.run(self._send_message_async(content, role, cwd))
+        logger.info(f"[LLM] {self.agent_name}: send_message called (cwd={cwd}, max_turns={max_turns})")
+        result = asyncio.run(self._send_message_async(content, role, cwd, max_turns=max_turns))
         return result
 
     def execute_command(

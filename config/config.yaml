@@ -20,6 +20,10 @@ agents:
     temperature: 0.1
     strictness: 5
     veto_power: true
+  confidence_evaluator:
+    model: claude-4-5-sonnet
+    temperature: 0.1
+    allowed_tools: []
   project_profiler:
     model: claude-4-5-sonnet
     temperature: 0.2
@@ -64,6 +68,12 @@ environment:
   auto_cleanup: true
   # Named volume shared between Sentinel and child containers
   volume_name: sentinel-projects
+jira:
+  # Restrict all Sentinel comments to this project role.
+  # Set to null or remove to post unrestricted comments.
+  comment_visibility_role: Employees
+confidence:
+  default_threshold: 95
 logging:
   level: INFO
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

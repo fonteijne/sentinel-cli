@@ -17,6 +17,7 @@ from src.environment_manager import EnvironmentManager
 from src.jira_factory import get_jira_client
 from src.beads_manager import BeadsManager
 from src.session_tracker import SessionTracker
+from src.agents.functional_debrief import FunctionalDebriefAgent
 from src.agents.plan_generator import PlanGeneratorAgent
 from src.agents.python_developer import PythonDeveloperAgent
 from src.agents.security_reviewer import SecurityReviewerAgent
@@ -69,101 +70,96 @@ def cli() -> None:
 @click.option(
     "--revise",
     is_flag=True,
-    help="Revise existing plan based on MR feedback",
+    hidden=True,
+    help="Deprecated — plan now auto-detects state",
 )
-def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False) -> None:
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Skip confidence evaluation (no report generated)",
+)
+def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False, force: bool = False) -> None:
     """Generate implementation plan for a Jira ticket.
 
     Creates a git worktree, analyzes the ticket, generates a detailed plan,
-    and creates a draft merge request.
+    and creates a draft merge request with a confidence report.
 
-    Use --revise to update an existing plan based on MR feedback.
+    Auto-detects state: first run generates from scratch, subsequent runs
+    pick up MR feedback or new Jira comments automatically.
+
+    Use --force to skip the confidence evaluation entirely.
 
     Args:
         ticket_id: Jira ticket ID (e.g., ACME-123)
         project: Project key (optional, extracted from ticket if not provided)
-        revise: Revise existing plan based on MR feedback
+        revise: Deprecated — ignored, state is auto-detected
+        force: Skip confidence evaluation (no report generated)
     """
     try:
+        if revise:
+            click.echo("⚠️  --revise is deprecated. 'sentinel plan' now auto-detects state.")
+
         # Extract project key from ticket ID if not provided
         if project is None:
             project = ticket_id.split("-")[0]
 
         # Initialize managers
         worktree_mgr = WorktreeManager()
+        jira_client = get_jira_client()
 
-        # Run revision workflow if --revise flag is set
-        if revise:
-            # For revision, worktree must already exist
-            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
-            click.echo(f"🔄 Revising plan for: {ticket_id}")
-            click.echo(f"🏗️  Project: {project}")
+        click.echo(f"📋 Planning ticket: {ticket_id}")
+        click.echo(f"🏗️  Project: {project}")
 
-            click.echo("\n1️⃣  Fetching MR feedback...")
-            plan_agent = PlanGeneratorAgent()
-            result = plan_agent.run_revision(ticket_id=ticket_id, worktree_path=worktree_path)
+        # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
+        click.echo("\n1️⃣  Fetching Jira ticket...")
+        ticket_data = jira_client.get_ticket(ticket_id)
+        click.echo(f"   ✓ {ticket_data['summary']}")
 
-            if result.get("feedback_count", 0) == 0:
-                click.echo("   ℹ No unresolved discussions found")
-                click.echo(f"\n✅ Nothing to revise for {ticket_id}")
-                return
+        # Step 2: Create git worktree (only after ticket is validated)
+        click.echo("\n2️⃣  Creating git worktree...")
+        worktree_path = worktree_mgr.create_worktree(ticket_id, project)
+        click.echo(f"   ✓ {worktree_path}")
 
-            click.echo(f"   ✓ Found {result['feedback_count']} unresolved discussion(s)")
+        # Step 3: Run unified plan workflow
+        click.echo("\n3️⃣  Generating implementation plan...")
+        plan_agent = PlanGeneratorAgent()
+        result = plan_agent.run(ticket_id=ticket_id, worktree_path=worktree_path, force=force)
 
-            click.echo("\n2️⃣  Revising plan based on feedback...")
-            revision_type = result.get("revision_type", "incremental")
-            click.echo(f"   ✓ Revision type: {revision_type.replace('_', ' ').title()}")
+        action = result.get("action")
 
-            click.echo("\n3️⃣  Updating MR...")
-            if result.get("plan_updated"):
-                click.echo("   ✓ Revised plan committed and pushed")
-            else:
-                click.echo("   ℹ Plan unchanged")
-
-            responses_posted = result.get("responses_posted", 0)
-            click.echo(f"   ✓ Posted {responses_posted} response(s) to discussions")
-            click.echo("   ✓ Added revision summary to MR")
-
-            click.echo(f"\n✅ Plan revision complete for {ticket_id}")
+        if action == "nothing_changed":
+            click.echo(f"\nℹ️  Nothing new for {ticket_id}")
+            click.echo("   No new Jira comments or MR discussions since last run.")
             click.echo(f"   MR: {result['mr_url']}")
-            click.echo("   Next: Review the updated plan and address any remaining feedback")
+            return
 
+        # Plan status
+        click.echo(f"   ✓ Plan saved: {result['plan_path']}")
+
+        # Confidence (if evaluated)
+        if result.get("confidence_score") is not None:
+            score = result["confidence_score"]
+            threshold = result["evaluation"]["threshold"]
+            click.echo(f"   ✓ Confidence: {score}/100 (threshold: {threshold})")
+            questions = result["evaluation"].get("questions", [])
+            if questions:
+                click.echo(f"   ✓ Posted {len(questions)} question(s) to Jira")
+
+        # Revision info
+        if action == "has_feedback":
+            click.echo(f"   ✓ Revised based on {result['feedback_count']} discussion(s)")
+
+        # Commit/MR status
+        if result.get("plan_updated"):
+            click.echo("   ✓ Plan committed and pushed")
+
+        if result.get("mr_created"):
+            click.echo(f"   ✓ Draft MR created: {result['mr_url']}")
         else:
-            # Normal plan generation workflow
-            jira_client = get_jira_client()
+            click.echo(f"   ✓ MR: {result['mr_url']}")
 
-            click.echo(f"📋 Planning ticket: {ticket_id}")
-            click.echo(f"🏗️  Project: {project}")
-
-            # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
-            click.echo("\n1️⃣  Fetching Jira ticket...")
-            ticket_data = jira_client.get_ticket(ticket_id)
-            click.echo(f"   ✓ {ticket_data['summary']}")
-
-            # Step 2: Create git worktree (only after ticket is validated)
-            click.echo("\n2️⃣  Creating git worktree...")
-            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
-            click.echo(f"   ✓ {worktree_path}")
-
-            # Step 3: Generate plan
-            click.echo("\n3️⃣  Generating implementation plan...")
-            plan_agent = PlanGeneratorAgent()
-            result = plan_agent.run(ticket_id=ticket_id, worktree_path=worktree_path)
-
-            click.echo(f"   ✓ Plan saved: {result['plan_path']}")
-
-            if result.get("plan_updated"):
-                click.echo("   ✓ Plan committed and pushed")
-            else:
-                click.echo("   ℹ Plan unchanged - skipped commit")
-
-            if result.get("mr_created"):
-                click.echo(f"   ✓ Draft MR created: {result['mr_url']}")
-            else:
-                click.echo(f"   ℹ Using existing MR: {result['mr_url']}")
-
-            click.echo(f"\n✅ Plan workflow complete for {ticket_id}")
-            click.echo(f"   Next: Review draft MR, then run 'sentinel execute {ticket_id}'")
+        click.echo(f"\n✅ Plan complete for {ticket_id}")
+        click.echo(f"   Next: Review draft MR, then run 'sentinel execute {ticket_id}'")
 
     except ValueError as e:
         if "not found" in str(e):
@@ -174,6 +170,99 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False) ->
     except Exception as e:
         logger.error(f"Plan command failed: {e}", exc_info=True)
         click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("ticket_id")
+@click.option(
+    "--project",
+    "-p",
+    help="Project key (e.g., ACME). If not provided, extracted from ticket ID.",
+)
+def debrief(ticket_id: str, project: Optional[str] = None) -> None:
+    """Run a functional debrief for a Jira ticket.
+
+    Analyzes the ticket from a functional perspective and posts a
+    conversational debrief comment to Jira. Re-running detects client
+    replies and continues the conversation until understanding is validated.
+
+    This is a VOLUNTARY step before 'sentinel plan'. It ensures
+    functional understanding before technical planning begins.
+
+    Args:
+        ticket_id: Jira ticket ID (e.g., ACME-123)
+        project: Project key (optional, extracted from ticket if not provided)
+    """
+    try:
+        # Extract project key from ticket ID if not provided
+        if project is None:
+            project = ticket_id.split("-")[0]
+
+        click.echo(f"\U0001f4ac Functional Debrief: {ticket_id}")
+        click.echo(f"\U0001f3d7\ufe0f  Project: {project}")
+
+        # Step 1: Create git worktree for codebase access
+        worktree_path = None
+        try:
+            worktree_mgr = WorktreeManager()
+            click.echo("\n1\ufe0f\u20e3  Creating git worktree...")
+            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
+            click.echo(f"   \u2713 {worktree_path}")
+        except Exception as e:
+            click.echo(f"   \u26a0\ufe0f  No codebase access: {e}")
+            click.echo("   Continuing with text-only analysis...")
+
+        # Step 2: Run debrief agent
+        click.echo("\n2\ufe0f\u20e3  Analyzing ticket...")
+        agent = FunctionalDebriefAgent()
+        result = agent.run(ticket_id=ticket_id, project=project, worktree_path=worktree_path)
+
+        action = result.get("action")
+        iteration_count = result.get("iteration_count", 1)
+
+        if action == "posted":
+            click.echo("   \u2713 Debrief generated and posted to Jira")
+            click.echo(f"\n\u2705 Debrief posted for {ticket_id}")
+            click.echo("   Next: Wait for client to reply on Jira, then re-run:")
+            click.echo(f"         sentinel debrief {ticket_id}")
+
+        elif action == "awaiting_reply":
+            posted_at = result.get("posted_at", "unknown")
+            click.echo(f"   \u2139\ufe0f  Debrief posted (at {posted_at}), no client reply yet.")
+            click.echo(f"\n\u23f3 Waiting for client response on {ticket_id}")
+            click.echo("   Check Jira and ask the client to reply to the debrief comment.")
+
+        elif action == "followed_up":
+            click.echo(f"   \u2713 Follow-up posted (iteration {iteration_count})")
+            click.echo(f"\n\u2705 Follow-up posted for {ticket_id}")
+            click.echo("   Next: Wait for client to reply, then re-run:")
+            click.echo(f"         sentinel debrief {ticket_id}")
+
+        elif action == "proposed_closure":
+            click.echo(f"   \u2713 Summary posted (iteration {iteration_count})")
+            click.echo(f"\n\u2705 Summary posted for {ticket_id}")
+            click.echo("   Next: Wait for client to confirm, then re-run:")
+            click.echo(f"         sentinel debrief {ticket_id}")
+
+        elif action == "pending_confirmation":
+            click.echo("   \u2139\ufe0f  Summary posted, waiting for client confirmation.")
+            click.echo(f"\n\u23f3 Waiting for client to confirm on {ticket_id}")
+
+        elif action == "validated":
+            click.echo("   \u2713 Client confirmed the debrief")
+            click.echo(f"\n\u2705 Debrief validated for {ticket_id}")
+            click.echo(f"   Next: Run 'sentinel plan {ticket_id}' to start technical planning")
+
+    except ValueError as e:
+        if "not found" in str(e):
+            click.echo(f"\n\u274c {e}", err=True)
+            click.echo("   Check that the ticket ID is correct and exists in Jira.")
+            sys.exit(1)
+        raise
+    except Exception as e:
+        logger.error(f"Debrief command failed: {e}", exc_info=True)
+        click.echo(f"\n\u274c Error: {e}", err=True)
         sys.exit(1)
 
 

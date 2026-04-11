@@ -2,6 +2,7 @@
 
 import os
 import logging
+import time
 from typing import Any, Dict
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
@@ -128,6 +129,7 @@ class AgentSDKWrapper:
         session_id: str | None = None,
         system_prompt: str | None = None,
         cwd: str | None = None,
+        max_turns: int | None = None,
     ) -> Dict[str, Any]:
         """Execute agent with tool use enabled.
 
@@ -136,6 +138,7 @@ class AgentSDKWrapper:
             session_id: Optional session ID to resume
             system_prompt: Optional system prompt to set agent behavior
             cwd: Optional working directory for agent execution
+            max_turns: Optional max agentic turns (prevents runaway exploration)
 
         Returns:
             Dictionary with:
@@ -201,26 +204,39 @@ class AgentSDKWrapper:
         logger.info(f"Using model: {self.model} (before SDK translation)")
 
         # Build options
-        options = ClaudeAgentOptions(
-            model=self.model,
-            allowed_tools=self.allowed_tools,
-            permission_mode='acceptEdits',  # Auto-accept file edits
-            system_prompt=system_prompt,
-            cwd=cwd,
-            env=subprocess_env,  # Pass environment to subprocess
-            resume=session_id if session_id else None,  # Resume session if provided
-            stderr=stderr_callback,  # Capture stderr output
-            extra_args={"debug-to-stderr": None},  # Force stderr piping
-        )
+        options_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "allowed_tools": self.allowed_tools,
+            "permission_mode": "acceptEdits",
+            "system_prompt": system_prompt,
+            "cwd": cwd,
+            "env": subprocess_env,
+            "resume": session_id if session_id else None,
+            "stderr": stderr_callback,
+            "extra_args": {"debug-to-stderr": None},
+        }
+        if max_turns is not None:
+            options_kwargs["max_turns"] = max_turns
+            logger.info(f"[SDK] max_turns={max_turns}")
+        options = ClaudeAgentOptions(**options_kwargs)
 
         responses: list[str] = []
         tool_uses: list[Dict[str, Any]] = []
         final_session_id: str | None = None
 
-        async with ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
+        sdk_start = time.monotonic()
+        logger.info(f"[SDK] Opening ClaudeSDKClient (model={self.model})...")
 
+        async with ClaudeSDKClient(options=options) as client:
+            logger.info(f"[SDK] Client opened ({time.monotonic() - sdk_start:.1f}s), sending query ({len(prompt)} chars)...")
+            query_start = time.monotonic()
+            await client.query(prompt)
+            logger.info(f"[SDK] Query sent ({time.monotonic() - query_start:.1f}s), waiting for response stream...")
+
+            stream_start = time.monotonic()
+            msg_count = 0
             async for message in client.receive_response():
+                msg_count += 1
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -230,11 +246,12 @@ class AgentSDKWrapper:
                                 "tool": block.name,
                                 "input": block.input
                             })
+                            logger.info(f"[SDK] Tool use: {block.name} ({time.monotonic() - stream_start:.1f}s into stream)")
                 # Extract session ID from ResultMessage
                 if hasattr(message, 'session_id'):
                     final_session_id = message.session_id
 
-        logger.info(f"Agent response received with {len(tool_uses)} tool uses")
+        logger.info(f"[SDK] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {time.monotonic() - sdk_start:.1f}s total")
 
         # Track the session ID if we got one (with project association)
         if final_session_id:

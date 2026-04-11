@@ -14,9 +14,9 @@ class PromptLoader:
             prompts_dir: Path to prompts directory. Defaults to .agents/prompts/
         """
         if prompts_dir is None:
-            # Default to .agents/prompts/ relative to project root
-            project_root = Path(__file__).parent.parent.parent
-            self.prompts_dir = project_root / ".agents" / "prompts"
+            # Default to prompts/ relative to sentinel project root
+            project_root = Path(__file__).parent.parent
+            self.prompts_dir = project_root / "prompts"
         else:
             self.prompts_dir = Path(prompts_dir)
 
