@@ -65,9 +65,9 @@ class CommandExecutor:
             commands_dir: Path to commands directory. Defaults to .agents/commands/
         """
         if commands_dir is None:
-            # Default to .agents/commands/ relative to project root
-            project_root = Path(__file__).parent.parent.parent
-            self.commands_dir = project_root / ".agents" / "commands"
+            # Default to commands/ relative to sentinel package root
+            sentinel_root = Path(__file__).parent.parent
+            self.commands_dir = sentinel_root / "commands"
         else:
             self.commands_dir = Path(commands_dir)
 

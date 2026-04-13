@@ -61,7 +61,7 @@ def mock_prompt():
 @pytest.fixture
 def mock_beads():
     """Mock BeadsManager."""
-    with patch("src.agents.python_developer.BeadsManager") as mock:
+    with patch("src.agents.base_developer.BeadsManager") as mock:
         manager = Mock()
         manager.create_task.return_value = "task-123"
         mock.return_value = manager
@@ -283,13 +283,18 @@ This is the overview section.
     def test_implement_feature_with_command(
         self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
     ):
-        """Test implementing a feature using TDD command."""
+        """Test implementing a feature loads TDD command and runs Agent SDK."""
         agent = PythonDeveloperAgent()
 
-        with patch.object(agent, "execute_command") as mock_execute:
-            mock_execute.return_value = {"success": True, "output": "Feature implemented"}
+        with patch.object(agent, "execute_command") as mock_execute, \
+             patch.object(agent, "run_tests") as mock_tests:
+            mock_execute.return_value = {
+                "success": True,
+                "workflow": [{"name": "write_failing_test"}],
+            }
+            mock_tests.return_value = {"success": True, "output": "", "return_code": 0}
 
-            agent.implement_feature("Add login endpoint", {}, temp_worktree)
+            result = agent.implement_feature("Add login endpoint", {}, temp_worktree)
 
             mock_execute.assert_called_once_with(
                 "implement-tdd",
@@ -298,6 +303,7 @@ This is the overview section.
                     "plan_step": "Add login endpoint",
                 },
             )
+            assert result["success"] is True
 
     def test_implement_feature_command_failure(
         self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
@@ -311,8 +317,8 @@ This is the overview section.
                 "errors": ["Test error"],
             }
 
-            # Should raise RuntimeError when command fails
-            with pytest.raises(RuntimeError, match="TDD command failed"):
+            # Should raise RuntimeError when command validation fails
+            with pytest.raises(RuntimeError, match="TDD command validation failed"):
                 agent.implement_feature("Add feature", {}, temp_worktree)
 
             mock_execute.assert_called_once()
@@ -376,7 +382,7 @@ This is the overview section.
         """Test running tests successfully."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.return_value = Mock(
                 returncode=0,
                 stdout="test_example.py PASSED",
@@ -400,7 +406,7 @@ This is the overview section.
         """Test running tests with failures."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.return_value = Mock(
                 returncode=1,
                 stdout="test_example.py FAILED",
@@ -419,7 +425,7 @@ This is the overview section.
         """Test running tests with timeout."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.TimeoutExpired(
                 cmd="pytest", timeout=300
             )
@@ -436,7 +442,7 @@ This is the overview section.
         """Test running tests with general exception."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.side_effect = Exception("Test execution error")
 
             result = agent.run_tests(temp_worktree)
@@ -451,7 +457,7 @@ This is the overview section.
         """Test committing changes."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.return_value = Mock(returncode=0)
 
             agent.commit_changes(
@@ -469,7 +475,7 @@ This is the overview section.
         """Test that files are staged correctly."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.return_value = Mock(returncode=0)
 
             agent.commit_changes(
@@ -491,7 +497,7 @@ This is the overview section.
         """Test that commit includes co-author."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.return_value = Mock(returncode=0)
 
             agent.commit_changes("Feature added", ["file.py"], temp_worktree)
@@ -512,7 +518,7 @@ This is the overview section.
         """Test commit failure raises exception."""
         agent = PythonDeveloperAgent()
 
-        with patch("src.agents.python_developer.subprocess.run") as mock_run:
+        with patch("src.agents.base_developer.subprocess.run") as mock_run:
             mock_run.side_effect = subprocess.CalledProcessError(1, "git")
 
             with pytest.raises(subprocess.CalledProcessError):
@@ -582,17 +588,26 @@ This is the overview section.
         """Test run handles task implementation failures."""
         agent = PythonDeveloperAgent()
 
+        success_result = {
+            "success": True,
+            "files_created": [],
+            "files_modified": [],
+            "test_results": {"success": True},
+            "commit_message": "feat: task",
+            "agent_response": "",
+        }
+
         with patch.object(agent, "implement_feature") as mock_implement, \
              patch.object(agent, "run_tests") as mock_test:
 
             # Simulate some failures (6 tasks total)
             mock_implement.side_effect = [
-                None,  # Success - Create feature branch
+                success_result,  # Success - Create feature branch
                 Exception("Implementation error"),  # Failure - Set up test environment
-                None,  # Success - Write failing tests
-                None,  # Success - Implement feature
+                success_result,  # Success - Write failing tests
+                success_result,  # Success - Implement feature
                 Exception("Another error"),  # Failure - Refactor code
-                None,  # Success - All tests passing
+                success_result,  # Success - All tests passing
             ]
 
             mock_test.return_value = {"success": True, "return_code": 0, "output": ""}
@@ -693,3 +708,27 @@ This is the overview section.
             )
 
             assert result is not None
+
+    def test_get_test_command(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+        """Test Python test command returns pytest."""
+        agent = PythonDeveloperAgent()
+        cmd = agent._get_test_command()
+        assert cmd == ["pytest", "-v", "--tb=short"]
+
+    def test_get_test_stub(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+        """Test Python test stub contains pytest imports."""
+        agent = PythonDeveloperAgent()
+        stub = agent._get_test_stub()
+        assert "import pytest" in stub
+        assert "def test_basic_functionality" in stub
+
+    def test_build_tdd_prompt(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+    ):
+        """Test Python TDD prompt references pytest and PEP 8."""
+        agent = PythonDeveloperAgent()
+        prompt = agent._build_tdd_prompt("Add login", {}, temp_worktree)
+        assert "pytest" in prompt
+        assert "PEP 8" in prompt
+        assert "type hints" in prompt
+        assert "TASK: Add login" in prompt

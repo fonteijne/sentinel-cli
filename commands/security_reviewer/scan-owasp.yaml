@@ -1,0 +1,208 @@
+name: scan-owasp
+description: Comprehensive scan for OWASP Top 10 vulnerabilities
+version: 2.0
+
+parameters:
+  target_path:
+    type: string
+    required: true
+    description: Path to scan (file or directory)
+
+  severity_threshold:
+    type: string
+    required: false
+    default: "MEDIUM"
+    enum: ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    description: Minimum severity to report
+
+vulnerability_checks:
+  - id: A01_broken_access_control
+    name: "Broken Access Control"
+    patterns:
+      - pattern: "without authentication check"
+        check: "Missing authentication decorator on sensitive endpoint"
+        severity: CRITICAL
+
+  - id: A02_cryptographic_failures
+    name: "Cryptographic Failures"
+    patterns:
+      - pattern: "\\bmd5\\s*\\(|\\bsha1\\s*\\("
+        check: "Use of weak hashing algorithm (MD5/SHA1)"
+        severity: HIGH
+      - pattern: "\\bDES\\b|\\b3DES\\b"
+        check: "Use of weak encryption algorithm"
+        severity: HIGH
+
+  - id: A03_injection
+    name: "Injection"
+    patterns:
+      - pattern: "(execute|query|cursor\\.execute|db_query|rawQuery)\\s*\\(\\s*f[\"']"
+        check: "SQL injection via f-string in database call"
+        severity: CRITICAL
+      - pattern: "(execute|query|cursor\\.execute|db_query)\\s*\\(.*\\.format\\("
+        check: "SQL injection via .format() in database call"
+        severity: CRITICAL
+      - pattern: "(execute|query|cursor\\.execute|db_query)\\s*\\(.*%\\s*\\("
+        check: "SQL injection via % formatting in database call"
+        severity: CRITICAL
+      - pattern: "subprocess\\.(call|run|Popen)\\s*\\(.*\\+"
+        check: "OS command injection via string concatenation with subprocess"
+        severity: CRITICAL
+      - pattern: "\\beval\\s*\\(.*\\binput|\\beval\\s*\\(.*request"
+        check: "Code injection via eval with user input"
+        severity: CRITICAL
+        examples:
+          vulnerable: |
+            query = f"SELECT * FROM users WHERE id = {user_id}"
+          safe: |
+            query = "SELECT * FROM users WHERE id = %s"
+            cursor.execute(query, (user_id,))
+
+  - id: A04_insecure_design
+    name: "Insecure Design"
+    patterns:
+      - pattern: "rate.?limit.*=\\s*0|disable.*csrf|csrf.*=.*False"
+        check: "Security feature explicitly disabled"
+        severity: HIGH
+
+  - id: A05_security_misconfiguration
+    name: "Security Misconfiguration"
+    patterns:
+      - pattern: "DEBUG\\s*=\\s*True"
+        check: "DEBUG mode enabled — must be disabled in production"
+        severity: MEDIUM
+      - pattern: "ALLOWED_HOSTS\\s*=\\s*\\[\\s*[\"']\\*[\"']\\s*\\]"
+        check: "ALLOWED_HOSTS accepts all hosts"
+        severity: MEDIUM
+
+  - id: A06_vulnerable_components
+    name: "Vulnerable and Outdated Components"
+    patterns:
+      - pattern: "verify\\s*=\\s*False|ssl\\s*=\\s*False|VERIFY_SSL.*=.*False"
+        check: "SSL/TLS verification disabled"
+        severity: HIGH
+
+  - id: A07_identification_auth_failures
+    name: "Identification and Authentication Failures"
+    patterns:
+      - pattern: "password\\s*=\\s*[\"'][^\"']{3,}[\"']"
+        check: "Hardcoded password value"
+        severity: CRITICAL
+      - pattern: "token\\s*=\\s*[\"'][A-Za-z0-9_\\-]{20,}[\"']"
+        check: "Hardcoded token value"
+        severity: CRITICAL
+      - pattern: "api[_-]?key\\s*=\\s*[\"'][^\"']{8,}[\"']"
+        check: "Hardcoded API key"
+        severity: CRITICAL
+
+  - id: A08_data_integrity_failures
+    name: "Software and Data Integrity Failures"
+    patterns:
+      - pattern: "pickle\\.loads?\\(|yaml\\.load\\([^)]*(?!Loader)"
+        check: "Insecure deserialization (pickle or yaml.load without SafeLoader)"
+        severity: HIGH
+      - pattern: "\\beval\\s*\\("
+        check: "Use of eval() — potential code execution"
+        severity: HIGH
+
+  - id: A09_logging_monitoring_failures
+    name: "Security Logging and Monitoring Failures"
+    patterns:
+      - pattern: "log(ger)?\\.(info|debug|warning|error)\\s*\\(.*password|log(ger)?\\.(info|debug|warning|error)\\s*\\(.*token|log(ger)?\\.(info|debug|warning|error)\\s*\\(.*secret"
+        check: "Sensitive data (password/token/secret) potentially written to logs"
+        severity: MEDIUM
+      - pattern: "print\\s*\\(.*password|print\\s*\\(.*token|print\\s*\\(.*secret"
+        check: "Sensitive data printed to stdout"
+        severity: MEDIUM
+
+  - id: A10_ssrf
+    name: "Server-Side Request Forgery (SSRF)"
+    patterns:
+      - pattern: "requests\\.(get|post|put|delete|patch)\\s*\\(\\s*f[\"']|requests\\.(get|post|put|delete|patch)\\s*\\(.*\\.format\\(|requests\\.(get|post|put|delete|patch)\\s*\\(.*\\+"
+        check: "HTTP request with dynamically constructed URL"
+        severity: HIGH
+      - pattern: "urllib\\.request\\.urlopen\\s*\\(.*\\+"
+        check: "URL open with string concatenation"
+        severity: HIGH
+
+workflow:
+  - name: scan_files
+    description: Scan changed files in target
+    actions:
+      - find_files: "changed_files"
+      - exclude_patterns:
+          - "**/venv/**"
+          - "**/.venv/**"
+          - "**/node_modules/**"
+          - "**/vendor/**"
+      - run_pattern_matching: true
+
+  - name: analyze_patterns
+    description: Match vulnerability patterns
+    actions:
+      - for_each_file:
+          - check_all_vulnerability_patterns
+          - record_matches_with_line_numbers
+          - classify_severity
+
+  - name: check_secrets
+    description: Scan for hardcoded credentials
+    patterns:
+      - 'api[_-]?key\s*=\s*["''][^"'']+["'']'
+      - 'password\s*=\s*["''][^"'']+["'']'
+      - 'secret\s*=\s*["''][^"'']+["'']'
+      - 'token\s*=\s*["''][A-Za-z0-9_\-]{20,}["'']'
+      - 'private[_-]?key'
+    severity: CRITICAL
+
+  - name: generate_report
+    description: Create findings report
+    output_format: |
+      # Security Scan Report
+
+      **Ticket**: {ticket_id}
+      **Scan Date**: {timestamp}
+      **Files Scanned**: {file_count}
+      **Findings**: {finding_count}
+
+      ## Summary
+      - 🔴 Critical: {critical_count}
+      - 🟠 High: {high_count}
+      - 🟡 Medium: {medium_count}
+      - 🔵 Low: {low_count}
+
+      ## Findings
+      {findings_list}
+
+      ## Recommendations
+      {recommendations}
+
+  - name: create_beads_tasks
+    description: Create remediation tasks
+    actions:
+      - for_each_finding:
+          severity: ["CRITICAL", "HIGH"]
+          action: |
+            bd add "🔴 Security: Fix {vulnerability_name} in {file}:{line}"
+
+configuration:
+  scan_tests: true
+  scan_dependencies: true
+  fail_on_critical: true
+  max_findings_to_report: 50
+
+quality_gates:
+  - no_critical_vulnerabilities: true
+  - no_high_severity_without_justification: true
+  - all_secrets_removed: true
+
+example_usage: |
+  # From agent code:
+  result = execute_command("scan-owasp", {
+    "target_path": "src/",
+    "severity_threshold": "MEDIUM"
+  })
+
+  if result.has_critical:
+    block_merge()
+    create_security_tasks(result.findings)

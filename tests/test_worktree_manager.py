@@ -157,18 +157,19 @@ class TestCreateWorktree:
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git worktree add, git rev-parse (branch doesn't exist), git checkout -b
+            # Mock git worktree add, git rev-parse local (no), rev-parse remote (no), git checkout -b
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
-                Mock(returncode=1),  # git rev-parse (branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse (local branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse (remote branch doesn't exist)
                 Mock(returncode=0),  # git checkout -b
             ]
 
             result = worktree_manager.create_worktree("ACME-123", "ACME")
 
             assert result == bare_dir / "ACME-123"
-            # Should call git worktree add, git rev-parse, and git checkout -b
-            assert mock_run.call_count == 3
+            # Should call git worktree add, git rev-parse (local), git rev-parse (remote), and git checkout -b
+            assert mock_run.call_count == 4
 
     @patch("subprocess.run")
     def test_create_worktree_existing_valid(
@@ -206,11 +207,12 @@ class TestCreateWorktree:
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git status to fail, then succeed for worktree add, rev-parse, checkout
+            # Mock git status to fail, then succeed for worktree add, rev-parse local, rev-parse remote, checkout
             mock_run.side_effect = [
                 subprocess.CalledProcessError(1, "git status"),
                 Mock(returncode=0),  # git worktree add
-                Mock(returncode=1),  # git rev-parse (branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse (local branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse (remote branch doesn't exist)
                 Mock(returncode=0),  # git checkout -b
             ]
 
@@ -235,10 +237,11 @@ class TestCreateWorktree:
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git worktree add, git rev-parse, git checkout -b
+            # Mock git worktree add, git rev-parse local, rev-parse remote, git checkout -b
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
-                Mock(returncode=1),  # git rev-parse (branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse (local branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse (remote branch doesn't exist)
                 Mock(returncode=0),  # git checkout -b
             ]
 
@@ -284,6 +287,34 @@ class TestCreateWorktree:
             assert "-b" not in checkout_call
 
     @patch("subprocess.run")
+    def test_create_worktree_remote_branch(
+        self, mock_run, worktree_manager, temp_workspace
+    ):
+        """Test worktree creation tracks existing remote branch (e.g. after reset)."""
+        bare_dir = temp_workspace / "acme"
+        bare_dir.mkdir(parents=True)
+
+        with patch.object(
+            worktree_manager, "ensure_bare_clone", return_value=bare_dir
+        ):
+            mock_run.side_effect = [
+                Mock(returncode=0),  # git worktree add
+                Mock(returncode=1),  # git rev-parse --verify (local branch doesn't exist)
+                Mock(returncode=0),  # git rev-parse --verify (remote branch EXISTS)
+                Mock(returncode=0),  # git checkout -b ... origin/...
+            ]
+
+            worktree_manager.create_worktree("ACME-123", "ACME")
+
+            # Verify git checkout -b was called with remote ref as start point
+            checkout_call = mock_run.call_args_list[3][0][0]
+            assert "git" in checkout_call
+            assert "checkout" in checkout_call
+            assert "-b" in checkout_call
+            assert "sentinel/feature/ACME-123" in checkout_call
+            assert "origin/sentinel/feature/ACME-123" in checkout_call
+
+    @patch("subprocess.run")
     def test_create_worktree_new_branch(
         self, mock_run, worktree_manager, temp_workspace
     ):
@@ -295,18 +326,20 @@ class TestCreateWorktree:
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
             # Mock git worktree add to succeed
-            # Mock git rev-parse to fail (branch doesn't exist)
+            # Mock git rev-parse to fail (local branch doesn't exist)
+            # Mock git rev-parse to fail (remote branch doesn't exist)
             # Mock git checkout -b to succeed
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
-                Mock(returncode=1),  # git rev-parse --verify (branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse --verify (local branch doesn't exist)
+                Mock(returncode=1),  # git rev-parse --verify (remote branch doesn't exist)
                 Mock(returncode=0),  # git checkout -b
             ]
 
             worktree_manager.create_worktree("ACME-123", "ACME")
 
-            # Verify git checkout -b was called
-            checkout_call = mock_run.call_args_list[2][0][0]
+            # Verify git checkout -b was called (last call, index 3)
+            checkout_call = mock_run.call_args_list[3][0][0]
             assert "git" in checkout_call
             assert "checkout" in checkout_call
             assert "-b" in checkout_call
