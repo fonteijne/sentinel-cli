@@ -1,5 +1,5 @@
-import React, { useState } from 'react'
-import { Search, ChevronRight, Info, Play, FileText, MessageSquare, Tag, Clock, User } from 'lucide-react'
+import React, { useState, useEffect, useCallback } from 'react'
+import { Search, RefreshCw, Play, FileText, MessageSquare, Tag, Radio, Layers } from 'lucide-react'
 import TicketCard from '../components/TicketCard.jsx'
 import clsx from 'clsx'
 import axios from 'axios'
@@ -73,6 +73,18 @@ function TicketDetailPanel({ ticket, onClose, onExecute, onPlan, onDebrief }) {
           <span className="text-slate-600 w-24">Updated</span>
           <span className="text-slate-400">{ticket.updated}</span>
         </div>
+        {ticket.project && (
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-slate-600 w-24">Project</span>
+            <span className="text-slate-300 font-mono text-xs">{ticket.project}</span>
+          </div>
+        )}
+        {ticket.branch && (
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-slate-600 w-24">Branch</span>
+            <span className="text-slate-400 font-mono text-xs truncate max-w-[180px]" title={ticket.branch}>{ticket.branch}</span>
+          </div>
+        )}
         {ticket.labels?.length > 0 && (
           <div className="flex items-start gap-2 text-sm">
             <span className="text-slate-600 w-24 mt-0.5">Labels</span>
@@ -128,13 +140,43 @@ export default function Tickets() {
   const [tickets, setTickets] = useState(MOCK_TICKETS)
   const [selected, setSelected] = useState(null)
   const [search, setSearch] = useState('')
+  const [projectFilter, setProjectFilter] = useState('all')
   const [running, setRunning] = useState({})
   const [notification, setNotification] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [isLive, setIsLive] = useState(false)
 
   const notify = (msg, type = 'info') => {
     setNotification({ msg, type })
     setTimeout(() => setNotification(null), 3000)
   }
+
+  const fetchTickets = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await axios.get('/api/tickets')
+      const data = res.data
+      const hasLiveData = Object.values(data).some(arr => arr.length > 0)
+      if (hasLiveData) {
+        setTickets(data)
+        setIsLive(true)
+      } else {
+        // API returned but all empty — keep mock done items, clear others
+        setTickets({ ...MOCK_TICKETS, plan: [], execute: [], review: [] })
+        setIsLive(false)
+      }
+    } catch {
+      // Network/API failure — fall back to full mock data
+      setTickets(MOCK_TICKETS)
+      setIsLive(false)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchTickets()
+  }, [fetchTickets])
 
   const runAction = async (ticketId, action) => {
     setRunning(r => ({ ...r, [`${ticketId}-${action}`]: true }))
@@ -150,12 +192,17 @@ export default function Tickets() {
   const allTickets = Object.values(tickets).flat()
   const totalCount = allTickets.length
 
+  // Collect unique project keys for filter dropdown
+  const allProjects = [...new Set(allTickets.map(t => t.project).filter(Boolean))]
+
   const filterTickets = (list) =>
-    list.filter(t =>
-      !search ||
-      t.id.toLowerCase().includes(search.toLowerCase()) ||
-      t.summary.toLowerCase().includes(search.toLowerCase())
-    )
+    list.filter(t => {
+      const matchesSearch = !search ||
+        t.id.toLowerCase().includes(search.toLowerCase()) ||
+        t.summary.toLowerCase().includes(search.toLowerCase())
+      const matchesProject = projectFilter === 'all' || t.project === projectFilter
+      return matchesSearch && matchesProject
+    })
 
   return (
     <div className="p-6 h-[calc(100vh-56px)] flex flex-col space-y-4">
@@ -171,8 +218,9 @@ export default function Tickets() {
         </div>
       )}
 
-      {/* Stats + search */}
-      <div className="flex items-center justify-between flex-shrink-0">
+      {/* Stats + toolbar */}
+      <div className="flex items-center justify-between flex-shrink-0 gap-3">
+        {/* Phase counts + live/demo badge */}
         <div className="flex items-center gap-4">
           {COLUMNS.map(col => {
             const count = tickets[col.key]?.length || 0
@@ -184,16 +232,56 @@ export default function Tickets() {
               </div>
             )
           })}
+          {/* Live / Demo badge */}
+          {isLive ? (
+            <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/25 px-2 py-0.5 rounded-full">
+              <Radio className="w-3 h-3" />
+              Live
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-500 bg-white/5 border border-white/10 px-2 py-0.5 rounded-full">
+              <Layers className="w-3 h-3" />
+              Demo
+            </span>
+          )}
         </div>
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-600" />
-          <input
-            type="text"
-            placeholder="Search tickets..."
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            className="dark-input pl-9 w-48"
-          />
+
+        {/* Right-side controls */}
+        <div className="flex items-center gap-2">
+          {/* Project filter */}
+          {allProjects.length > 0 && (
+            <select
+              value={projectFilter}
+              onChange={e => setProjectFilter(e.target.value)}
+              className="dark-input text-xs pr-8 w-36"
+            >
+              <option value="all">All projects</option>
+              {allProjects.map(p => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+            </select>
+          )}
+          {/* Search */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-600" />
+            <input
+              type="text"
+              placeholder="Search tickets..."
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              className="dark-input pl-9 w-48"
+            />
+          </div>
+          {/* Refresh button */}
+          <button
+            onClick={fetchTickets}
+            disabled={loading}
+            className="btn-secondary px-3 py-1.5 flex items-center gap-1.5 text-xs"
+            title="Sync worktrees"
+          >
+            <RefreshCw className={clsx('w-3.5 h-3.5', loading && 'animate-spin')} />
+            {loading ? 'Syncing...' : 'Sync'}
+          </button>
         </div>
       </div>
 
@@ -224,7 +312,16 @@ export default function Tickets() {
 
                 {/* Cards */}
                 <div className="flex-1 space-y-2 overflow-y-auto pr-1">
-                  {colTickets.length === 0 ? (
+                  {loading ? (
+                    // Loading skeleton
+                    [0, 1].map(i => (
+                      <div key={i} className="rounded-xl border border-white/5 bg-white/3 p-3 animate-pulse space-y-2">
+                        <div className="h-2.5 bg-white/8 rounded w-16" />
+                        <div className="h-2 bg-white/5 rounded w-full" />
+                        <div className="h-2 bg-white/5 rounded w-3/4" />
+                      </div>
+                    ))
+                  ) : colTickets.length === 0 ? (
                     <div className="flex items-center justify-center h-20 text-xs text-slate-700">
                       No tickets
                     </div>

@@ -35,6 +35,14 @@
 - [x] Search/filter tickets
 - [x] Per-column ticket counts
 - [x] Action commands trigger sentinel CLI via API
+- [x] Worktree-based ticket sync — scans active git worktrees to derive live ticket data
+- [x] Phase detection: plan file presence, memory/session artifacts, code diffs vs default branch
+- [x] Live/Demo badge indicating data source
+- [x] Sync button for manual worktree refresh
+- [x] Project filter dropdown (multi-project support)
+- [x] Loading skeleton during sync
+- [x] Graceful fallback to demo data when no worktrees exist or API unavailable
+- [x] Detail panel shows project key, branch name, and worktree path for live tickets
 
 ### Agents
 - [x] Agent cards for all 7 agent types (plan_generator, python_developer, drupal_developer, security_review, functional_debrief, confidence_evaluator, project_profiler)
@@ -90,6 +98,7 @@
 - [x] `POST /api/projects/{key}/profile` — Generate project profile
 
 ### Tickets
+- [x] `GET /api/tickets` — List all active tickets from git worktrees (with phase detection)
 - [x] `GET /api/tickets/{ticket_id}/info` — Get ticket info from Jira
 - [x] `POST /api/tickets/{ticket_id}/plan` — Generate/revise plan
 - [x] `POST /api/tickets/{ticket_id}/execute` — Execute implementation
@@ -163,7 +172,7 @@
 - [ ] Reset ticket action from Tickets detail panel
 - [ ] Reset all action from Settings
 - [ ] Real-time execution progress (streaming CLI output during plan/execute)
-- [ ] Worktree management view per project
+- [x] ~~Worktree management view per project~~ (implemented via Tickets worktree sync)
 - [ ] MR status tracking from GitLab
 - [ ] Debrief conversation thread viewer
 - [ ] Config editor with save/validate

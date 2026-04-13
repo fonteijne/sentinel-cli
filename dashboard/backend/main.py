@@ -351,6 +351,123 @@ async def generate_profile(key: str, refresh: bool = False):
 
 
 # Tickets ─────────────────────────────────────────────────────────────────────
+@app.get("/api/tickets")
+async def list_tickets():
+    """List all active tickets derived from git worktrees across all projects."""
+    config = _load_config()
+    workspace_root = Path(
+        os.path.expanduser(config.get("workspace", {}).get("root_dir", "~/sentinel-workspaces"))
+    )
+
+    tickets = {"plan": [], "execute": [], "review": [], "done": []}
+    projects_cfg = config.get("projects", {})
+
+    for project_key, project_conf in projects_cfg.items():
+        project_dir = workspace_root / project_key.lower()
+        if not project_dir.exists():
+            continue
+
+        default_branch = project_conf.get("default_branch", "main") if isinstance(project_conf, dict) else "main"
+
+        # List worktrees
+        try:
+            result = subprocess.run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=str(project_dir),
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                continue
+        except Exception:
+            continue
+
+        # Parse worktrees
+        for line in result.stdout.split("\n"):
+            if not line.startswith("worktree "):
+                continue
+            wt_path = Path(line.split(" ", 1)[1])
+            ticket_id = wt_path.name
+            if ticket_id == project_key.lower():
+                continue  # Skip bare repo
+
+            # Determine phase
+            plan_file = wt_path / ".agents" / "plans" / f"{ticket_id}.md"
+            memory_dir = wt_path / ".agents" / "memory"
+
+            has_plan = plan_file.exists()
+            has_memory = (memory_dir.exists() and any(memory_dir.iterdir())) if memory_dir.exists() else False
+
+            # Check for code changes beyond plan
+            has_code_changes = False
+            if has_plan:
+                try:
+                    diff_result = subprocess.run(
+                        ["git", "diff", "--stat", f"origin/{default_branch}...HEAD"],
+                        cwd=str(wt_path), capture_output=True, text=True, timeout=5,
+                    )
+                    # Filter: if diff includes files beyond .agents/ directory, there are code changes
+                    if diff_result.returncode == 0:
+                        for diff_line in diff_result.stdout.strip().split("\n"):
+                            if diff_line.strip() and not diff_line.strip().startswith(".agents/") and "|" in diff_line:
+                                has_code_changes = True
+                                break
+                except Exception:
+                    pass
+
+            if not has_plan:
+                phase = "plan"
+            elif has_code_changes or has_memory:
+                phase = "review"
+            else:
+                phase = "execute"
+
+            # Get last commit time
+            updated = "just now"
+            try:
+                log_result = subprocess.run(
+                    ["git", "log", "-1", "--format=%cr"],
+                    cwd=str(wt_path), capture_output=True, text=True, timeout=5,
+                )
+                if log_result.returncode == 0 and log_result.stdout.strip():
+                    updated = log_result.stdout.strip()
+            except Exception:
+                pass
+
+            # Get branch name
+            branch = f"sentinel/feature/{ticket_id}"
+
+            # Try to read plan summary
+            summary = f"Ticket {ticket_id}"
+            if has_plan:
+                try:
+                    plan_content = plan_file.read_text()
+                    for pline in plan_content.split("\n"):
+                        pline = pline.strip()
+                        if pline.startswith("# "):
+                            summary = pline[2:].strip()
+                            # Remove ticket ID prefix if present
+                            if summary.upper().startswith(ticket_id.upper()):
+                                summary = summary[len(ticket_id):].strip(" :-\u2013\u2014")
+                            break
+                except Exception:
+                    pass
+
+            tickets[phase].append({
+                "id": ticket_id,
+                "summary": summary,
+                "priority": "Medium",  # Default, could be enriched from Jira
+                "assignee": "agent",
+                "labels": [project_key.lower()],
+                "updated": updated,
+                "status": phase,
+                "project": project_key,
+                "branch": branch,
+                "worktree_path": str(wt_path),
+            })
+
+    return tickets
+
+
 @app.get("/api/tickets/{ticket_id}/info")
 async def ticket_info(ticket_id: str):
     result = await _run_sentinel(["info", ticket_id])
