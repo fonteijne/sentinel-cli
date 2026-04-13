@@ -23,13 +23,18 @@ FROM python:3.11-slim AS app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install backend Python dependencies
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy sentinel-cli source and install it so the dashboard can call the CLI.
+# The parent sentinel-cli project is mounted or copied in via build context.
+# For now, sentinel availability is optional — the dashboard degrades gracefully.
 
 # Copy backend source
 COPY backend/ ./backend/
@@ -47,7 +52,6 @@ EXPOSE 8000
 # Config directory (will be mounted from host)
 VOLUME ["/app/config"]
 
-# Working directory is the sentinel-cli root (for CLI subprocess calls)
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

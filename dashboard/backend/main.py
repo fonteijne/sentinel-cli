@@ -34,14 +34,30 @@ logging.basicConfig(
 log = logging.getLogger("sentinel.dashboard")
 
 # ── Paths ───────────────────────────────────────────────────────────────────
-APP_DIR = Path(__file__).parent.parent.parent  # sentinel-cli root
-CONFIG_DIR = APP_DIR / "config"
+# Resolve paths: works in both local dev and Docker.
+# Local dev:   sentinel-cli/dashboard/backend/main.py → APP_DIR = sentinel-cli/
+# Docker:      /app/backend/main.py                   → APP_DIR = /app/
+_BACKEND_DIR = Path(__file__).parent
+_DASHBOARD_DIR = _BACKEND_DIR.parent
+
+# In Docker, config is mounted at /app/config. In local dev, it's at sentinel-cli/config.
+# Use env var override, then check common locations.
+_CONFIG_ENV = os.environ.get("SENTINEL_CONFIG_DIR")
+if _CONFIG_ENV:
+    CONFIG_DIR = Path(_CONFIG_ENV)
+elif (_DASHBOARD_DIR / ".." / "config" / "config.yaml").resolve().exists():
+    CONFIG_DIR = (_DASHBOARD_DIR / ".." / "config").resolve()
+elif (_DASHBOARD_DIR.parent.parent / "config" / "config.yaml").exists():
+    CONFIG_DIR = _DASHBOARD_DIR.parent.parent / "config"  # local dev: sentinel-cli/config
+else:
+    CONFIG_DIR = Path("/app/config")  # Docker default
+
 CONFIG_YAML = CONFIG_DIR / "config.yaml"
 CONFIG_LOCAL_YAML = CONFIG_DIR / "config.local.yaml"
 SENTINEL_CMD = shutil.which("sentinel") or "sentinel"
 
 # Static files directory (built frontend)
-STATIC_DIR = Path(__file__).parent.parent / "frontend" / "dist"
+STATIC_DIR = _DASHBOARD_DIR / "frontend" / "dist"
 
 # ── App setup ───────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -127,7 +143,7 @@ async def _run_sentinel(args: list[str], timeout: int = 300) -> dict:
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        cwd=str(APP_DIR),
+        cwd=str(CONFIG_DIR.parent),  # Run from sentinel-cli root (or /app in Docker)
     )
 
     output_lines: list[str] = []

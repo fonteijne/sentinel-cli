@@ -16,8 +16,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount config for runtime configuration changes (read-only)
       - ./config:/app/config:ro
-      # Mount .env.local as writable for sentinel auth configure
-      - ./config/.env.local:/app/config/.env.local:rw
       # Mount SSH keys for git operations over SSH (bypasses HTTP auth proxy)
       - ~/.ssh:/root/.ssh:ro
       # Uncomment below if using Claude Code subscription mode (not API key):
@@ -35,10 +33,58 @@ services:
     # Keep container running for exec usage
     entrypoint: []
     command: ["sleep", "infinity"]
-    # Network access for API calls
-    network_mode: bridge
+    networks:
+      - sentinel-net
 
-  # Development variant with source mounted
+  # ─── Command Center Dashboard ────────────────────────────────────
+  # Accessible at http://localhost:3000
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: sentinel-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:8000"
+    volumes:
+      # Shared config with sentinel container
+      - ./config:/app/config:rw
+      # Read workspaces for worktree count queries
+      - sentinel-workspaces:/workspaces:ro
+      # Docker socket for container status checks
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # SSH keys for status checks
+      - ~/.ssh:/root/.ssh:ro
+    environment:
+      - JIRA_URL=${JIRA_URL:-}
+      - JIRA_EMAIL=${JIRA_EMAIL:-}
+      - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
+      - GITLAB_URL=${GITLAB_URL:-}
+      - GITLAB_TOKEN=${GITLAB_TOKEN:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - CLAUDE_MODE=${CLAUDE_MODE:-}
+      - WORKSPACE_ROOT=/workspaces
+    env_file:
+      - path: ./config/.env.local
+        required: false
+      - path: ./config/.env
+        required: false
+    networks:
+      - sentinel-net
+    depends_on:
+      - sentinel
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    labels:
+      - "com.sentinel.component=dashboard"
+      - "com.sentinel.version=1.0.0"
+
+  # ─── Development variant ─────────────────────────────────────────
+  # Usage: docker compose --profile dev up -d
   sentinel-dev:
     build:
       context: .
@@ -51,8 +97,6 @@ services:
       - sentinel-workspaces:/workspaces
       - sentinel-projects:/workspace/projects
       - /var/run/docker.sock:/var/run/docker.sock
-      # Mount .env.local as writable for sentinel auth configure
-      - ./config/.env.local:/app/config/.env.local:rw
       # Mount SSH keys for git operations over SSH (bypasses HTTP auth proxy)
       - ~/.ssh:/root/.ssh:ro
       # Uncomment below if using Claude Code subscription mode (not API key):
@@ -64,9 +108,14 @@ services:
     tty: true
     entrypoint: []
     command: ["sleep", "infinity"]
-    network_mode: bridge
+    networks:
+      - sentinel-net
     profiles:
       - dev
+
+networks:
+  sentinel-net:
+    driver: bridge
 
 volumes:
   sentinel-workspaces:
