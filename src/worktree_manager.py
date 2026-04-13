@@ -188,19 +188,35 @@ class WorktreeManager:
         )
 
         if result.returncode == 0:
-            # Branch exists, just checkout to it
+            # Branch exists locally, just checkout to it
             subprocess.run(
                 ["git", "checkout", branch_name],
                 cwd=worktree_dir,
                 check=True,
             )
         else:
-            # Branch doesn't exist, create it
-            subprocess.run(
-                ["git", "checkout", "-b", branch_name],
+            # Check if branch exists on remote (e.g. after a reset)
+            remote_ref = f"origin/{branch_name}"
+            remote_result = subprocess.run(
+                ["git", "rev-parse", "--verify", remote_ref],
                 cwd=worktree_dir,
-                check=True,
+                capture_output=True,
             )
+
+            if remote_result.returncode == 0:
+                # Remote branch exists — create local branch tracking it
+                subprocess.run(
+                    ["git", "checkout", "-b", branch_name, remote_ref],
+                    cwd=worktree_dir,
+                    check=True,
+                )
+            else:
+                # No local or remote branch — create fresh
+                subprocess.run(
+                    ["git", "checkout", "-b", branch_name],
+                    cwd=worktree_dir,
+                    check=True,
+                )
 
         return worktree_dir
 
