@@ -20,6 +20,7 @@ from src.session_tracker import SessionTracker
 from src.agents.functional_debrief import FunctionalDebriefAgent
 from src.agents.plan_generator import PlanGeneratorAgent
 from src.agents.python_developer import PythonDeveloperAgent
+from src.agents.drupal_developer import DrupalDeveloperAgent
 from src.agents.security_reviewer import SecurityReviewerAgent
 from src.utils.adf_parser import parse_adf_to_text
 
@@ -332,7 +333,17 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             click.echo(f"🏗️  Project: {project}")
 
             click.echo("\n1️⃣  Fetching MR feedback...")
-            developer = PythonDeveloperAgent()
+
+            # Select developer agent based on project stack type
+            config = get_config()
+            project_config = config.get_project_config(project)
+            stack_type = project_config.get("stack_type", "")
+
+            if stack_type and stack_type.startswith("drupal"):
+                developer = DrupalDeveloperAgent()
+            else:
+                developer = PythonDeveloperAgent()
+
             result = developer.run_revision(ticket_id=ticket_id, worktree_path=worktree_path)
 
             if result.get("feedback_count", 0) == 0:
@@ -435,18 +446,12 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 else:
                     click.echo("   ✓ No container environment needed")
             except RuntimeError as e:
-                click.echo(f"   ⚠️  Container setup failed: {e}", err=True)
-                click.echo("   Continuing without container environment...")
-                env_info = None
+                click.echo(f"\n❌ Container setup failed: {e}", err=True)
+                click.echo(f"   Project requires a container environment (.lando.yml detected)")
+                click.echo(f"   Fix the issue above and retry, or use --no-env to skip containers")
+                sys.exit(1)
 
         try:
-            # Initialize project structure in worktree (for Python projects without containers)
-            if not env_info or not env_info.active:
-                click.echo("\n   Initializing worktree...")
-                project_name = ticket_id.lower().replace("-", "_")
-                worktree_mgr.initialize_python_project(worktree_path, project_name)
-                click.echo("   ✓ Python project structure initialized")
-
             # Initialize beads for coordination
             click.echo("\n2️⃣  Initializing task tracking...")
             beads_mgr.init_project(ticket_id, str(worktree_path))
@@ -461,7 +466,20 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
 
             # Execute implementation with developer and security review loop
             click.echo("\n3️⃣  Executing implementation...")
-            developer = PythonDeveloperAgent()
+
+            # Select developer agent based on project stack type
+            config = get_config()
+            project_config = config.get_project_config(project)
+            stack_type = project_config.get("stack_type", "")
+
+            if stack_type and stack_type.startswith("drupal"):
+                developer = DrupalDeveloperAgent()
+                click.echo(f"   Using Drupal developer agent (stack: {stack_type})")
+            else:
+                developer = PythonDeveloperAgent()
+                if stack_type:
+                    click.echo(f"   Using Python developer agent (stack: {stack_type})")
+
             security = SecurityReviewerAgent()
 
             for iteration in range(1, max_iterations + 1):
@@ -473,6 +491,12 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 click.echo(f"      ✓ {dev_result['tasks_completed']} tasks completed")
                 if dev_result['tasks_failed'] > 0:
                     click.echo(f"      ⚠ {dev_result['tasks_failed']} tasks failed")
+
+                # Gate: abort if no tasks succeeded — nothing to review or push
+                if dev_result['tasks_completed'] == 0:
+                    click.echo(f"\n❌ All {dev_result['tasks_failed']} tasks failed — nothing to review or push", err=True)
+                    click.echo("   Check the developer agent logs above for failure details")
+                    sys.exit(1)
 
                 # Security reviews the implementation
                 click.echo("   🔒 Security: Reviewing code...")
@@ -602,6 +626,48 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         sys.exit(1)
 
 
+def _teardown_containers(
+    worktree_mgr: WorktreeManager,
+    ticket_id: str,
+    project: str,
+) -> None:
+    """Tear down any Docker Compose containers for a ticket.
+
+    Looks for docker-compose.sentinel.yml in the worktree and runs
+    docker compose down. Also cleans up orphan containers by project name.
+    """
+    from src.compose_runner import ComposeRunner
+    from src.environment_manager import SENTINEL_COMPOSE_FILE
+
+    worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
+    compose_project = f"sentinel-{ticket_id}".lower()
+
+    if worktree_path:
+        compose_file = worktree_path / SENTINEL_COMPOSE_FILE
+        if compose_file.exists():
+            try:
+                runner = ComposeRunner(
+                    compose_file=compose_file, project_name=compose_project
+                )
+                result = runner.down(volumes=True)
+                if result.success:
+                    click.echo("   ✓ Containers stopped and removed")
+                else:
+                    click.echo(f"   ⚠️  Container teardown issue: {result.stderr}")
+                return
+            except RuntimeError:
+                # Docker Compose not available — try orphan cleanup
+                pass
+
+    # Fallback: clean up by project name even without compose file
+    try:
+        runner = ComposeRunner(project_name=compose_project)
+        runner.cleanup_orphans()
+        click.echo("   ✓ No active containers found (or cleaned up orphans)")
+    except RuntimeError:
+        click.echo("   ℹ️  Docker not available — skipping container cleanup")
+
+
 def _reset_ticket(
     worktree_mgr: WorktreeManager,
     ticket_id: str,
@@ -616,6 +682,7 @@ def _reset_ticket(
 
     # Confirmation
     click.echo("\nThis will remove:")
+    click.echo(f"  • Containers for {ticket_id} (if running)")
     click.echo(f"  • Worktree for {ticket_id}")
     click.echo(f"  • Local branch {get_branch_name(ticket_id)}")
     click.echo("\n⚠️  Any uncommitted changes will be lost!")
@@ -624,15 +691,19 @@ def _reset_ticket(
         click.echo("\n❌ Reset cancelled")
         return
 
+    # Tear down containers before removing worktree (needs compose file)
+    click.echo("\n1️⃣  Stopping containers...")
+    _teardown_containers(worktree_mgr, ticket_id, project)
+
     result = worktree_mgr.reset_ticket(ticket_id, project)
 
-    click.echo("\n1️⃣  Removing worktree...")
+    click.echo("\n2️⃣  Removing worktree...")
     if result["worktree_removed"]:
         click.echo("   ✓ Worktree removed")
     else:
         click.echo("   ℹ️  No worktree found")
 
-    click.echo("\n2️⃣  Deleting local branch...")
+    click.echo("\n3️⃣  Deleting local branch...")
     if result["branch_deleted"]:
         click.echo(f"   ✓ Branch {get_branch_name(ticket_id)} deleted")
     else:
@@ -688,6 +759,7 @@ def _reset_all(
     click.echo("This will remove:")
 
     if existing_repos:
+        click.echo(f"  • Docker containers for {total_worktrees} worktree(s)")
         click.echo(f"  • {total_worktrees} worktree(s)")
         click.echo(f"  • {len(existing_repos)} bare repository(ies): {', '.join(existing_repos)}")
         click.echo("  • All local branches in those repositories")
@@ -706,6 +778,14 @@ def _reset_all(
         return
 
     step = 1
+
+    # Tear down containers for all worktrees before removing them
+    click.echo(f"\n{step}️⃣  Stopping containers...")
+    for proj in existing_repos:
+        worktrees = worktree_mgr.list_worktrees(proj)
+        for wt_ticket_id in worktrees:
+            _teardown_containers(worktree_mgr, wt_ticket_id, proj)
+    step += 1
 
     # Reset each project
     for proj in existing_repos:
