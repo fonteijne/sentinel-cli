@@ -132,7 +132,10 @@ export default function Projects() {
 
   useEffect(() => {
     axios.get('/api/projects')
-      .then(r => setProjects(r.data))
+      .then(r => {
+        // Use mock data when API returns empty array (no Sentinel CLI connected)
+        setProjects(r.data && r.data.length > 0 ? r.data : MOCK_PROJECTS)
+      })
       .catch(() => setProjects(MOCK_PROJECTS))
       .finally(() => setLoading(false))
   }, [])

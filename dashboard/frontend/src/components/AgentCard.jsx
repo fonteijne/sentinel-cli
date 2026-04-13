@@ -9,6 +9,7 @@ const AGENT_COLORS = {
   security_review: { accent: 'text-red-400', border: 'border-red-500/20', glow: 'shadow-red-500/10' },
   functional_debrief: { accent: 'text-purple-400', border: 'border-purple-500/20', glow: 'shadow-purple-500/10' },
   confidence_evaluator: { accent: 'text-emerald-400', border: 'border-emerald-500/20', glow: 'shadow-emerald-500/10' },
+  project_profiler: { accent: 'text-orange-400', border: 'border-orange-500/20', glow: 'shadow-orange-500/10' },
 }
 
 const AGENT_LABELS = {
@@ -18,6 +19,7 @@ const AGENT_LABELS = {
   security_review: 'Security Reviewer',
   functional_debrief: 'Functional Debrief',
   confidence_evaluator: 'Confidence Evaluator',
+  project_profiler: 'Project Profiler',
 }
 
 const AGENT_DESCRIPTIONS = {
@@ -27,6 +29,7 @@ const AGENT_DESCRIPTIONS = {
   security_review: 'OWASP security scanning with veto power over releases.',
   functional_debrief: 'Conversational functional analysis posted to Jira.',
   confidence_evaluator: 'Scores plan confidence against a 95% threshold.',
+  project_profiler: 'Generates project profiles with codebase analysis and dependency mapping.',
 }
 
 function TempBar({ temperature }) {

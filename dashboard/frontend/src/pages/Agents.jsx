@@ -35,6 +35,11 @@ const MOCK_AGENTS = {
     temperature: 0.1,
     specializations: [],
   },
+  project_profiler: {
+    model: 'claude-4-5-sonnet',
+    temperature: 0.2,
+    specializations: [],
+  },
 }
 
 const MOCK_RUN_HISTORY = {
@@ -109,7 +114,12 @@ export default function Agents() {
 
   useEffect(() => {
     axios.get('/api/agents')
-      .then(r => setAgents(r.data))
+      .then(r => {
+        // Merge API data with mock data to ensure all known agents are shown
+        if (r.data && Object.keys(r.data).length > 0) {
+          setAgents({ ...MOCK_AGENTS, ...r.data })
+        }
+      })
       .catch(() => {})
   }, [])
 

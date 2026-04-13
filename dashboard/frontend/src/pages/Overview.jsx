@@ -26,7 +26,7 @@ function QuickActionCard({ label, description, icon: Icon, color, bg }) {
         <ArrowRight className="w-4 h-4 text-slate-700 group-hover:text-slate-400 transition-colors" />
       </div>
       <div className="text-sm font-semibold text-slate-100">{label}</div>
-      <div className="text-xs text-slate-600 mt-0.5">{description}</div>
+      <div className="text-xs text-slate-500 mt-0.5">{description}</div>
     </button>
   )
 }
@@ -42,12 +42,15 @@ export default function Overview() {
       .finally(() => setLoading(false))
   }, [])
 
-  const stats = status?.stats || {
+  // Use demo data when API returns zeros (no Sentinel CLI connected)
+  const raw = status?.stats || {}
+  const isDemo = !raw.active_projects && !raw.active_tickets && !raw.agent_runs_today
+  const stats = isDemo ? {
     active_projects: 4,
     active_tickets: 7,
     security_score: 94,
     agent_runs_today: 12,
-  }
+  } : raw
 
   const healthItems = [
     { name: 'Jira', status: status?.jira || 'unknown', detail: status?.jira_url || 'Not configured', icon: Ticket },

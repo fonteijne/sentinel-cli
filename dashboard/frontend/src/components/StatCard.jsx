@@ -82,7 +82,7 @@ export default function StatCard({ title, value, subtitle, trend, trendLabel, ic
 
       {/* Subtitle / trend label */}
       {(subtitle || trendLabel) && (
-        <div className="text-xs text-slate-600">{trendLabel || subtitle}</div>
+        <div className="text-xs text-slate-500">{trendLabel || subtitle}</div>
       )}
     </div>
   )

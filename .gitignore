@@ -61,3 +61,6 @@ Thumbs.db
 
 # Workspace directories (created at runtime)
 workspaces/
+
+# Node.js
+node_modules/
