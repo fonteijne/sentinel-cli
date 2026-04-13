@@ -1,0 +1,85 @@
+name: implement-tdd
+description: Execute complete TDD cycle for a Drupal feature
+version: 1.0
+
+parameters:
+  feature_description:
+    type: string
+    required: true
+    description: Description of the feature to implement
+
+  plan_step:
+    type: string
+    required: false
+    description: Specific step from the implementation plan
+
+workflow:
+  - name: write_failing_test
+    description: Create a PHPUnit test that fails (RED phase)
+    actions:
+      - create_test_file: tests/src/Unit/{TestName}Test.php
+      - write_test_cases: |
+          - Happy path scenario
+          - Edge cases
+          - Error conditions
+      - run_tests: vendor/bin/phpunit --filter={TestName}Test
+      - verify: "Tests should FAIL at this stage"
+
+  - name: implement_minimal_code
+    description: Write simplest code to pass tests (GREEN phase)
+    actions:
+      - create_implementation: src/{ClassName}.php
+      - follow_drupal_standards: true
+      - use_dependency_injection: true
+      - run_tests: vendor/bin/phpunit --filter={TestName}Test
+      - run_drush: drush cr
+      - verify: "All tests should PASS"
+
+  - name: refactor_code
+    description: Improve code quality while keeping tests green (REFACTOR phase)
+    actions:
+      - extract_services: if reusable logic detected
+      - add_cache_metadata: if render arrays present
+      - improve_naming: if names unclear
+      - remove_duplication: if DRY violated
+      - run_drush: drush cr
+      - run_tests: vendor/bin/phpunit
+      - verify: "All tests still PASS after refactoring"
+
+  - name: commit_changes
+    description: Make atomic commit
+    actions:
+      - stage_files:
+          - "*.module"
+          - "*.php"
+          - "*.yml"
+          - "*.twig"
+      - commit_message: |
+          {type}: {description}
+
+          - Implemented {feature_description}
+          - PHPUnit tests passing
+
+          Follows TDD: RED → GREEN → REFACTOR
+
+          Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+      - update_beads_task: "Completed implementation of {feature_description}"
+
+configuration:
+  test_framework: phpunit
+  coding_standard: Drupal,DrupalPractice
+  max_function_length: 50
+  max_cyclomatic_complexity: 10
+
+quality_gates:
+  - all_tests_passing: true
+  - no_coding_standard_violations: true
+  - dependency_injection_used: true
+  - cache_metadata_present: true
+
+example_usage: |
+  # From agent code:
+  result = execute_command("implement-tdd", {
+    "feature_description": "Webform submission handler with email notification",
+    "plan_step": "Step 2: Implement form submission hook"
+  })

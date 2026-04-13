@@ -1,0 +1,79 @@
+name: implement-tdd
+description: Execute complete TDD cycle for a feature
+version: 1.0
+
+parameters:
+  feature_description:
+    type: string
+    required: true
+    description: Description of the feature to implement
+
+  plan_step:
+    type: string
+    required: false
+    description: Specific step from the implementation plan
+
+workflow:
+  - name: write_failing_test
+    description: Create a test that fails (RED phase)
+    actions:
+      - create_test_file: tests/test_{feature_name}.py
+      - write_test_cases: |
+          - Happy path scenario
+          - Edge cases
+          - Error conditions
+      - run_tests: pytest tests/test_{feature_name}.py
+      - verify: "Tests should FAIL at this stage"
+
+  - name: implement_minimal_code
+    description: Write simplest code to pass tests (GREEN phase)
+    actions:
+      - create_implementation: src/{feature_name}.py
+      - add_type_hints: true
+      - run_tests: pytest tests/test_{feature_name}.py
+      - verify: "All tests should PASS"
+
+  - name: refactor_code
+    description: Improve code quality while keeping tests green (REFACTOR phase)
+    actions:
+      - extract_functions: if complexity > 10
+      - improve_naming: if names unclear
+      - remove_duplication: if DRY violated
+      - run_tests: pytest
+      - verify: "All tests still PASS after refactoring"
+
+  - name: commit_changes
+    description: Make atomic commit
+    actions:
+      - stage_files:
+          - tests/test_{feature_name}.py
+          - src/{feature_name}.py
+      - commit_message: |
+          {type}: {description}
+
+          - Implemented {feature_description}
+          - Test coverage: {coverage}%
+
+          Follows TDD: RED → GREEN → REFACTOR
+
+          Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+      - update_beads_task: "Completed implementation of {feature_description}"
+
+configuration:
+  test_framework: pytest
+  coverage_minimum: 80
+  max_function_length: 50
+  max_cyclomatic_complexity: 10
+
+quality_gates:
+  - all_tests_passing: true
+  - coverage_above_minimum: true
+  - no_linting_errors: true
+  - type_hints_present: true
+
+example_usage: |
+  # From agent code:
+  result = execute_command("implement-tdd", {
+    "feature_description": "User authentication with JWT",
+    "plan_step": "Step 3: Implement token generation"
+  })

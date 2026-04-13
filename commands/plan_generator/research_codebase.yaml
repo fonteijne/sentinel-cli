@@ -1,0 +1,205 @@
+name: research-codebase
+description: Explore existing code patterns and architecture before planning
+version: 1.0
+
+parameters:
+  ticket_id:
+    type: string
+    required: true
+    description: Jira ticket ID being planned
+
+  focus_areas:
+    type: array
+    required: false
+    default: ["authentication", "database", "api", "testing"]
+    description: Specific areas to research
+
+  depth:
+    type: string
+    required: false
+    default: "medium"
+    enum: ["quick", "medium", "thorough"]
+    description: How deep to explore
+
+research_strategy:
+  quick:
+    time_budget: 5 minutes
+    actions:
+      - scan_project_structure
+      - identify_main_modules
+      - check_testing_patterns
+      - review_recent_commits
+
+  medium:
+    time_budget: 15 minutes
+    actions:
+      - deep_dive_on_related_files
+      - analyze_import_patterns
+      - check_configuration_files
+      - review_similar_features
+      - identify_shared_utilities
+
+  thorough:
+    time_budget: 30 minutes
+    actions:
+      - comprehensive_codebase_analysis
+      - dependency_graph_mapping
+      - architectural_pattern_detection
+      - technical_debt_assessment
+      - security_pattern_analysis
+
+workflow:
+  - name: discover_structure
+    description: Understand project organization
+    actions:
+      - list_directories: "src/"
+      - identify_modules:
+          - api/
+          - models/
+          - services/
+          - utils/
+          - tests/
+      - check_framework: "FastAPI|Flask|Django"
+      - identify_database: "PostgreSQL|MySQL|MongoDB"
+
+  - name: analyze_patterns
+    description: Extract existing code patterns
+    patterns_to_find:
+      authentication:
+        - "How is auth currently implemented?"
+        - "JWT vs Sessions?"
+        - "Where are auth decorators defined?"
+
+      database:
+        - "ORM or raw SQL?"
+        - "Migration strategy?"
+        - "Connection pooling?"
+
+      api:
+        - "REST or GraphQL?"
+        - "Validation library?"
+        - "Error handling patterns?"
+
+      testing:
+        - "Pytest or unittest?"
+        - "Fixture patterns?"
+        - "Mocking strategy?"
+
+  - name: find_similar_features
+    description: Locate analogous implementations
+    actions:
+      - search_for_keywords: "{ticket keywords}"
+      - identify_related_files
+      - extract_implementation_patterns
+      - note_reusable_components
+
+  - name: check_dependencies
+    description: Understand external integrations
+    actions:
+      - parse: "pyproject.toml"
+      - list_dependencies
+      - check_versions
+      - identify_integration_points
+
+  - name: review_recent_changes
+    description: Learn from recent work
+    actions:
+      - git_log: "last 10 commits"
+      - identify_active_areas
+      - check_commit_patterns
+      - find_related_merge_requests
+
+  - name: document_findings
+    description: Summarize research for planning
+    output_format: |
+      # Codebase Research: {ticket_id}
+
+      ## Project Structure
+      {structure_overview}
+
+      ## Existing Patterns
+
+      ### Authentication
+      {auth_patterns}
+
+      ### Database
+      {db_patterns}
+
+      ### API Design
+      {api_patterns}
+
+      ### Testing
+      {test_patterns}
+
+      ## Similar Features
+      {similar_implementations}
+
+      ## Reusable Components
+      {reusable_code}
+
+      ## Integration Points
+      {integrations}
+
+      ## Recommendations
+      - Follow pattern X for consistency
+      - Reuse utility Y from module Z
+      - Consider architectural constraint Q
+
+output:
+  save_to: ".agents/memory/research-{ticket_id}.md"
+  include_in_plan: true
+  reference_format: "See research: .agents/memory/research-{ticket_id}.md"
+
+example_research_output: |
+  # Codebase Research: ACME-123
+
+  ## Project Structure
+  - FastAPI application
+  - PostgreSQL database with SQLAlchemy ORM
+  - Pytest for testing
+  - Poetry for dependency management
+
+  ## Existing Patterns
+
+  ### Authentication
+  - JWT tokens via `src/auth/jwt_handler.py`
+  - `@require_auth` decorator in `src/auth/decorators.py`
+  - Token expiration: 24 hours
+  - Refresh token support: Yes
+
+  ### Database
+  - SQLAlchemy models in `src/models/`
+  - Alembic migrations in `migrations/`
+  - Connection pooling configured in `src/db/connection.py`
+
+  ### API Design
+  - Pydantic models for validation
+  - Consistent error responses via `src/api/errors.py`
+  - OpenAPI docs auto-generated
+
+  ### Testing
+  - Pytest with fixtures in `tests/conftest.py`
+  - Database fixtures use transactions (rollback after test)
+  - Mocking with `pytest-mock`
+
+  ## Similar Features
+  Found similar pattern in `src/api/users.py`:
+  - User creation endpoint follows validation → business logic → persistence
+  - Can adapt this pattern for new feature
+
+  ## Recommendations
+  - Follow existing JWT pattern, don't introduce new auth
+  - Use SQLAlchemy models, not raw SQL
+  - Write Pydantic schemas for request/response validation
+  - Follow test fixture pattern from `tests/conftest.py`
+
+example_usage: |
+  # From agent code:
+  research = execute_command("research-codebase", {
+    "ticket_id": "ACME-123",
+    "focus_areas": ["authentication", "api"],
+    "depth": "medium"
+  })
+
+  # Use research findings in plan generation
+  plan = generate_plan(ticket, research.findings)
