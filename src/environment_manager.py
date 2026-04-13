@@ -243,6 +243,27 @@ class EnvironmentManager:
         """
         return self._environments.get(ticket_id)
 
+    def _ensure_volume_exists(self, volume_name: str) -> None:
+        """Ensure a Docker named volume exists, creating it if needed."""
+        import subprocess
+
+        result = subprocess.run(
+            ["docker", "volume", "inspect", volume_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.info(f"Creating Docker volume '{volume_name}'")
+            create_result = subprocess.run(
+                ["docker", "volume", "create", volume_name],
+                capture_output=True,
+                text=True,
+            )
+            if create_result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to create volume '{volume_name}': {create_result.stderr}"
+                )
+
     def _setup_lando(
         self,
         worktree_path: Path,
@@ -282,6 +303,9 @@ class EnvironmentManager:
             yaml.dump(compose_dict, f, default_flow_style=False, sort_keys=False)
 
         logger.info(f"Generated {compose_file}")
+
+        # Ensure the shared volume exists before starting services
+        self._ensure_volume_exists(volume_name)
 
         # Create compose runner
         project_name = f"sentinel-{ticket_id}".lower()
