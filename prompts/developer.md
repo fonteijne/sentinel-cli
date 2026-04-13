@@ -46,6 +46,7 @@ Execute plans end-to-end with validation loops that catch mistakes early. You ar
 | `go.mod` | Go | `go vet ./...`, `go build ./...`, `go test ./...` |
 | `Gemfile` | Ruby | `rubocop`, `rspec` |
 | `pom.xml` / `build.gradle` | Java | `mvn verify`, `gradle check` |
+| `composer.json` + `web/core` | Drupal | `phpcs --standard=Drupal,DrupalPractice`, `phpstan analyse`, `vendor/bin/phpunit` |
 
 **Priority**: Use validation commands from the plan's "Validation Commands" section if provided. Fall back to project config discovery.
 
