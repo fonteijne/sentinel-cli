@@ -3,6 +3,7 @@ import {
   FolderOpen, Ticket, Shield, Bot, Zap,
   ExternalLink, ArrowRight, RefreshCw,
 } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 import StatCard from '../components/StatCard.jsx'
 import ActivityFeed from '../components/ActivityFeed.jsx'
 import HealthIndicator from '../components/HealthIndicator.jsx'
@@ -10,15 +11,15 @@ import { AgentRunBarChart, ConfidenceLineChart } from '../components/SecurityCha
 import axios from 'axios'
 
 const QUICK_ACTIONS = [
-  { label: 'Plan Ticket', description: 'Generate plan for a Jira ticket', icon: Ticket, color: 'text-cyan-400', bg: 'bg-cyan-500/10 border-cyan-500/20' },
-  { label: 'Execute Ticket', description: 'Run implementation for a ticket', icon: Zap, color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/20' },
-  { label: 'Validate Connections', description: 'Test all API connections', icon: Shield, color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20' },
-  { label: 'View Projects', description: 'Manage configured projects', icon: FolderOpen, color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20' },
+  { label: 'Plan Ticket', description: 'Generate plan for a Jira ticket', icon: Ticket, color: 'text-cyan-400', bg: 'bg-cyan-500/10 border-cyan-500/20', route: '/tickets' },
+  { label: 'Execute Ticket', description: 'Run implementation for a ticket', icon: Zap, color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/20', route: '/tickets' },
+  { label: 'Validate Connections', description: 'Test all API connections', icon: Shield, color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20', route: '/settings' },
+  { label: 'View Projects', description: 'Manage configured projects', icon: FolderOpen, color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20', route: '/projects' },
 ]
 
-function QuickActionCard({ label, description, icon: Icon, color, bg }) {
+function QuickActionCard({ label, description, icon: Icon, color, bg, onClick }) {
   return (
-    <button className={`glass-card glass-card-hover p-4 text-left w-full group border ${bg}`}>
+    <button onClick={onClick} className={`glass-card glass-card-hover p-4 text-left w-full group border ${bg}`}>
       <div className="flex items-start justify-between">
         <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${bg} mb-3`}>
           <Icon className={`w-4 h-4 ${color}`} />
@@ -32,25 +33,42 @@ function QuickActionCard({ label, description, icon: Icon, color, bg }) {
 }
 
 export default function Overview() {
+  const navigate = useNavigate()
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [activity, setActivity] = useState([])
+  const [ticketCount, setTicketCount] = useState(0)
+  const [refreshingHealth, setRefreshingHealth] = useState(false)
 
   useEffect(() => {
     axios.get('/api/status')
       .then(r => setStatus(r.data))
       .catch(() => setStatus(null))
       .finally(() => setLoading(false))
+
+    axios.get('/api/activity')
+      .then(r => setActivity(r.data || []))
+      .catch(() => setActivity([]))
+
+    axios.get('/api/tickets')
+      .then(r => {
+        const data = r.data || {}
+        const count = Object.values(data).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0)
+        setTicketCount(count)
+      })
+      .catch(() => setTicketCount(0))
   }, [])
 
-  // Use demo data when API returns zeros (no Sentinel CLI connected)
+  const handleRefreshHealth = async () => {
+    setRefreshingHealth(true)
+    try {
+      const res = await axios.get('/api/status/validate')
+      setStatus(prev => ({ ...prev, ...res.data }))
+    } catch {}
+    setRefreshingHealth(false)
+  }
+
   const raw = status?.stats || {}
-  const isDemo = !raw.active_projects && !raw.active_tickets && !raw.agent_runs_today
-  const stats = isDemo ? {
-    active_projects: 4,
-    active_tickets: 7,
-    security_score: 94,
-    agent_runs_today: 12,
-  } : raw
 
   const healthItems = [
     { name: 'Jira', status: status?.jira || 'unknown', detail: status?.jira_url || 'Not configured', icon: Ticket },
@@ -66,38 +84,30 @@ export default function Overview() {
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard
           title="Active Projects"
-          value={stats.active_projects}
+          value={raw.active_projects ?? 0}
           icon={FolderOpen}
           color="blue"
-          trend={0}
-          trendLabel="vs last week"
           loading={loading}
         />
         <StatCard
           title="Active Tickets"
-          value={stats.active_tickets}
+          value={ticketCount}
           icon={Ticket}
           color="cyan"
-          trend={14}
-          trendLabel="vs last week"
           loading={loading}
         />
         <StatCard
           title="Security Score"
-          value={`${stats.security_score}%`}
+          value={raw.security_score != null ? `${raw.security_score}%` : '-'}
           icon={Shield}
           color="emerald"
-          trend={2}
-          trendLabel="improved since last scan"
           loading={loading}
         />
         <StatCard
           title="Agent Runs Today"
-          value={stats.agent_runs_today}
+          value={raw.agent_runs_today ?? 0}
           icon={Bot}
           color="purple"
-          trend={-8}
-          trendLabel="vs yesterday"
           loading={loading}
         />
       </div>
@@ -112,7 +122,7 @@ export default function Overview() {
               View all <ArrowRight className="w-3 h-3" />
             </button>
           </div>
-          <ActivityFeed maxItems={8} />
+          <ActivityFeed items={activity} maxItems={8} />
         </div>
 
         {/* Charts — 7 cols split */}
@@ -155,8 +165,12 @@ export default function Overview() {
         <div className="col-span-12 lg:col-span-7 glass-card p-5">
           <div className="section-header">
             <h2 className="section-title">System Health</h2>
-            <button className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-blue-400 transition-colors">
-              <RefreshCw className="w-3 h-3" />
+            <button
+              onClick={handleRefreshHealth}
+              disabled={refreshingHealth}
+              className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-blue-400 transition-colors"
+            >
+              <RefreshCw className={`w-3 h-3 ${refreshingHealth ? 'animate-spin' : ''}`} />
               Refresh
             </button>
           </div>
@@ -180,7 +194,11 @@ export default function Overview() {
           </div>
           <div className="grid grid-cols-2 gap-3">
             {QUICK_ACTIONS.map(action => (
-              <QuickActionCard key={action.label} {...action} />
+              <QuickActionCard
+                key={action.label}
+                {...action}
+                onClick={() => navigate(action.route)}
+              />
             ))}
           </div>
         </div>

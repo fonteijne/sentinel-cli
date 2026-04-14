@@ -36,19 +36,16 @@ function timeAgo(ts) {
   return 'Just now'
 }
 
-const MOCK_ACTIVITY = [
-  { id: 1, type: 'execute', text: 'Executed ticket PROJ-142 — Python authentication module', ts: Date.now() - 8 * 60000, ticket: 'PROJ-142' },
-  { id: 2, type: 'security', text: 'Security review passed with 0 critical findings', ts: Date.now() - 25 * 60000 },
-  { id: 3, type: 'plan', text: 'Plan generated for PROJ-145 — Refactor database layer', ts: Date.now() - 52 * 60000, ticket: 'PROJ-145' },
-  { id: 4, type: 'warning', text: 'LLM rate limit reached, retried after backoff', ts: Date.now() - 1.5 * 3600000 },
-  { id: 5, type: 'execute', text: 'Executed ticket SHOP-88 — Drupal content migration', ts: Date.now() - 2.2 * 3600000, ticket: 'SHOP-88' },
-  { id: 6, type: 'project', text: 'Project profile regenerated for shop-platform', ts: Date.now() - 3.1 * 3600000 },
-  { id: 7, type: 'success', text: 'PROJ-140 debrief validated — ticket resolved', ts: Date.now() - 5 * 3600000, ticket: 'PROJ-140' },
-  { id: 8, type: 'ticket', text: 'Plan revision triggered by MR feedback on PROJ-139', ts: Date.now() - 7 * 3600000, ticket: 'PROJ-139' },
-]
-
-export default function ActivityFeed({ items = MOCK_ACTIVITY, maxItems = 8 }) {
+export default function ActivityFeed({ items = [], maxItems = 8 }) {
   const displayed = items.slice(0, maxItems)
+
+  if (displayed.length === 0) {
+    return (
+      <div className="flex items-center justify-center py-8 text-slate-600 text-sm text-center">
+        No activity yet — run a sentinel command to see events here
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-1">

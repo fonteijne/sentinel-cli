@@ -4,41 +4,6 @@ import ProjectCard from '../components/ProjectCard.jsx'
 import axios from 'axios'
 import clsx from 'clsx'
 
-const MOCK_PROJECTS = [
-  {
-    key: 'PROJ',
-    name: 'Core Platform',
-    git_url: 'git@gitlab.example.com:backend/core-platform.git',
-    default_branch: 'main',
-    stack_type: 'python',
-    worktree_count: 2,
-  },
-  {
-    key: 'SHOP',
-    name: 'E-Commerce Shop',
-    git_url: 'git@gitlab.example.com:frontend/shop-platform.git',
-    default_branch: 'develop',
-    stack_type: 'drupal',
-    worktree_count: 1,
-  },
-  {
-    key: 'API',
-    name: 'Public API Gateway',
-    git_url: 'git@gitlab.example.com:backend/api-gateway.git',
-    default_branch: 'main',
-    stack_type: 'python',
-    worktree_count: 0,
-  },
-  {
-    key: 'CMS',
-    name: 'Content Management',
-    git_url: 'git@gitlab.example.com:frontend/cms.git',
-    default_branch: 'develop',
-    stack_type: 'drupal',
-    worktree_count: 0,
-  },
-]
-
 const EMPTY_FORM = {
   key: '',
   name: '',
@@ -133,10 +98,9 @@ export default function Projects() {
   useEffect(() => {
     axios.get('/api/projects')
       .then(r => {
-        // Use mock data when API returns empty array (no Sentinel CLI connected)
-        setProjects(r.data && r.data.length > 0 ? r.data : MOCK_PROJECTS)
+        setProjects(r.data || [])
       })
-      .catch(() => setProjects(MOCK_PROJECTS))
+      .catch(() => setProjects([]))
       .finally(() => setLoading(false))
   }, [])
 

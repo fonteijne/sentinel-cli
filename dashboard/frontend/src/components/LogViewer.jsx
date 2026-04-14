@@ -62,7 +62,7 @@ function generateMockLog(id) {
 }
 
 export default function LogViewer({ websocketUrl = null }) {
-  const [logs, setLogs] = useState(() => Array.from({ length: 30 }, (_, i) => generateMockLog(i)))
+  const [logs, setLogs] = useState(() => websocketUrl ? [] : Array.from({ length: 30 }, (_, i) => generateMockLog(i)))
   const [filter, setFilter] = useState('')
   const [levelFilter, setLevelFilter] = useState('ALL')
   const [autoScroll, setAutoScroll] = useState(true)
@@ -218,7 +218,10 @@ export default function LogViewer({ websocketUrl = null }) {
       <div className="flex-1 overflow-y-auto">
         {filteredLogs.length === 0 ? (
           <div className="flex items-center justify-center h-32 text-slate-600 text-sm">
-            No log entries match your filters
+            {websocketUrl && logs.length === 0
+              ? 'Waiting for sentinel commands...'
+              : 'No log entries match your filters'
+            }
           </div>
         ) : (
           <>

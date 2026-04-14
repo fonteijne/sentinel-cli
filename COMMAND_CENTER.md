@@ -8,46 +8,48 @@
 ## Dashboard Pages
 
 ### Overview
-- [x] KPI stat cards (active projects, active tickets, security score, agent runs today)
-- [x] Trend indicators with percentage change
-- [x] Recent activity feed with timeline entries
+- [x] KPI stat cards wired to real backend (active projects, active tickets, security score, agent runs today)
+- [x] Recent activity feed from real CLI execution history (`GET /api/activity`)
 - [x] Agent runs per week bar chart
 - [x] Plan confidence score line chart with threshold indicator
-- [x] System health indicators (Jira, GitLab, LLM, SSH, Beads)
-- [x] Quick action buttons (Plan Ticket, Execute Ticket, Validate Connections, View Projects)
-- [x] Demo data fallback when Sentinel CLI is not connected
+- [x] System health indicators (Jira, GitLab, LLM, SSH, Beads) from real `/api/status`
+- [x] Quick action buttons navigate to actual pages (Tickets, Settings, Projects)
+- [x] System Health refresh triggers real `sentinel validate` via `/api/status/validate`
+- [x] Zero-state display when no data — no fake demo numbers
 
 ### Projects
 - [x] Project grid with card layout (key, name, git URL, branch, stack type, worktree count)
-- [x] Add new project form
+- [x] Add new project form (writes to config.yaml via API)
 - [x] Edit existing project form
 - [x] Delete project with confirmation
-- [x] Generate project profile action
+- [x] Generate project profile action (triggers `sentinel projects profile`)
 - [x] Search/filter projects
-- [x] Active worktree count display
-- [x] Demo project data fallback
+- [x] Active worktree count from real git data
+- [x] Empty state when no projects configured
 
 ### Tickets (Kanban Pipeline)
 - [x] Four-column kanban board: Plan → Execute → Review → Done
 - [x] Ticket cards with ID, summary, priority badge, labels
-- [x] Click-to-select ticket detail panel
-- [x] Actions: Generate/Revise Plan, Execute Implementation, Run Functional Debrief
+- [x] Click-to-select ticket detail panel with project/branch/worktree info
+- [x] Actions: Generate/Revise Plan, Execute Implementation, Run Functional Debrief (all pass project context)
 - [x] Search/filter tickets
 - [x] Per-column ticket counts
-- [x] Action commands trigger sentinel CLI via API
 - [x] Worktree-based ticket sync — scans active git worktrees to derive live ticket data
 - [x] Phase detection: plan file presence, memory/session artifacts, code diffs vs default branch
-- [x] Live/Demo badge indicating data source
+- [x] "Start New Ticket" modal — select project + ticket ID → creates worktree via API
+- [x] "Reset Ticket" action — removes worktree + branch
+- [x] "Remove Worktree" action — cleans up worktree only
+- [x] Connected/Offline status badge
 - [x] Sync button for manual worktree refresh
 - [x] Project filter dropdown (multi-project support)
 - [x] Loading skeleton during sync
-- [x] Graceful fallback to demo data when no worktrees exist or API unavailable
-- [x] Detail panel shows project key, branch name, and worktree path for live tickets
+- [x] Empty state when no active tickets (no fake mock data)
 
 ### Agents
-- [x] Agent cards for all 7 agent types (plan_generator, python_developer, drupal_developer, security_review, functional_debrief, confidence_evaluator, project_profiler)
+- [x] Agent cards from real config.yaml (plan_generator, python_developer, security_review, confidence_evaluator, project_profiler)
 - [x] Model name and temperature display per agent
-- [x] Specialization tags
+- [x] Specialization tags from real config
+- [x] Dynamic model usage breakdown computed from agent config
 - [x] Run history with success/failure indicators
 - [x] Success rate percentage
 - [x] Click-to-select run history detail panel
@@ -57,29 +59,29 @@
 ### Security
 - [x] Security score calculation (weighted by severity)
 - [x] Severity breakdown stat cards (Critical, High, Medium, Low)
-- [x] Severity pie chart
-- [x] Findings trend line chart (6-week history)
-- [x] Findings list with severity filter tabs (ALL, Critical, High, Medium, Low)
+- [x] Findings list with severity filter tabs
 - [x] Finding detail panel (ID, OWASP rule, ticket link, file location, description)
 - [x] Mark Resolved / Ignore actions
-- [x] Status badges (Open, Resolved)
+- [x] Empty state when no findings — explains how to trigger security reviews
+- [x] Info banner explaining security review workflow
 
 ### Settings
-- [x] Service connection cards (Jira, GitLab, LLM, SSH, Beads) with status indicators
-- [x] Test connection action per service
+- [x] Service connection cards (Jira, GitLab, LLM, SSH, Beads) with real status from `/api/status`
+- [x] Test connection triggers real `sentinel validate` via `/api/status/validate`
 - [x] Validate All connections button
-- [x] config.yaml viewer with syntax-highlighted YAML
-- [x] Edit config action
+- [x] config.yaml viewer loaded from real file via `/api/config`
+- [x] Edit + Save config (writes back to disk)
 - [x] Environment variables reference table
+- [x] Auth management section (LLM, Jira, GitLab)
 
 ### Logs
-- [x] Real-time log stream viewer (WebSocket-ready)
+- [x] Real-time log stream via WebSocket (`ws://host/ws/logs`)
 - [x] Log level filter buttons (ALL, INFO, WARNING, ERROR, DEBUG)
 - [x] Text search/filter
 - [x] Color-coded log levels
 - [x] Timestamped entries with source module identification
-- [x] Demo log data for offline/demo mode
-- [x] Download, copy, and clear actions
+- [x] "Waiting for sentinel commands..." when idle
+- [x] Auto-scroll, pause/resume, and clear actions
 
 ---
 
@@ -100,14 +102,20 @@
 ### Tickets
 - [x] `GET /api/tickets` — List all active tickets from git worktrees (with phase detection)
 - [x] `GET /api/tickets/{ticket_id}/info` — Get ticket info from Jira
-- [x] `POST /api/tickets/{ticket_id}/plan` — Generate/revise plan
-- [x] `POST /api/tickets/{ticket_id}/execute` — Execute implementation
-- [x] `POST /api/tickets/{ticket_id}/debrief` — Run functional debrief
+- [x] `POST /api/tickets/{ticket_id}/plan` — Generate/revise plan (accepts `?project=`)
+- [x] `POST /api/tickets/{ticket_id}/execute` — Execute implementation (accepts `?project=`)
+- [x] `POST /api/tickets/{ticket_id}/debrief` — Run functional debrief (accepts `?project=`)
+- [x] `POST /api/tickets/{ticket_id}/worktree` — Create worktree for ticket (bare clone + branch)
+- [x] `DELETE /api/tickets/{ticket_id}/worktree` — Remove worktree
+- [x] `POST /api/tickets/{ticket_id}/reset` — Full reset (worktree + branch)
 
 ### Configuration
 - [x] `GET /api/config` — Read config.yaml
 - [x] `PUT /api/config` — Update config.yaml
 - [x] `GET /api/agents` — Get agent configurations
+
+### Activity
+- [x] `GET /api/activity` — Recent activity log from CLI executions (in-memory buffer)
 
 ### Real-time
 - [x] `WS /ws/logs` — WebSocket log stream from CLI process
@@ -152,7 +160,7 @@
 | `sentinel info <ticket>` | Tickets → Ticket cards display info | ✅ |
 | `sentinel status` | Overview → KPI cards + System Health | ✅ |
 | `sentinel validate` | Settings → Validate All / Overview → Quick Actions | ✅ |
-| `sentinel reset <ticket>` | — | ⬜ Planned |
+| `sentinel reset <ticket>` | Tickets → Reset Ticket / Remove Worktree | ✅ |
 | `sentinel reset --all` | — | ⬜ Planned |
 | `sentinel auth login` | — | ⬜ Planned |
 | `sentinel auth logout` | — | ⬜ Planned |
@@ -169,12 +177,13 @@
 ## Upcoming Features
 
 - [ ] Auth management page (login/logout/configure LLM provider)
-- [ ] Reset ticket action from Tickets detail panel
+- [x] ~~Reset ticket action from Tickets detail panel~~ (implemented: Reset Ticket + Remove Worktree buttons)
 - [ ] Reset all action from Settings
-- [ ] Real-time execution progress (streaming CLI output during plan/execute)
+- [x] ~~Real-time execution progress~~ (implemented: WebSocket log stream from CLI process)
 - [x] ~~Worktree management view per project~~ (implemented via Tickets worktree sync)
+- [x] ~~Config editor with save/validate~~ (implemented in Settings page)
 - [ ] MR status tracking from GitLab
 - [ ] Debrief conversation thread viewer
-- [ ] Config editor with save/validate
 - [ ] Multi-project dashboard switching
 - [ ] Light theme option
+- [ ] Auth management page (login/logout/configure LLM provider)

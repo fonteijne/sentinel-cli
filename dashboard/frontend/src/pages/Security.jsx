@@ -1,94 +1,7 @@
 import React, { useState } from 'react'
-import { Shield, AlertTriangle, ShieldAlert, ShieldCheck, Info, ChevronRight, Clock, Code2, Bug } from 'lucide-react'
+import { Shield, AlertTriangle, ShieldAlert, ShieldCheck, Info, Clock, Code2, Bug } from 'lucide-react'
 import { SeverityPieChart, SecurityTrendChart } from '../components/SecurityChart.jsx'
 import clsx from 'clsx'
-
-const MOCK_FINDINGS = [
-  {
-    id: 'SEC-001',
-    severity: 'Critical',
-    title: 'SQL injection vulnerability in user search endpoint',
-    ticket: 'PROJ-142',
-    file: 'src/api/users.py',
-    line: 87,
-    rule: 'A03:2021-Injection',
-    status: 'open',
-    found: '2h ago',
-    description: 'User-supplied input is concatenated directly into SQL query without parameterization.',
-  },
-  {
-    id: 'SEC-002',
-    severity: 'High',
-    title: 'Missing authentication on admin API endpoints',
-    ticket: 'PROJ-140',
-    file: 'src/api/admin.py',
-    line: 34,
-    rule: 'A01:2021-Access Control',
-    status: 'resolved',
-    found: '1d ago',
-    description: 'Several admin routes do not require authentication headers.',
-  },
-  {
-    id: 'SEC-003',
-    severity: 'High',
-    title: 'JWT secret stored in plaintext in config file',
-    ticket: 'PROJ-138',
-    file: 'config/config.yaml',
-    line: 15,
-    rule: 'A02:2021-Cryptographic',
-    status: 'resolved',
-    found: '3d ago',
-    description: 'JWT signing secret is stored in config.yaml which is tracked by git.',
-  },
-  {
-    id: 'SEC-004',
-    severity: 'Medium',
-    title: 'Weak password hashing algorithm (MD5)',
-    ticket: 'PROJ-136',
-    file: 'src/auth/password.py',
-    line: 22,
-    rule: 'A02:2021-Cryptographic',
-    status: 'open',
-    found: '5h ago',
-    description: 'MD5 is used for password hashing — should use bcrypt or argon2.',
-  },
-  {
-    id: 'SEC-005',
-    severity: 'Medium',
-    title: 'Exposed stack trace in error responses',
-    ticket: 'PROJ-143',
-    file: 'src/middleware/error_handler.py',
-    line: 45,
-    rule: 'A05:2021-Misconfiguration',
-    status: 'open',
-    found: '1h ago',
-    description: 'Stack traces are included in 500 error responses in production mode.',
-  },
-  {
-    id: 'SEC-006',
-    severity: 'Low',
-    title: 'Missing CORS configuration for API routes',
-    ticket: 'PROJ-142',
-    file: 'src/main.py',
-    line: 12,
-    rule: 'A05:2021-Misconfiguration',
-    status: 'open',
-    found: '2h ago',
-    description: 'CORS headers allow all origins (*) without restriction.',
-  },
-  {
-    id: 'SEC-007',
-    severity: 'Low',
-    title: 'Outdated dependency with known CVE',
-    ticket: 'SHOP-88',
-    file: 'composer.json',
-    line: null,
-    rule: 'A06:2021-Vulnerable Components',
-    status: 'open',
-    found: '4h ago',
-    description: 'symfony/http-foundation 5.4.0 has CVE-2023-46733.',
-  },
-]
 
 const SEVERITY_CONFIG = {
   Critical: { icon: ShieldAlert, color: 'text-red-400', bg: 'bg-red-500/10', border: 'border-red-500/25', dot: 'bg-red-400' },
@@ -231,8 +144,7 @@ export default function Security() {
   const [selected, setSelected] = useState(null)
   const [severityFilter, setSeverityFilter] = useState('ALL')
 
-  const findings = MOCK_FINDINGS
-  const openFindings = findings.filter(f => f.status === 'open')
+  const findings = []
   const sevCounts = {
     Critical: findings.filter(f => f.severity === 'Critical').length,
     High: findings.filter(f => f.severity === 'High').length,
@@ -240,12 +152,19 @@ export default function Security() {
     Low: findings.filter(f => f.severity === 'Low').length,
   }
 
-  const score = Math.max(0, 100 - (sevCounts.Critical * 20) - (sevCounts.High * 8) - (sevCounts.Medium * 3) - (sevCounts.Low * 1))
+  const score = findings.length === 0 ? 100 : Math.max(0, 100 - (sevCounts.Critical * 20) - (sevCounts.High * 8) - (sevCounts.Medium * 3) - (sevCounts.Low * 1))
 
   const filtered = findings.filter(f => severityFilter === 'ALL' || f.severity === severityFilter)
+  const totalFindings = Object.values(sevCounts).reduce((a, b) => a + b, 0)
 
   return (
     <div className="p-6 space-y-5">
+      {/* Info banner */}
+      <div className="flex items-center gap-3 px-4 py-3 rounded-xl border border-blue-500/20 bg-blue-500/5 text-sm text-blue-300">
+        <Shield className="w-4 h-4 flex-shrink-0 text-blue-400" />
+        <span>Security findings are generated when you run the security review agent on a ticket from the Tickets page.</span>
+      </div>
+
       {/* Stats row */}
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4">
         <div className="glass-card p-4 border border-emerald-500/15">
@@ -272,70 +191,83 @@ export default function Security() {
         })}
       </div>
 
-      <div className="grid grid-cols-12 gap-5">
-        {/* Charts */}
-        <div className="col-span-12 lg:col-span-4 space-y-4">
-          <div className="glass-card p-5">
-            <h3 className="section-title mb-4">Severity Breakdown</h3>
-            <SeverityPieChart data={sevCounts} />
+      {totalFindings === 0 ? (
+        /* Empty state */
+        <div className="glass-card p-16 text-center">
+          <div className="w-16 h-16 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto mb-4">
+            <ShieldCheck className="w-8 h-8 text-emerald-400/60" />
           </div>
-          <div className="glass-card p-5">
-            <h3 className="section-title mb-4">Findings Trend</h3>
-            <SecurityTrendChart />
-          </div>
+          <p className="text-slate-300 text-sm font-medium mb-1">No security findings</p>
+          <p className="text-slate-600 text-xs max-w-sm mx-auto leading-relaxed">
+            Run a security review from the Tickets page to scan for vulnerabilities
+          </p>
         </div>
-
-        {/* Findings list + detail */}
-        <div className="col-span-12 lg:col-span-8 grid grid-cols-12 gap-4">
-          {/* List */}
-          <div className="col-span-12 lg:col-span-7 glass-card overflow-hidden flex flex-col">
-            {/* Filter bar */}
-            <div className="flex items-center gap-2 px-4 py-3 border-b border-blue-500/8 flex-shrink-0">
-              {['ALL', 'Critical', 'High', 'Medium', 'Low'].map(sev => {
-                const cfg = SEVERITY_CONFIG[sev]
-                return (
-                  <button
-                    key={sev}
-                    onClick={() => setSeverityFilter(sev)}
-                    className={clsx(
-                      'text-[11px] font-medium px-2.5 py-1 rounded-lg border transition-all',
-                      severityFilter === sev
-                        ? sev === 'ALL'
-                          ? 'bg-blue-500/20 border-blue-500/30 text-blue-300'
-                          : `${cfg.bg} ${cfg.border} ${cfg.color}`
-                        : 'bg-transparent border-white/8 text-slate-600 hover:text-slate-400'
-                    )}
-                  >
-                    {sev} {sev !== 'ALL' && `(${sevCounts[sev] || 0})`}
-                  </button>
-                )
-              })}
+      ) : (
+        <div className="grid grid-cols-12 gap-5">
+          {/* Charts */}
+          <div className="col-span-12 lg:col-span-4 space-y-4">
+            <div className="glass-card p-5">
+              <h3 className="section-title mb-4">Severity Breakdown</h3>
+              <SeverityPieChart data={sevCounts} />
             </div>
-
-            <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
-              {filtered.length === 0 ? (
-                <div className="text-center py-8 text-slate-600 text-sm">
-                  No findings for this severity level
-                </div>
-              ) : (
-                filtered.map(f => (
-                  <FindingRow
-                    key={f.id}
-                    finding={f}
-                    isSelected={selected?.id === f.id}
-                    onClick={() => setSelected(selected?.id === f.id ? null : f)}
-                  />
-                ))
-              )}
+            <div className="glass-card p-5">
+              <h3 className="section-title mb-4">Findings Trend</h3>
+              <SecurityTrendChart />
             </div>
           </div>
 
-          {/* Detail */}
-          <div className="col-span-12 lg:col-span-5">
-            <FindingDetail finding={selected} onClose={() => setSelected(null)} />
+          {/* Findings list + detail */}
+          <div className="col-span-12 lg:col-span-8 grid grid-cols-12 gap-4">
+            {/* List */}
+            <div className="col-span-12 lg:col-span-7 glass-card overflow-hidden flex flex-col">
+              {/* Filter bar */}
+              <div className="flex items-center gap-2 px-4 py-3 border-b border-blue-500/8 flex-shrink-0">
+                {['ALL', 'Critical', 'High', 'Medium', 'Low'].map(sev => {
+                  const cfg = SEVERITY_CONFIG[sev]
+                  return (
+                    <button
+                      key={sev}
+                      onClick={() => setSeverityFilter(sev)}
+                      className={clsx(
+                        'text-[11px] font-medium px-2.5 py-1 rounded-lg border transition-all',
+                        severityFilter === sev
+                          ? sev === 'ALL'
+                            ? 'bg-blue-500/20 border-blue-500/30 text-blue-300'
+                            : `${cfg.bg} ${cfg.border} ${cfg.color}`
+                          : 'bg-transparent border-white/8 text-slate-600 hover:text-slate-400'
+                      )}
+                    >
+                      {sev} {sev !== 'ALL' && `(${sevCounts[sev] || 0})`}
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-2 space-y-0.5">
+                {filtered.length === 0 ? (
+                  <div className="text-center py-8 text-slate-600 text-sm">
+                    No findings for this severity level
+                  </div>
+                ) : (
+                  filtered.map(f => (
+                    <FindingRow
+                      key={f.id}
+                      finding={f}
+                      isSelected={selected?.id === f.id}
+                      onClick={() => setSelected(selected?.id === f.id ? null : f)}
+                    />
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Detail */}
+            <div className="col-span-12 lg:col-span-5">
+              <FindingDetail finding={selected} onClose={() => setSelected(null)} />
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   )
 }

@@ -14,33 +14,6 @@ const SERVICE_ICONS = {
   Beads: Zap,
 }
 
-const MOCK_CONFIG = `version: '1.0'
-workspace:
-  root_dir: ~/sentinel-workspaces
-  plans_dir: .agents/plans
-  memory_dir: .agents/memory
-agents:
-  plan_generator:
-    model: claude-opus-4-5
-    temperature: 0.3
-  python_developer:
-    model: claude-4-5-sonnet
-    temperature: 0.2
-    specializations:
-    - python
-    - pydantic-ai
-    - fastapi
-    - postgresql
-  security_review:
-    model: claude-4-5-sonnet
-    temperature: 0.1
-    strictness: 5
-    veto_power: true
-confidence:
-  default_threshold: 95
-logging:
-  level: INFO`
-
 export default function Settings() {
   const [connections, setConnections] = useState({
     Jira: 'unconfigured',
@@ -51,9 +24,9 @@ export default function Settings() {
   })
   const [connectionDetails, setConnectionDetails] = useState({})
   const [validating, setValidating] = useState(false)
-  const [config, setConfig] = useState(MOCK_CONFIG)
+  const [config, setConfig] = useState('')
   const [editingConfig, setEditingConfig] = useState(false)
-  const [configDraft, setConfigDraft] = useState(MOCK_CONFIG)
+  const [configDraft, setConfigDraft] = useState('')
   const [savingConfig, setSavingConfig] = useState(false)
   const [notification, setNotification] = useState(null)
   const [authStatus, setAuthStatus] = useState(null)
@@ -85,7 +58,7 @@ export default function Settings() {
 
     axios.get('/api/config')
       .then(r => {
-        const txt = r.data.raw || MOCK_CONFIG
+        const txt = r.data.raw || ''
         setConfig(txt)
         setConfigDraft(txt)
       })
@@ -130,9 +103,17 @@ export default function Settings() {
 
   const handleTestConnection = async (name) => {
     setConnections(c => ({ ...c, [name]: 'checking' }))
-    await new Promise(r => setTimeout(r, 1200))
-    setConnections(c => ({ ...c, [name]: 'ok' }))
-    notify(`${name} connection OK`, 'success')
+    try {
+      const res = await axios.get('/api/status/validate')
+      const keyMap = { Jira: 'jira', GitLab: 'gitlab', LLM: 'llm', SSH: 'ssh', Beads: 'beads' }
+      const apiKey = keyMap[name]
+      const newStatus = res.data[apiKey] || 'error'
+      setConnections(c => ({ ...c, [name]: newStatus }))
+      notify(`${name} connection ${newStatus === 'ok' ? 'OK' : newStatus}`, newStatus === 'ok' ? 'success' : 'error')
+    } catch {
+      setConnections(c => ({ ...c, [name]: 'error' }))
+      notify(`${name} connection failed`, 'error')
+    }
   }
 
   return (
@@ -277,7 +258,7 @@ export default function Settings() {
               />
             ) : (
               <pre className="bg-white/3 border border-white/8 rounded-xl p-4 font-mono text-xs text-slate-400 overflow-auto max-h-[420px] leading-relaxed">
-                {config}
+                {config || <span className="text-slate-600 italic">Loading...</span>}
               </pre>
             )}
           </div>

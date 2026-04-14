@@ -103,6 +103,23 @@ class LogBroadcaster:
 broadcaster = LogBroadcaster()
 
 
+# ── Activity log buffer ────────────────────────────────────────────────────
+from collections import deque
+
+_activity_log: deque = deque(maxlen=100)
+
+def _log_activity(event_type: str, text: str, ticket: str | None = None, project: str | None = None) -> None:
+    """Append an event to the in-memory activity buffer."""
+    _activity_log.appendleft({
+        "id": len(_activity_log) + 1,
+        "type": event_type,
+        "text": text,
+        "ticket": ticket,
+        "project": project,
+        "ts": datetime.utcnow().isoformat() + "Z",
+    })
+
+
 # ── Config helpers ───────────────────────────────────────────────────────────
 def _load_config() -> dict:
     """Load config.yaml (and optionally config.local.yaml) and deep-merge them."""
@@ -171,6 +188,14 @@ async def _run_sentinel(args: list[str], timeout: int = 300) -> dict:
         return {"success": False, "output": output_lines, "error": "Timeout"}
 
     returncode = await proc.wait()
+    # Log activity
+    action = args[0] if args else "unknown"
+    ticket_id = args[1] if len(args) > 1 else None
+    _log_activity(
+        event_type=action,
+        text=f"{'\u2713' if returncode == 0 else '\u2717'} sentinel {' '.join(args)}",
+        ticket=ticket_id,
+    )
     return {
         "success": returncode == 0,
         "output": output_lines,
@@ -219,6 +244,12 @@ async def health_check():
     }
 
 
+@app.get("/api/activity")
+async def get_activity(limit: int = 20):
+    """Return recent activity from CLI runs."""
+    return list(_activity_log)[:limit]
+
+
 # Status ──────────────────────────────────────────────────────────────────────
 @app.get("/api/status")
 async def get_status():
@@ -234,6 +265,13 @@ async def get_status():
     def _presence(val: str) -> str:
         return "ok" if val else "unconfigured"
 
+    projects_cfg = config.get("projects", {})
+
+    # Count active tickets across all projects
+    active_ticket_count = 0
+    for key in projects_cfg:
+        active_ticket_count += _count_worktrees(key)
+
     return {
         "jira": _presence(jira_url),
         "jira_url": jira_url,
@@ -244,10 +282,10 @@ async def get_status():
         "ssh": "ok" if Path.home().joinpath(".ssh").exists() else "unconfigured",
         "beads": "unconfigured",
         "stats": {
-            "active_projects": len(config.get("projects", {})),
-            "active_tickets": 0,
-            "security_score": 94,
-            "agent_runs_today": 0,
+            "active_projects": len(projects_cfg),
+            "active_tickets": active_ticket_count,
+            "security_score": 0,
+            "agent_runs_today": len([a for a in _activity_log if a.get("ts", "").startswith(datetime.utcnow().strftime("%Y-%m-%d"))]),
         },
     }
 
@@ -475,14 +513,19 @@ async def ticket_info(ticket_id: str):
 
 
 @app.post("/api/tickets/{ticket_id}/plan")
-async def plan_ticket(ticket_id: str):
-    result = await _run_sentinel(["plan", ticket_id], timeout=300)
+async def plan_ticket(ticket_id: str, project: str | None = None):
+    args = ["plan", ticket_id]
+    if project:
+        args.extend(["-p", project])
+    result = await _run_sentinel(args, timeout=300)
     return {"ticket_id": ticket_id, "output": result.get("output", []), "success": result.get("success")}
 
 
 @app.post("/api/tickets/{ticket_id}/execute")
-async def execute_ticket(ticket_id: str, revise: bool = False):
+async def execute_ticket(ticket_id: str, revise: bool = False, project: str | None = None):
     args = ["execute", ticket_id]
+    if project:
+        args.extend(["-p", project])
     if revise:
         args.append("--revise")
     result = await _run_sentinel(args, timeout=600)
@@ -490,9 +533,151 @@ async def execute_ticket(ticket_id: str, revise: bool = False):
 
 
 @app.post("/api/tickets/{ticket_id}/debrief")
-async def debrief_ticket(ticket_id: str):
-    result = await _run_sentinel(["debrief", ticket_id], timeout=300)
+async def debrief_ticket(ticket_id: str, project: str | None = None):
+    args = ["debrief", ticket_id]
+    if project:
+        args.extend(["-p", project])
+    result = await _run_sentinel(args, timeout=300)
     return {"ticket_id": ticket_id, "output": result.get("output", []), "success": result.get("success")}
+
+
+@app.post("/api/tickets/{ticket_id}/worktree")
+async def create_worktree(ticket_id: str, project: str):
+    """Create a worktree for a ticket via sentinel CLI."""
+    # We run the plan command which auto-creates the worktree
+    # But first just create the worktree itself
+    config = _load_config()
+    projects_cfg = config.get("projects", {})
+    if project not in projects_cfg:
+        raise HTTPException(status_code=404, detail=f"Project {project} not found")
+
+    workspace_root = Path(
+        os.path.expanduser(config.get("workspace", {}).get("root_dir", "~/sentinel-workspaces"))
+    )
+    project_dir = workspace_root / project.lower()
+    worktree_dir = project_dir / ticket_id
+
+    if worktree_dir.exists():
+        return {"ticket_id": ticket_id, "project": project, "worktree_path": str(worktree_dir), "created": False, "message": "Worktree already exists"}
+
+    # Use sentinel CLI to create worktree (plan command creates it)
+    # For now, replicate the git operations directly
+    project_conf = projects_cfg[project]
+    git_url = project_conf.get("git_url", "")
+    default_branch = project_conf.get("default_branch", "main")
+
+    try:
+        # Ensure bare clone exists
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        if not project_dir.exists() or not (project_dir / "config").exists():
+            if not git_url:
+                raise HTTPException(status_code=400, detail=f"No git_url configured for project {project}")
+            subprocess.run(
+                ["git", "clone", "--bare", git_url, str(project_dir)],
+                capture_output=True, text=True, check=True, timeout=60,
+            )
+        else:
+            # Fetch latest
+            subprocess.run(
+                ["git", "fetch", "--all"],
+                cwd=str(project_dir), capture_output=True, text=True, timeout=30,
+            )
+
+        # Create worktree
+        subprocess.run(
+            ["git", "worktree", "add", str(worktree_dir), default_branch],
+            cwd=str(project_dir), capture_output=True, text=True, check=True, timeout=30,
+        )
+
+        # Create feature branch
+        branch_name = f"sentinel/feature/{ticket_id}"
+        # Check if branch exists
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", branch_name],
+            cwd=str(worktree_dir), capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            subprocess.run(["git", "checkout", branch_name], cwd=str(worktree_dir), capture_output=True, text=True, check=True)
+        else:
+            # Check remote
+            remote_result = subprocess.run(
+                ["git", "rev-parse", "--verify", f"origin/{branch_name}"],
+                cwd=str(worktree_dir), capture_output=True, text=True,
+            )
+            if remote_result.returncode == 0:
+                subprocess.run(["git", "checkout", "-b", branch_name, f"origin/{branch_name}"], cwd=str(worktree_dir), capture_output=True, text=True, check=True)
+            else:
+                subprocess.run(["git", "checkout", "-b", branch_name], cwd=str(worktree_dir), capture_output=True, text=True, check=True)
+
+        _log_activity("worktree", f"Worktree created for {ticket_id} in {project}", ticket=ticket_id, project=project)
+
+        return {"ticket_id": ticket_id, "project": project, "worktree_path": str(worktree_dir), "created": True, "branch": branch_name}
+
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Git operation failed: {e.stderr or e.stdout or str(e)}")
+
+
+@app.delete("/api/tickets/{ticket_id}/worktree")
+async def delete_worktree(ticket_id: str, project: str):
+    """Remove a worktree for a ticket."""
+    config = _load_config()
+    workspace_root = Path(
+        os.path.expanduser(config.get("workspace", {}).get("root_dir", "~/sentinel-workspaces"))
+    )
+    project_dir = workspace_root / project.lower()
+    worktree_dir = project_dir / ticket_id
+
+    if not worktree_dir.exists():
+        return {"ticket_id": ticket_id, "removed": False, "message": "Worktree not found"}
+
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", str(worktree_dir), "--force"],
+            cwd=str(project_dir), capture_output=True, text=True, check=False, timeout=15,
+        )
+        _log_activity("reset", f"Worktree removed for {ticket_id}", ticket=ticket_id, project=project)
+        return {"ticket_id": ticket_id, "removed": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/tickets/{ticket_id}/reset")
+async def reset_ticket(ticket_id: str, project: str):
+    """Reset a ticket: remove worktree and delete local branch."""
+    config = _load_config()
+    workspace_root = Path(
+        os.path.expanduser(config.get("workspace", {}).get("root_dir", "~/sentinel-workspaces"))
+    )
+    project_dir = workspace_root / project.lower()
+    worktree_dir = project_dir / ticket_id
+
+    results = {"worktree_removed": False, "branch_deleted": False}
+
+    # Remove worktree
+    if worktree_dir.exists():
+        try:
+            subprocess.run(
+                ["git", "worktree", "remove", str(worktree_dir), "--force"],
+                cwd=str(project_dir), capture_output=True, text=True, check=False, timeout=15,
+            )
+            results["worktree_removed"] = True
+        except Exception:
+            pass
+
+    # Delete branch
+    branch_name = f"sentinel/feature/{ticket_id}"
+    if project_dir.exists():
+        try:
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                cwd=str(project_dir), capture_output=True, text=True, check=True, timeout=10,
+            )
+            results["branch_deleted"] = True
+        except Exception:
+            pass
+
+    _log_activity("reset", f"Ticket {ticket_id} reset (worktree + branch)", ticket=ticket_id, project=project)
+    return {"ticket_id": ticket_id, **results}
 
 
 # Config ──────────────────────────────────────────────────────────────────────
