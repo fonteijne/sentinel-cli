@@ -191,9 +191,11 @@ async def _run_sentinel(args: list[str], timeout: int = 300) -> dict:
     # Log activity
     action = args[0] if args else "unknown"
     ticket_id = args[1] if len(args) > 1 else None
+    status_icon = "\u2713" if returncode == 0 else "\u2717"
+    args_str = " ".join(args)
     _log_activity(
         event_type=action,
-        text=f"{'\u2713' if returncode == 0 else '\u2717'} sentinel {' '.join(args)}",
+        text=f"{status_icon} sentinel {args_str}",
         ticket=ticket_id,
     )
     return {

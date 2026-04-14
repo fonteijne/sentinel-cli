@@ -17,7 +17,7 @@ RUN npm run build
 # ══════════════════════════════════════════════════════════════════
 # Stage 2: Python backend + pre-built frontend static files
 # ══════════════════════════════════════════════════════════════════
-FROM python:3.11-slim AS app
+FROM python:3.12-slim AS app
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
