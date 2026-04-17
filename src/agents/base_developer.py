@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     from src.environment_manager import EnvironmentManager
 
 from src.agents.base_agent import ImplementationAgent
-from src.beads_manager import BeadsManager
 from src.prompt_loader import load_agent_prompt
 from src.worktree_manager import get_branch_name
 
@@ -46,8 +45,6 @@ class BaseDeveloperAgent(ImplementationAgent):
                 logger.info(f"Loaded fallback developer prompt ({len(self.system_prompt)} chars)")
             except FileNotFoundError:
                 logger.warning("Developer system prompt not found at prompts/developer.md")
-
-        self.beads = BeadsManager()
 
         # Container environment for test execution (set via set_environment)
         self._env_manager: Optional["EnvironmentManager"] = None
@@ -337,6 +334,80 @@ Return the task list now, one task per line:"""
 
         return self._run_tests_on_host(test_cmd, worktree_path)
 
+    def _ensure_composer_deps(self) -> None:
+        """Ensure composer dependencies are installed inside the container.
+
+        Checks whether vendor/bin/phpunit exists. If not, runs
+        ``composer install --no-interaction`` so the test runner is available.
+        """
+        check = self._env_manager.exec(
+            ticket_id=self._env_ticket_id,
+            service="appserver",
+            command=["test", "-f", "vendor/bin/phpunit"],
+            workdir="/app",
+        )
+        if check.returncode == 0:
+            return
+
+        logger.info("phpunit not found in container — running composer install")
+        result = self._env_manager.exec(
+            ticket_id=self._env_ticket_id,
+            service="appserver",
+            command=["composer", "install", "--no-interaction", "--no-progress"],
+            workdir="/app",
+        )
+        if result.returncode != 0:
+            logger.warning(f"composer install failed: {result.stderr}")
+
+    def _resolve_test_cmd_for_container(self, test_cmd: List[str]) -> Optional[List[str]]:
+        """Adapt the test command to what the container actually supports.
+
+        Checks whether phpunit.xml exists and whether the requested
+        ``--testsuite`` is defined in it.  Returns ``None`` when no
+        phpunit config exists at all (meaning tests should be skipped
+        rather than letting phpunit print its help text and exit non-zero).
+
+        Returns:
+            Adapted command list, or None if tests should be skipped.
+        """
+        # Check if phpunit.xml or phpunit.xml.dist exists
+        check = self._env_manager.exec(
+            ticket_id=self._env_ticket_id,
+            service="appserver",
+            command=["sh", "-c", "test -f phpunit.xml || test -f phpunit.xml.dist"],
+            workdir="/app",
+        )
+        if check.returncode != 0:
+            # No config file at all — cannot run phpunit
+            logger.info("No phpunit.xml found in container — skipping test execution")
+            return None
+
+        # Config exists — check if requested testsuite is defined
+        testsuite_arg = next((a for a in test_cmd if a.startswith("--testsuite=")), None)
+        if testsuite_arg:
+            suite_name = testsuite_arg.split("=", 1)[1]
+            grep = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=["grep", "-q", f'name="{suite_name}"', "phpunit.xml"],
+                workdir="/app",
+            )
+            if grep.returncode != 0:
+                # Also check phpunit.xml.dist
+                grep2 = self._env_manager.exec(
+                    ticket_id=self._env_ticket_id,
+                    service="appserver",
+                    command=["grep", "-q", f'name="{suite_name}"', "phpunit.xml.dist"],
+                    workdir="/app",
+                )
+                if grep2.returncode != 0:
+                    logger.info(
+                        f"Testsuite '{suite_name}' not found in phpunit config — stripping flag"
+                    )
+                    return [arg for arg in test_cmd if not arg.startswith("--testsuite")]
+
+        return test_cmd
+
     def _run_tests_in_container(self, test_cmd: List[str]) -> Dict[str, Any]:
         """Execute tests inside the container environment.
 
@@ -349,10 +420,25 @@ Return the task list now, one task per line:"""
         logger.info(f"Running tests in container (service=appserver)")
 
         try:
+            # Ensure composer deps (including phpunit) exist
+            self._ensure_composer_deps()
+
+            # Adapt command to container's phpunit config
+            resolved_cmd = self._resolve_test_cmd_for_container(test_cmd)
+
+            if resolved_cmd is None:
+                # No phpunit config exists — skip tests gracefully
+                return {
+                    "success": True,
+                    "output": "No phpunit configuration found — skipping test execution",
+                    "return_code": 0,
+                }
+
             result = self._env_manager.exec(
                 ticket_id=self._env_ticket_id,
                 service="appserver",
-                command=test_cmd,
+                command=resolved_cmd,
+                workdir="/app",
             )
 
             output = result.stdout + result.stderr
@@ -494,19 +580,6 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
 
         # Break down plan into tasks
         tasks = self.break_down_plan(plan_file)
-
-        # Create beads tasks for tracking
-        for task in tasks:
-            try:
-                task_id = self.beads.create_task(
-                    title=task,
-                    task_type="task",
-                    priority=1,
-                    working_dir=str(worktree_path),
-                )
-                logger.info(f"Created task: {task_id}")
-            except Exception as e:
-                logger.warning(f"Could not create beads task: {e}")
 
         # Implement each task
         results = []

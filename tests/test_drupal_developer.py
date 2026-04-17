@@ -58,15 +58,6 @@ def mock_prompt():
         yield mock
 
 
-@pytest.fixture
-def mock_beads():
-    """Mock BeadsManager."""
-    with patch("src.agents.base_developer.BeadsManager") as mock:
-        manager = Mock()
-        manager.create_task.return_value = "task-123"
-        mock.return_value = manager
-        yield manager
-
 
 @pytest.fixture
 def temp_worktree():
@@ -101,7 +92,7 @@ Implement webform submission handler.
 class TestDrupalDeveloperAgent:
     """Test suite for DrupalDeveloperAgent class."""
 
-    def test_init(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_init(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test agent initialization."""
         agent = DrupalDeveloperAgent()
 
@@ -109,7 +100,7 @@ class TestDrupalDeveloperAgent:
         assert agent.model == "claude-4-5-sonnet"
         assert agent.temperature == 0.2
 
-    def test_init_loads_overlay(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_init_loads_overlay(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test that overlay is appended to system prompt."""
         agent = DrupalDeveloperAgent()
 
@@ -118,7 +109,7 @@ class TestDrupalDeveloperAgent:
         if overlay_path.exists():
             assert "Drupal Developer Overlay" in agent.system_prompt
 
-    def test_get_test_command(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_get_test_command(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test Drupal test command returns phpunit."""
         agent = DrupalDeveloperAgent()
         cmd = agent._get_test_command()
@@ -126,15 +117,14 @@ class TestDrupalDeveloperAgent:
         assert cmd == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
 
     def test_get_test_command_is_not_pytest(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads
-    ):
+        self, mock_config, mock_agent_sdk, mock_prompt    ):
         """Test Drupal test command does NOT return pytest."""
         agent = DrupalDeveloperAgent()
         cmd = agent._get_test_command()
 
         assert "pytest" not in cmd
 
-    def test_get_test_stub(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_get_test_stub(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test Drupal test stub is PHP, not Python."""
         agent = DrupalDeveloperAgent()
         stub = agent._get_test_stub()
@@ -147,7 +137,7 @@ class TestDrupalDeveloperAgent:
         assert "def test_" not in stub
 
     def test_build_tdd_prompt_references_phpunit(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test Drupal TDD prompt references PHPUnit and Drupal concepts."""
         agent = DrupalDeveloperAgent()
@@ -159,7 +149,7 @@ class TestDrupalDeveloperAgent:
         assert "TASK: Implement webform handler" in prompt
 
     def test_build_tdd_prompt_no_python_references(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test Drupal TDD prompt does NOT reference Python concepts."""
         agent = DrupalDeveloperAgent()
@@ -170,7 +160,7 @@ class TestDrupalDeveloperAgent:
         assert "type hints" not in prompt.lower() or "type hint" not in prompt.lower()
 
     def test_build_tdd_prompt_includes_di_guidance(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test Drupal TDD prompt includes dependency injection guidance."""
         agent = DrupalDeveloperAgent()
@@ -180,7 +170,7 @@ class TestDrupalDeveloperAgent:
         assert "\\Drupal::service()" in prompt
 
     def test_run_tests_uses_phpunit(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that run_tests calls phpunit, not pytest."""
         agent = DrupalDeveloperAgent()
@@ -200,7 +190,7 @@ class TestDrupalDeveloperAgent:
             assert call_args[1]["cwd"] == temp_worktree
 
     def test_run_tests_failure(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test running Drupal tests with failures."""
         agent = DrupalDeveloperAgent()
@@ -218,7 +208,7 @@ class TestDrupalDeveloperAgent:
             assert result["return_code"] == 1
 
     def test_write_tests_creates_php_file(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that write_tests creates a PHP test file."""
         agent = DrupalDeveloperAgent()
@@ -232,7 +222,7 @@ class TestDrupalDeveloperAgent:
         assert "import pytest" not in test_code
 
     def test_run_complete_workflow(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads,
+        self, mock_config, mock_agent_sdk, mock_prompt,
         sample_plan_file, temp_worktree
     ):
         """Test complete run workflow for Drupal."""
@@ -260,7 +250,7 @@ class TestDrupalDeveloperAgent:
             assert mock_implement.call_count == 3
 
     def test_implement_feature_with_command(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test implementing a feature loads TDD command and runs Agent SDK."""
         agent = DrupalDeveloperAgent()
@@ -289,8 +279,7 @@ class TestContainerAwareTests:
     """Test container-aware test execution for Drupal projects."""
 
     def test_set_environment_stores_values(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads
-    ):
+        self, mock_config, mock_agent_sdk, mock_prompt    ):
         """Test that set_environment stores env_manager and ticket_id."""
         agent = DrupalDeveloperAgent()
         mock_env_mgr = Mock()
@@ -301,11 +290,12 @@ class TestContainerAwareTests:
         assert agent._env_ticket_id == "TEST-123"
 
     def test_run_tests_uses_container_when_env_set(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that run_tests uses container exec when environment is attached."""
         agent = DrupalDeveloperAgent()
         mock_env_mgr = Mock()
+        # All exec calls succeed (phpunit exists, config exists, suite found, tests pass)
         mock_env_mgr.exec.return_value = Mock(
             success=True,
             stdout="OK (3 tests, 5 assertions)",
@@ -318,12 +308,20 @@ class TestContainerAwareTests:
         with patch("src.agents.base_developer.subprocess.run") as mock_subprocess:
             result = agent.run_tests(temp_worktree)
 
-            # Container exec should be called
-            mock_env_mgr.exec.assert_called_once_with(
-                ticket_id="TEST-123",
-                service="appserver",
-                command=["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"],
-            )
+            calls = mock_env_mgr.exec.call_args_list
+            # Calls: phpunit exists, phpunit.xml check, grep testsuite, actual test run
+            assert len(calls) >= 3
+
+            # First call: check if phpunit exists
+            assert calls[0].kwargs["command"] == ["test", "-f", "vendor/bin/phpunit"]
+            assert calls[0].kwargs["workdir"] == "/app"
+
+            # Second call: check if phpunit.xml exists
+            assert calls[1].kwargs["command"] == ["sh", "-c", "test -f phpunit.xml || test -f phpunit.xml.dist"]
+
+            # Last call: actual test execution (suite kept since config+suite exist)
+            assert calls[-1].kwargs["command"] == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+            assert calls[-1].kwargs["workdir"] == "/app"
 
             # Host subprocess should NOT be called
             mock_subprocess.assert_not_called()
@@ -332,7 +330,7 @@ class TestContainerAwareTests:
             assert result["return_code"] == 0
 
     def test_run_tests_falls_back_to_host_without_env(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that run_tests uses subprocess when no environment is attached."""
         agent = DrupalDeveloperAgent()
@@ -355,7 +353,7 @@ class TestContainerAwareTests:
             assert result["success"] is True
 
     def test_run_tests_container_failure_returns_gracefully(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that container exec failures are handled gracefully."""
         agent = DrupalDeveloperAgent()
@@ -371,17 +369,24 @@ class TestContainerAwareTests:
         assert "No active environment" in result["output"]
 
     def test_run_tests_container_test_failure(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that failing tests in container are reported correctly."""
         agent = DrupalDeveloperAgent()
         mock_env_mgr = Mock()
-        mock_env_mgr.exec.return_value = Mock(
-            success=False,
-            stdout="FAILURES!\nTests: 3, Assertions: 4, Failures: 1.",
-            stderr="",
-            returncode=1,
-        )
+        ok = Mock(success=True, stdout="", stderr="", returncode=0)
+        # Calls: phpunit exists, phpunit.xml check, grep testsuite, actual test run (fails)
+        mock_env_mgr.exec.side_effect = [
+            ok,  # phpunit exists
+            ok,  # phpunit.xml exists
+            ok,  # grep testsuite found
+            Mock(
+                success=False,
+                stdout="FAILURES!\nTests: 3, Assertions: 4, Failures: 1.",
+                stderr="",
+                returncode=1,
+            ),
+        ]
 
         agent.set_environment(mock_env_mgr, "TEST-123")
 
@@ -390,3 +395,60 @@ class TestContainerAwareTests:
         assert result["success"] is False
         assert result["return_code"] == 1
         assert "FAILURES!" in result["output"]
+
+    def test_run_tests_skips_when_no_config(
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
+    ):
+        """Test that tests are skipped gracefully when phpunit.xml is missing."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        ok = Mock(success=True, stdout="", stderr="", returncode=0)
+        fail = Mock(success=False, stdout="", stderr="", returncode=1)
+        # Calls: phpunit exists, phpunit.xml NOT found → skip
+        mock_env_mgr.exec.side_effect = [
+            ok,    # phpunit exists
+            fail,  # phpunit.xml does NOT exist
+        ]
+
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        result = agent.run_tests(temp_worktree)
+
+        # Should return success with skip message (no actual test run)
+        assert result["success"] is True
+        assert "skipping" in result["output"].lower()
+        assert result["return_code"] == 0
+        # Only 2 exec calls — no test execution attempted
+        assert mock_env_mgr.exec.call_count == 2
+
+    def test_run_tests_strips_testsuite_when_suite_undefined(
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
+    ):
+        """Test that --testsuite is stripped when suite name not in config."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        ok = Mock(success=True, stdout="", stderr="", returncode=0)
+        fail = Mock(success=False, stdout="", stderr="", returncode=1)
+        # Calls: phpunit exists, phpunit.xml exists, grep phpunit.xml fails,
+        #        grep phpunit.xml.dist fails, test run (without --testsuite)
+        mock_env_mgr.exec.side_effect = [
+            ok,    # phpunit exists
+            ok,    # phpunit.xml exists
+            fail,  # grep 'name="unit"' phpunit.xml — not found
+            fail,  # grep 'name="unit"' phpunit.xml.dist — not found
+            Mock(  # actual test run
+                success=True,
+                stdout="OK (3 tests, 5 assertions)",
+                stderr="",
+                returncode=0,
+            ),
+        ]
+
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        result = agent.run_tests(temp_worktree)
+
+        calls = mock_env_mgr.exec.call_args_list
+        # Last call should have --testsuite stripped
+        assert calls[-1].kwargs["command"] == ["vendor/bin/phpunit", "--no-coverage"]
+        assert result["success"] is True

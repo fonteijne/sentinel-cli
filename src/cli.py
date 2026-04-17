@@ -15,7 +15,6 @@ from src.stack_profiler import StackProfiler
 from src.worktree_manager import WorktreeManager, get_branch_name
 from src.environment_manager import EnvironmentManager
 from src.jira_factory import get_jira_client
-from src.beads_manager import BeadsManager
 from src.session_tracker import SessionTracker
 from src.agents.functional_debrief import FunctionalDebriefAgent
 from src.agents.plan_generator import PlanGeneratorAgent
@@ -318,7 +317,6 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
 
         # Initialize managers
         worktree_mgr = WorktreeManager()
-        beads_mgr = BeadsManager()
 
         # Get worktree path
         worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
@@ -474,11 +472,6 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 sys.exit(1)
 
         try:
-            # Initialize beads for coordination
-            click.echo("\n2️⃣  Initializing task tracking...")
-            beads_mgr.init_project(ticket_id, str(worktree_path))
-            click.echo("   ✓ Beads initialized")
-
             # Find plan file
             plan_file = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
             if not plan_file.exists():
@@ -535,25 +528,7 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                     issues_count = len(sec_result.get("findings", []))
                     click.echo(f"      ⚠️  Found {issues_count} security issues")
 
-                    # Create beads tasks for security findings (for next iteration)
                     if iteration < max_iterations:
-                        click.echo("      📝 Creating fix tasks for security findings...")
-                        for finding in sec_result.get("findings", []):
-                            try:
-                                task_title = f"Fix {finding['severity'].upper()} - {finding['category']}: {finding['file']}:{finding['line']}"
-                                task_description = f"{finding['description']}\n\nRecommendation: {finding['recommendation']}"
-
-                                beads_mgr.create_task(
-                                    title=task_title[:100],  # Limit title length
-                                    task_type="bug",
-                                    priority=0 if finding['severity'] == 'critical' else 1,  # P0 for critical, P1 for high
-                                    description=task_description,
-                                    working_dir=str(worktree_path),
-                                )
-                            except Exception as e:
-                                logger.warning(f"Could not create beads task for finding: {e}")
-
-                        click.echo(f"      ✓ Created {issues_count} fix tasks")
                         click.echo("      ↻  Developer will address feedback...")
                     else:
                         click.echo("\n❌ Max iterations reached without approval", err=True)
@@ -929,7 +904,6 @@ def status(project: Optional[str] = None) -> None:
             projects = list(projects_config.keys())
 
         worktree_mgr = WorktreeManager()
-        beads_mgr = BeadsManager()
 
         for proj in projects:
             click.echo(f"\n🏗️  Project: {proj}")
@@ -944,16 +918,6 @@ def status(project: Optional[str] = None) -> None:
                     click.echo(f"     ... and {len(worktrees) - 5} more")
             else:
                 click.echo("   No active worktrees")
-
-        # Show beads stats
-        try:
-            stats = beads_mgr.get_stats()
-            click.echo("\n📋 Task Tracking:")
-            click.echo(f"   Open: {stats.get('open', 0)}")
-            click.echo(f"   Ready: {stats.get('ready', 0)}")
-            click.echo(f"   Closed: {stats.get('closed', 0)}")
-        except Exception:
-            click.echo("\n📋 Task Tracking: Not initialized")
 
     except Exception as e:
         logger.error(f"Status command failed: {e}", exc_info=True)
@@ -1111,7 +1075,7 @@ def validate() -> None:
         gitlab_failed = False
         llm_failed = False
         llm_mode = "unknown"  # Track LLM mode for fix instructions
-        beads_failed = False
+        beads_disabled = True  # Beads disabled — re-enable when Dolt stability improves
 
         # Test Jira
         click.echo("1️⃣  Testing Jira API...")
@@ -1370,27 +1334,8 @@ def validate() -> None:
             all_valid = False
             ssh_failed = True
 
-        # Test Beads
-        click.echo("\n5️⃣  Testing Beads CLI...")
-        import subprocess as sp
-        try:
-            beads_mgr = BeadsManager()
-            # BeadsManager.__init__ verifies bd --version works
-            click.echo("   ✅ Beads CLI installed")
-            try:
-                stats = beads_mgr.get_stats()
-                click.echo(f"      Total issues: {stats.get('total', 0)}")
-            except sp.CalledProcessError:
-                # No database initialized yet - that's OK for validation
-                click.echo("      ℹ️  No beads database (run 'bd init' in a project)")
-        except RuntimeError as e:
-            click.echo(f"   ❌ {e}")
-            all_valid = False
-            beads_failed = True
-        except Exception as e:
-            click.echo(f"   ❌ Beads CLI error: {e}")
-            all_valid = False
-            beads_failed = True
+        # Beads (disabled)
+        click.echo("\n5️⃣  Beads CLI: disabled (Dolt server stability issues)")
 
         # Summary
         click.echo("\n" + "=" * 50)
@@ -1429,10 +1374,7 @@ def validate() -> None:
                 click.echo(f"{step}. Mount SSH keys: add '~/.ssh:/root/.ssh:ro' to docker-compose volumes")
                 step += 1
 
-            # Beads instructions
-            if beads_failed:
-                click.echo(f"{step}. Install beads CLI: npm install -g @beads/bd")
-                step += 1
+            # Beads currently disabled
 
             # Generic hint if .env doesn't exist
             if jira_failed or gitlab_failed or (llm_failed and llm_mode != "subscription"):
