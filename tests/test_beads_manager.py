@@ -55,15 +55,19 @@ class TestInitProject:
     def test_init_project_already_initialized(self, mock_run, beads_manager):
         """Test when beads is already initialized."""
         # Mock bd stats returning success (already initialized)
-        mock_run.return_value = Mock(returncode=0)
+        # and bd dolt status returning server running
+        mock_run.side_effect = [
+            Mock(returncode=0, stdout="", stderr=""),  # bd stats
+            Mock(returncode=0, stdout="Dolt server running", stderr=""),  # bd dolt status
+        ]
 
         beads_manager.init_project("ACME-123", "/tmp/test")
 
-        # Should only call bd stats once
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        assert args[0] == "bd"
-        assert args[1] == "stats"
+        # Should call bd stats + bd dolt status
+        assert mock_run.call_count == 2
+        first_args = mock_run.call_args_list[0][0][0]
+        assert first_args[0] == "bd"
+        assert first_args[1] == "stats"
 
     @patch("subprocess.run")
     def test_init_project_new_initialization(self, mock_run, beads_manager):
@@ -82,12 +86,16 @@ class TestInitProject:
     @patch("subprocess.run")
     def test_init_project_with_working_dir(self, mock_run, beads_manager):
         """Test that working directory is passed correctly."""
-        mock_run.return_value = Mock(returncode=0)
+        mock_run.side_effect = [
+            Mock(returncode=0, stdout="", stderr=""),  # bd stats
+            Mock(returncode=0, stdout="Dolt server running", stderr=""),  # bd dolt status
+        ]
 
         beads_manager.init_project("ACME-123", "/custom/path")
 
-        call_args = mock_run.call_args
-        assert call_args.kwargs["cwd"] == "/custom/path"
+        # Both calls should use the working dir
+        for call in mock_run.call_args_list:
+            assert call.kwargs["cwd"] == "/custom/path"
 
 
 class TestCreateTask:

@@ -1,7 +1,14 @@
 """Beads CLI wrapper for task coordination."""
 
+import logging
 import subprocess
+import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Timeout for bd commands that talk to the Dolt server (seconds)
+_BD_TIMEOUT = 60
 
 
 class BeadsManager:
@@ -19,6 +26,70 @@ class BeadsManager:
         except (subprocess.CalledProcessError, FileNotFoundError):
             raise RuntimeError("beads CLI (bd) not found. Install with: npm install -g @beads/bd")
 
+    def _ensure_dolt_server(self, working_dir: Optional[str] = None) -> None:
+        """Ensure Dolt SQL server is running before beads operations.
+
+        Checks server status via `bd dolt status`. If not running,
+        starts it with `bd dolt start` and waits for readiness.
+
+        Args:
+            working_dir: Working directory (optional)
+        """
+        # Quick check: is server already running?
+        try:
+            status = subprocess.run(
+                ["bd", "dolt", "status"],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if status.returncode == 0 and "running" in status.stdout.lower():
+                return
+        except subprocess.TimeoutExpired:
+            logger.warning("bd dolt status timed out")
+        except subprocess.CalledProcessError:
+            pass
+
+        # Start the server
+        logger.info("Starting Dolt SQL server for beads...")
+        try:
+            start_result = subprocess.run(
+                ["bd", "dolt", "start"],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if start_result.returncode != 0:
+                logger.warning(
+                    f"bd dolt start returned {start_result.returncode}: "
+                    f"{start_result.stderr or start_result.stdout}"
+                )
+                return
+        except subprocess.TimeoutExpired:
+            logger.warning("bd dolt start timed out after 30s")
+            return
+
+        # Wait for server to be ready (up to 10s)
+        for _ in range(10):
+            time.sleep(1)
+            try:
+                check = subprocess.run(
+                    ["bd", "dolt", "test"],
+                    cwd=working_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if check.returncode == 0:
+                    logger.info("Dolt SQL server is ready")
+                    return
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+                continue
+
+        logger.warning("Dolt server started but not confirmed ready after 10s")
+
     def init_project(self, ticket_id: str, working_dir: Optional[str] = None) -> None:
         """Initialize beads project for a ticket (if not already initialized).
 
@@ -32,18 +103,21 @@ class BeadsManager:
         """
         from pathlib import Path
 
-        # Check if beads is already initialized
-        check_cmd = ["bd", "stats"]
-        result = subprocess.run(
-            check_cmd,
-            cwd=working_dir,
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode == 0:
-            # Already initialized
-            return
+        # Check if beads is already initialized (with timeout to avoid hang)
+        try:
+            result = subprocess.run(
+                ["bd", "stats"],
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                timeout=_BD_TIMEOUT,
+            )
+            if result.returncode == 0:
+                # Already initialized — ensure server is running for future ops
+                self._ensure_dolt_server(working_dir)
+                return
+        except subprocess.TimeoutExpired:
+            logger.warning("bd stats timed out — beads may not be initialized yet")
 
         # Determine the correct directory to initialize beads
         # If this is a git worktree, we need to initialize in the bare repo
@@ -61,12 +135,20 @@ class BeadsManager:
                 init_dir = str(bare_repo)
 
         # Initialize new beads project in the correct directory
-        subprocess.run(
-            ["bd", "init"],
-            cwd=init_dir,
-            capture_output=True,
-            check=True,
-        )
+        # bd init auto-starts the Dolt server, but use a timeout in case it hangs
+        try:
+            subprocess.run(
+                ["bd", "init"],
+                cwd=init_dir,
+                capture_output=True,
+                check=True,
+                timeout=_BD_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"bd init timed out after {_BD_TIMEOUT}s. "
+                "Ensure Dolt is installed and working: dolt version"
+            )
 
     def create_task(
         self,
@@ -107,6 +189,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
         # Extract task ID from output
@@ -157,6 +240,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
     def close_task(
@@ -186,6 +270,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
     def get_task(self, task_id: str, working_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -207,6 +292,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
         # Parse the output (simple text-based parsing)
@@ -271,6 +357,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
         # Parse output into list of tasks
@@ -308,6 +395,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
         # Parse ready tasks from output
@@ -340,6 +428,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
     def get_stats(self, working_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -360,6 +449,7 @@ class BeadsManager:
             capture_output=True,
             text=True,
             check=True,
+            timeout=_BD_TIMEOUT,
         )
 
         # Simple stats parsing
