@@ -3,6 +3,7 @@
 import logging
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -51,25 +52,26 @@ class BeadsManager:
         except subprocess.CalledProcessError:
             pass
 
-        # Start the server
+        # Start the server using Popen to avoid blocking on inherited pipes.
+        # bd dolt start spawns a dolt sql-server child process; with
+        # capture_output=True the child inherits our pipes, so
+        # subprocess.run() blocks until the server exits (never).
         logger.info("Starting Dolt SQL server for beads...")
         try:
-            start_result = subprocess.run(
+            proc = subprocess.Popen(
                 ["bd", "dolt", "start"],
                 cwd=working_dir,
-                capture_output=True,
-                text=True,
-                timeout=30,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
-            if start_result.returncode != 0:
-                logger.warning(
-                    f"bd dolt start returned {start_result.returncode}: "
-                    f"{start_result.stderr or start_result.stdout}"
-                )
+            proc.wait(timeout=30)
+            if proc.returncode != 0:
+                logger.warning(f"bd dolt start returned {proc.returncode}")
                 return
         except subprocess.TimeoutExpired:
-            logger.warning("bd dolt start timed out after 30s")
-            return
+            # Server process still running is expected — it's a daemon.
+            logger.debug("bd dolt start still running (expected for daemon)")
 
         # Wait for server to be ready (up to 10s)
         for _ in range(10):
@@ -101,8 +103,6 @@ class BeadsManager:
             If beads is already initialized in the directory, this is a no-op.
             For git worktrees, beads must be initialized in the bare repository.
         """
-        from pathlib import Path
-
         # Check if beads is already initialized (with timeout to avoid hang)
         try:
             result = subprocess.run(
@@ -134,21 +134,39 @@ class BeadsManager:
                 bare_repo = work_path.parent
                 init_dir = str(bare_repo)
 
-        # Initialize new beads project in the correct directory
-        # bd init auto-starts the Dolt server, but use a timeout in case it hangs
+        # Initialize new beads project.
+        # bd init auto-starts a Dolt SQL server as a child process. That child
+        # inherits our stdout/stderr pipes, so subprocess.run(capture_output=True)
+        # blocks until the server exits (never). Fix: use Popen with DEVNULL so
+        # there are no pipes to block on, and start_new_session so the server
+        # is in its own process group.
+        proc = subprocess.Popen(
+            ["bd", "init", "--skip-agents", "--skip-hooks"],
+            cwd=init_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         try:
-            subprocess.run(
-                ["bd", "init"],
-                cwd=init_dir,
-                capture_output=True,
-                check=True,
-                timeout=_BD_TIMEOUT,
-            )
+            proc.wait(timeout=_BD_TIMEOUT)
         except subprocess.TimeoutExpired:
+            # bd init may have finished its work while the Dolt server it
+            # spawned keeps running.  Check whether .beads/ was created.
+            beads_dir = Path(init_dir or ".") / ".beads"
+            if beads_dir.exists():
+                logger.info(
+                    "bd init timed out (Dolt server still starting) "
+                    "but .beads/ was created — treating as success"
+                )
+                return
+            proc.kill()
             raise RuntimeError(
-                f"bd init timed out after {_BD_TIMEOUT}s. "
+                f"bd init timed out after {_BD_TIMEOUT}s and .beads/ was not created. "
                 "Ensure Dolt is installed and working: dolt version"
             )
+
+        if proc.returncode != 0:
+            raise RuntimeError(f"bd init failed with exit code {proc.returncode}")
 
     def create_task(
         self,
