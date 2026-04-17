@@ -5,7 +5,10 @@ import logging
 import subprocess
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from src.environment_manager import EnvironmentManager
 
 from src.agents.base_agent import ImplementationAgent
 from src.beads_manager import BeadsManager
@@ -45,6 +48,28 @@ class BaseDeveloperAgent(ImplementationAgent):
                 logger.warning("Developer system prompt not found at prompts/developer.md")
 
         self.beads = BeadsManager()
+
+        # Container environment for test execution (set via set_environment)
+        self._env_manager: Optional["EnvironmentManager"] = None
+        self._env_ticket_id: Optional[str] = None
+
+    def set_environment(
+        self,
+        env_manager: "EnvironmentManager",
+        ticket_id: str,
+    ) -> None:
+        """Attach a container environment for test execution.
+
+        When set, run_tests() will execute inside the container
+        instead of on the host via subprocess.
+
+        Args:
+            env_manager: Active EnvironmentManager instance
+            ticket_id: Ticket ID for this environment
+        """
+        self._env_manager = env_manager
+        self._env_ticket_id = ticket_id
+        logger.info(f"Container environment attached for {ticket_id}")
 
     # ------------------------------------------------------------------
     # Abstract methods — subclasses MUST implement
@@ -294,6 +319,9 @@ Return the task list now, one task per line:"""
     def run_tests(self, worktree_path: Path) -> Dict[str, Any]:
         """Run tests using the stack's test framework.
 
+        If a container environment is attached (via set_environment),
+        tests run inside the container. Otherwise, tests run on the host.
+
         Args:
             worktree_path: Path to git worktree
 
@@ -302,8 +330,61 @@ Return the task list now, one task per line:"""
         """
         logger.info(f"Running tests in {worktree_path}")
 
+        test_cmd = self._get_test_command()
+
+        if self._env_manager and self._env_ticket_id:
+            return self._run_tests_in_container(test_cmd)
+
+        return self._run_tests_on_host(test_cmd, worktree_path)
+
+    def _run_tests_in_container(self, test_cmd: List[str]) -> Dict[str, Any]:
+        """Execute tests inside the container environment.
+
+        Args:
+            test_cmd: Test command as list of strings
+
+        Returns:
+            Dictionary with success, output, return_code
+        """
+        logger.info(f"Running tests in container (service=appserver)")
+
         try:
-            test_cmd = self._get_test_command()
+            result = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=test_cmd,
+            )
+
+            output = result.stdout + result.stderr
+            success = result.returncode == 0
+
+            return {
+                "success": success,
+                "output": output,
+                "return_code": result.returncode,
+            }
+
+        except Exception as e:
+            logger.error(f"Error running tests in container: {e}")
+            return {
+                "success": False,
+                "output": str(e),
+                "return_code": -1,
+            }
+
+    def _run_tests_on_host(
+        self, test_cmd: List[str], worktree_path: Path
+    ) -> Dict[str, Any]:
+        """Execute tests on the host via subprocess.
+
+        Args:
+            test_cmd: Test command as list of strings
+            worktree_path: Path to git worktree
+
+        Returns:
+            Dictionary with success, output, return_code
+        """
+        try:
             result = subprocess.run(
                 test_cmd,
                 cwd=worktree_path,

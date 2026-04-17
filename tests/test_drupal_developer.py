@@ -283,3 +283,110 @@ class TestDrupalDeveloperAgent:
                 },
             )
             assert result["success"] is True
+
+
+class TestContainerAwareTests:
+    """Test container-aware test execution for Drupal projects."""
+
+    def test_set_environment_stores_values(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads
+    ):
+        """Test that set_environment stores env_manager and ticket_id."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        assert agent._env_manager is mock_env_mgr
+        assert agent._env_ticket_id == "TEST-123"
+
+    def test_run_tests_uses_container_when_env_set(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+    ):
+        """Test that run_tests uses container exec when environment is attached."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.return_value = Mock(
+            success=True,
+            stdout="OK (3 tests, 5 assertions)",
+            stderr="",
+            returncode=0,
+        )
+
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        with patch("src.agents.base_developer.subprocess.run") as mock_subprocess:
+            result = agent.run_tests(temp_worktree)
+
+            # Container exec should be called
+            mock_env_mgr.exec.assert_called_once_with(
+                ticket_id="TEST-123",
+                service="appserver",
+                command=["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"],
+            )
+
+            # Host subprocess should NOT be called
+            mock_subprocess.assert_not_called()
+
+            assert result["success"] is True
+            assert result["return_code"] == 0
+
+    def test_run_tests_falls_back_to_host_without_env(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+    ):
+        """Test that run_tests uses subprocess when no environment is attached."""
+        agent = DrupalDeveloperAgent()
+
+        with patch("src.agents.base_developer.subprocess.run") as mock_subprocess:
+            mock_subprocess.return_value = Mock(
+                returncode=0,
+                stdout="OK (3 tests, 5 assertions)",
+                stderr="",
+            )
+
+            result = agent.run_tests(temp_worktree)
+
+            # Host subprocess should be called
+            mock_subprocess.assert_called_once()
+            call_args = mock_subprocess.call_args
+            assert call_args[0][0] == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+            assert call_args[1]["cwd"] == temp_worktree
+
+            assert result["success"] is True
+
+    def test_run_tests_container_failure_returns_gracefully(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+    ):
+        """Test that container exec failures are handled gracefully."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.side_effect = RuntimeError("No active environment for TEST-123")
+
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        result = agent.run_tests(temp_worktree)
+
+        assert result["success"] is False
+        assert result["return_code"] == -1
+        assert "No active environment" in result["output"]
+
+    def test_run_tests_container_test_failure(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+    ):
+        """Test that failing tests in container are reported correctly."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.return_value = Mock(
+            success=False,
+            stdout="FAILURES!\nTests: 3, Assertions: 4, Failures: 1.",
+            stderr="",
+            returncode=1,
+        )
+
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        result = agent.run_tests(temp_worktree)
+
+        assert result["success"] is False
+        assert result["return_code"] == 1
+        assert "FAILURES!" in result["output"]

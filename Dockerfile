@@ -58,6 +58,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
 # Install Poetry
 RUN curl -sSL https://install.python-poetry.org | python3 -
 
+# Install Dolt (database backend required by Beads)
+RUN curl -L https://github.com/dolthub/dolt/releases/latest/download/install.sh | bash
+
 # Install Claude Code and Beads globally via npm (slow - ~13 min)
 RUN npm install -g @anthropic-ai/claude-code @beads/bd
 

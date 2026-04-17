@@ -175,7 +175,7 @@ class TestCreateWorktree:
     def test_create_worktree_existing_valid(
         self, mock_run, worktree_manager, temp_workspace
     ):
-        """Test with existing valid worktree."""
+        """Test with existing valid worktree syncs with remote."""
         bare_dir = temp_workspace / "acme"
         bare_dir.mkdir(parents=True)
         worktree_dir = bare_dir / "ACME-123"
@@ -184,14 +184,18 @@ class TestCreateWorktree:
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git status to succeed
-            mock_run.return_value = Mock(returncode=0)
+            mock_run.side_effect = [
+                Mock(returncode=0),  # git status
+                Mock(returncode=0, stdout="sentinel/feature/ACME-123\n"),  # git rev-parse --abbrev-ref HEAD
+                Mock(returncode=0),  # git rev-parse --verify origin/... (remote exists)
+                Mock(returncode=0),  # git merge --ff-only
+            ]
 
             result = worktree_manager.create_worktree("ACME-123", "ACME")
 
             assert result == worktree_dir
-            # Should only call git status
-            mock_run.assert_called_once()
+            # Should call: git status, rev-parse HEAD, rev-parse remote, merge --ff-only
+            assert mock_run.call_count == 4
 
     @patch("subprocess.run")
     @patch("shutil.rmtree")
@@ -261,20 +265,19 @@ class TestCreateWorktree:
     def test_create_worktree_existing_branch(
         self, mock_run, worktree_manager, temp_workspace
     ):
-        """Test worktree creation with existing feature branch."""
+        """Test worktree creation with existing feature branch syncs with remote."""
         bare_dir = temp_workspace / "acme"
         bare_dir.mkdir(parents=True)
 
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git worktree add to succeed
-            # Mock git rev-parse to succeed (branch exists)
-            # Mock git checkout to succeed
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
-                Mock(returncode=0),  # git rev-parse --verify (branch exists)
+                Mock(returncode=0),  # git rev-parse --verify (branch exists locally)
                 Mock(returncode=0),  # git checkout
+                Mock(returncode=0),  # git rev-parse --verify origin/... (remote exists)
+                Mock(returncode=0),  # git merge --ff-only
             ]
 
             worktree_manager.create_worktree("ACME-123", "ACME")
@@ -285,6 +288,12 @@ class TestCreateWorktree:
             assert "checkout" in checkout_call
             assert "sentinel/feature/ACME-123" in checkout_call
             assert "-b" not in checkout_call
+
+            # Verify merge --ff-only was called to sync with remote
+            merge_call = mock_run.call_args_list[4][0][0]
+            assert "merge" in merge_call
+            assert "--ff-only" in merge_call
+            assert "origin/sentinel/feature/ACME-123" in merge_call
 
     @patch("subprocess.run")
     def test_create_worktree_remote_branch(
@@ -344,6 +353,54 @@ class TestCreateWorktree:
             assert "checkout" in checkout_call
             assert "-b" in checkout_call
             assert "sentinel/feature/ACME-123" in checkout_call
+
+    @patch("subprocess.run")
+    def test_create_worktree_existing_valid_no_remote(
+        self, mock_run, worktree_manager, temp_workspace
+    ):
+        """Test existing worktree skips sync when no remote branch exists."""
+        bare_dir = temp_workspace / "acme"
+        bare_dir.mkdir(parents=True)
+        worktree_dir = bare_dir / "ACME-123"
+        worktree_dir.mkdir(parents=True)
+
+        with patch.object(
+            worktree_manager, "ensure_bare_clone", return_value=bare_dir
+        ):
+            mock_run.side_effect = [
+                Mock(returncode=0),  # git status
+                Mock(returncode=0, stdout="sentinel/feature/ACME-123\n"),  # git rev-parse --abbrev-ref HEAD
+                Mock(returncode=1),  # git rev-parse --verify origin/... (no remote)
+            ]
+
+            result = worktree_manager.create_worktree("ACME-123", "ACME")
+
+            assert result == worktree_dir
+            # No merge call — only status, rev-parse HEAD, rev-parse remote
+            assert mock_run.call_count == 3
+
+    @patch("subprocess.run")
+    def test_create_worktree_existing_branch_no_remote(
+        self, mock_run, worktree_manager, temp_workspace
+    ):
+        """Test existing local branch skips sync when no remote branch exists."""
+        bare_dir = temp_workspace / "acme"
+        bare_dir.mkdir(parents=True)
+
+        with patch.object(
+            worktree_manager, "ensure_bare_clone", return_value=bare_dir
+        ):
+            mock_run.side_effect = [
+                Mock(returncode=0),  # git worktree add
+                Mock(returncode=0),  # git rev-parse --verify (branch exists locally)
+                Mock(returncode=0),  # git checkout
+                Mock(returncode=1),  # git rev-parse --verify origin/... (no remote)
+            ]
+
+            worktree_manager.create_worktree("ACME-123", "ACME")
+
+            # No merge call — only worktree add, rev-parse local, checkout, rev-parse remote
+            assert mock_run.call_count == 4
 
 
 class TestCleanupWorktree:

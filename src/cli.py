@@ -344,83 +344,105 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             else:
                 developer = PythonDeveloperAgent()
 
-            result = developer.run_revision(ticket_id=ticket_id, worktree_path=worktree_path)
+            # Set up container environment for test execution
+            env_mgr = EnvironmentManager()
+            env_info = None
+            if not no_env:
+                try:
+                    env_info = env_mgr.setup(worktree_path, ticket_id)
+                    if env_info and env_info.active:
+                        developer.set_environment(env_mgr, ticket_id)
+                        click.echo(f"   ✓ Container environment started: {', '.join(env_info.services)}")
+                except RuntimeError as e:
+                    logger.warning(f"Container setup failed during revision: {e}")
+                    click.echo(f"   ⚠️  Container setup failed: {e} (tests will run on host)")
 
-            if result.get("feedback_count", 0) == 0:
-                click.echo("   ℹ No unresolved discussions found")
-                click.echo(f"\n✅ Nothing to revise for {ticket_id}")
-                return
-
-            click.echo(f"   ✓ Found {result['feedback_count']} unresolved discussion(s)")
-
-            click.echo("\n2️⃣  Implementing fixes based on feedback...")
-            click.echo(f"   ✓ {result.get('tasks_completed', 0)} task(s) completed")
-            if result.get("tasks_failed", 0) > 0:
-                click.echo(f"   ⚠ {result['tasks_failed']} task(s) failed")
-
-            click.echo("\n3️⃣  Updating MR...")
-            if result.get("changes_committed"):
-                click.echo("   ✓ Revised implementation committed")
-            else:
-                click.echo("   ℹ No code changes made")
-
-            responses_posted = result.get("responses_posted", 0)
-            click.echo(f"   ✓ Posted {responses_posted} response(s) to discussions")
-
-            test_results = result.get("test_results", {})
-            if test_results.get("success"):
-                click.echo("   ✓ All tests passing")
-            else:
-                click.echo("   ⚠️  Some tests failing - review needed")
-
-            # Push changes to remote
-            click.echo("\n4️⃣  Pushing changes to remote...")
             try:
-                import subprocess
+                result = developer.run_revision(ticket_id=ticket_id, worktree_path=worktree_path)
 
-                # Get current branch name
-                branch_result = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                branch_name = branch_result.stdout.strip()
+                if result.get("feedback_count", 0) == 0:
+                    click.echo("   ℹ No unresolved discussions found")
+                    click.echo(f"\n✅ Nothing to revise for {ticket_id}")
+                    return
 
-                # Build push command
-                push_cmd = ["git", "push", "-u", "origin", branch_name]
-                if force:
-                    push_cmd.insert(2, "--force")
-                    click.echo("   ⚠️  Force-pushing (may overwrite remote commits)")
+                click.echo(f"   ✓ Found {result['feedback_count']} unresolved discussion(s)")
 
-                # Attempt push
-                push_result = subprocess.run(
-                    push_cmd,
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
-                )
+                click.echo("\n2️⃣  Implementing fixes based on feedback...")
+                click.echo(f"   ✓ {result.get('tasks_completed', 0)} task(s) completed")
+                if result.get("tasks_failed", 0) > 0:
+                    click.echo(f"   ⚠ {result['tasks_failed']} task(s) failed")
 
-                if push_result.returncode == 0:
-                    click.echo(f"   ✓ Pushed to origin/{branch_name}")
+                click.echo("\n3️⃣  Updating MR...")
+                if result.get("changes_committed"):
+                    click.echo("   ✓ Revised implementation committed")
                 else:
-                    error_output = push_result.stderr
-                    if "non-fast-forward" in error_output or "rejected" in error_output:
-                        click.echo("   ⚠️  Push rejected: remote branch has diverged")
-                        click.echo("   💡 Use --force flag to force-push and overwrite remote")
-                        click.echo(f"      Example: sentinel execute {ticket_id} --revise --force")
+                    click.echo("   ℹ No code changes made")
+
+                responses_posted = result.get("responses_posted", 0)
+                click.echo(f"   ✓ Posted {responses_posted} response(s) to discussions")
+
+                test_results = result.get("test_results", {})
+                if test_results.get("success"):
+                    click.echo("   ✓ All tests passing")
+                else:
+                    click.echo("   ⚠️  Some tests failing - review needed")
+
+                # Push changes to remote
+                click.echo("\n4️⃣  Pushing changes to remote...")
+                try:
+                    import subprocess
+
+                    # Get current branch name
+                    branch_result = subprocess.run(
+                        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                        cwd=worktree_path,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    branch_name = branch_result.stdout.strip()
+
+                    # Build push command
+                    push_cmd = ["git", "push", "-u", "origin", branch_name]
+                    if force:
+                        push_cmd.insert(2, "--force")
+                        click.echo("   ⚠️  Force-pushing (may overwrite remote commits)")
+
+                    # Attempt push
+                    push_result = subprocess.run(
+                        push_cmd,
+                        cwd=worktree_path,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    if push_result.returncode == 0:
+                        click.echo(f"   ✓ Pushed to origin/{branch_name}")
                     else:
-                        click.echo(f"   ⚠️  Push failed: {error_output}")
+                        error_output = push_result.stderr
+                        if "non-fast-forward" in error_output or "rejected" in error_output:
+                            click.echo("   ⚠️  Push rejected: remote branch has diverged")
+                            click.echo("   💡 Use --force flag to force-push and overwrite remote")
+                            click.echo(f"      Example: sentinel execute {ticket_id} --revise --force")
+                        else:
+                            click.echo(f"   ⚠️  Push failed: {error_output}")
 
-            except Exception as e:
-                logger.warning(f"Failed to push changes: {e}")
-                click.echo(f"   ⚠️  Push failed: {e}")
-                click.echo("   💡 You may need to push manually from the worktree")
+                except Exception as e:
+                    logger.warning(f"Failed to push changes: {e}")
+                    click.echo(f"   ⚠️  Push failed: {e}")
+                    click.echo("   💡 You may need to push manually from the worktree")
 
-            click.echo(f"\n✅ Implementation revision complete for {ticket_id}")
-            click.echo(f"   MR: {result['mr_url']}")
-            click.echo("   Next: Review the updated implementation and address any remaining feedback")
+                click.echo(f"\n✅ Implementation revision complete for {ticket_id}")
+                click.echo(f"   MR: {result['mr_url']}")
+                click.echo("   Next: Review the updated implementation and address any remaining feedback")
+
+            finally:
+                # Teardown container environment
+                if env_info and env_info.active:
+                    try:
+                        env_mgr.teardown(ticket_id)
+                    except Exception as e:
+                        logger.warning(f"Container teardown failed: {e}")
 
             return
 
@@ -479,6 +501,10 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 developer = PythonDeveloperAgent()
                 if stack_type:
                     click.echo(f"   Using Python developer agent (stack: {stack_type})")
+
+            # Wire container environment to developer agent for test execution
+            if env_info and env_info.active:
+                developer.set_environment(env_mgr, ticket_id)
 
             security = SecurityReviewerAgent()
 
