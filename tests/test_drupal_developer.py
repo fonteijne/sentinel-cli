@@ -452,3 +452,62 @@ class TestContainerAwareTests:
         # Last call should have --testsuite stripped
         assert calls[-1].kwargs["command"] == ["vendor/bin/phpunit", "--no-coverage"]
         assert result["success"] is True
+
+
+class TestDrupalFilterOutputFiles:
+    """Test per-stack allowlist filtering for Drupal projects."""
+
+    def test_keeps_drupal_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that valid Drupal/PHP files are kept."""
+        agent = DrupalDeveloperAgent()
+        files = [
+            "/app/web/modules/custom/mymod/mymod.module",
+            "/app/web/modules/custom/mymod/src/Service/Handler.php",
+            "/app/web/modules/custom/mymod/mymod.services.yml",
+            "/app/web/modules/custom/mymod/templates/block.html.twig",
+            "/app/web/modules/custom/mymod/mymod.install",
+            "/app/web/themes/custom/mytheme/mytheme.theme",
+            "/app/web/modules/custom/mymod/js/script.js",
+            "/app/web/modules/custom/mymod/css/style.css",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == files
+
+    def test_rejects_python_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that .py files are rejected in a Drupal project."""
+        agent = DrupalDeveloperAgent()
+        files = [
+            "/app/web/modules/custom/mymod/src/Service/Handler.php",
+            "/app/validate_pricing_block_library.py",
+            "/app/test_runner.py",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/web/modules/custom/mymod/src/Service/Handler.php"]
+
+    def test_rejects_junk_and_python_combined(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Test mixed junk + cross-stack files are all filtered."""
+        agent = DrupalDeveloperAgent()
+        files = [
+            "/app/web/modules/custom/mymod/tests/src/Unit/HandlerTest.php",
+            "/app/PRICING_BLOCK_JAVASCRIPT_TDD_IMPLEMENTATION.md",
+            "/app/TDD_SUMMARY.txt",
+            "/app/validate_pricing_block_library.py",
+            "/app/web/modules/custom/mymod/mymod.module",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == [
+            "/app/web/modules/custom/mymod/tests/src/Unit/HandlerTest.php",
+            "/app/web/modules/custom/mymod/mymod.module",
+        ]
+
+    def test_rejects_markdown_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that .md files are still rejected by blocklist."""
+        agent = DrupalDeveloperAgent()
+        files = [
+            "/app/web/modules/custom/mymod/mymod.module",
+            "/app/TDD_DOCUMENTATION.md",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/web/modules/custom/mymod/mymod.module"]

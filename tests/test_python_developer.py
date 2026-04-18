@@ -676,3 +676,74 @@ This is the overview section.
         assert "PEP 8" in prompt
         assert "type hints" in prompt
         assert "TASK: Add login" in prompt
+
+
+class TestFilterOutputFiles:
+    """Test _filter_output_files junk and cross-stack filtering."""
+
+    def test_filters_markdown_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that .md files are filtered out."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/feature.py",
+            "/app/TDD_DOCUMENTATION_INDEX.md",
+            "/app/README.md",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/feature.py"]
+
+    def test_filters_txt_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that .txt files are filtered out."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/service.py",
+            "/app/TDD_EXECUTION_SUMMARY_FINAL.txt",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/service.py"]
+
+    def test_keeps_python_code_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that valid Python files are kept."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/feature.py",
+            "/app/tests/test_feature.py",
+            "/app/config.yaml",
+            "/app/setup.cfg",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == files
+
+    def test_python_agent_rejects_php_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that Python agent rejects PHP/Drupal files (cross-stack)."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/feature.py",
+            "/app/web/modules/custom/mymod/Handler.php",
+            "/app/web/modules/custom/mymod/mymod.module",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/feature.py"]
+
+    def test_filters_empty_strings(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that empty strings are filtered out."""
+        agent = PythonDeveloperAgent()
+        files = ["", "/app/src/feature.py", ""]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/feature.py"]
+
+    def test_empty_list(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test with empty file list."""
+        agent = PythonDeveloperAgent()
+        assert agent._filter_output_files([]) == []
+
+    def test_all_junk_returns_empty(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that all-junk input returns empty list."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/TDD_DOCUMENTATION_INDEX.md",
+            "/app/EXECUTION_LOG.txt",
+            "/app/SUMMARY.md",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == []

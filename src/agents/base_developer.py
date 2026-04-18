@@ -104,6 +104,70 @@ class BaseDeveloperAgent(ImplementationAgent):
         """
 
     # ------------------------------------------------------------------
+    # Output file validation
+    # ------------------------------------------------------------------
+
+    #: File extensions that are never valid implementation output.
+    _JUNK_EXTENSIONS: frozenset = frozenset({
+        ".md", ".txt", ".log", ".csv", ".json.bak",
+    })
+
+    #: Allowlist of valid output file extensions for this stack.
+    #: Subclasses MUST override this.  When set, only files whose extension
+    #: appears in the allowlist (or whose extension is empty, e.g. Makefiles)
+    #: are kept.  Files matching _JUNK_EXTENSIONS are always rejected first.
+    _VALID_EXTENSIONS: frozenset = frozenset()  # empty = no allowlist filtering
+
+    def _filter_output_files(self, files: List[str]) -> List[str]:
+        """Remove junk and off-stack files from LLM output.
+
+        Filtering is two-tiered:
+        1. Blocklist — extensions in ``_JUNK_EXTENSIONS`` are always rejected.
+        2. Allowlist — if ``_VALID_EXTENSIONS`` is non-empty, only files whose
+           extension appears in the set are kept.  This catches cross-stack
+           contamination (e.g. ``.py`` files in a Drupal project).
+
+        Args:
+            files: List of file paths produced by Write/Edit tool uses
+
+        Returns:
+            Filtered list with invalid files removed
+        """
+        valid = []
+        for f in files:
+            if not f:
+                continue
+            ext = Path(f).suffix.lower()
+            name = Path(f).name
+
+            # Tier 1: always-reject blocklist
+            if ext in self._JUNK_EXTENSIONS:
+                logger.warning("Filtering junk output file: %s", f)
+                continue
+
+            # Reject ALL_CAPS filenames like TDD_EXECUTION_SUMMARY_FINAL.txt
+            if name.replace("_", "").replace("-", "").replace(".", "").isupper() and ext in {".md", ".txt", ""}:
+                logger.warning("Filtering documentation-style output file: %s", f)
+                continue
+
+            # Tier 2: per-stack allowlist
+            if self._VALID_EXTENSIONS and ext and ext not in self._VALID_EXTENSIONS:
+                logger.warning(
+                    "Filtering off-stack file (ext=%s not in allowlist): %s",
+                    ext, f,
+                )
+                continue
+
+            valid.append(f)
+
+        if len(valid) < len(files):
+            logger.info(
+                "Filtered %d invalid files from %d total output files",
+                len(files) - len(valid), len(files),
+            )
+        return valid
+
+    # ------------------------------------------------------------------
     # Shared orchestration methods
     # ------------------------------------------------------------------
 
@@ -264,6 +328,10 @@ Return the task list now, one task per line:"""
                 elif tool_name == "Edit":
                     files_modified.append(tool_use.get("input", {}).get("file_path", ""))
 
+            # Filter out junk documentation files the LLM may have created
+            files_created = self._filter_output_files(files_created)
+            files_modified = self._filter_output_files(files_modified)
+
             test_results = self.run_tests(worktree_path)
 
             if not test_results.get("success"):
@@ -273,9 +341,14 @@ Return the task list now, one task per line:"""
                 )
 
             task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
+            test_output = test_results.get("output", "")
+            if "skipping" in test_output.lower():
+                test_status = "Tests skipped (no test config found)"
+            else:
+                test_status = "All tests passing"
             commit_message = (
                 f"{commit_prefix}: {task_summary}\n\n"
-                f"- Implemented using TDD approach\n- All tests passing"
+                f"- Implemented using TDD approach\n- {test_status}"
             )
 
             logger.info(f"Task implementation complete: {task}")

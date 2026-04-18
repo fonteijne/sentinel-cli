@@ -18,6 +18,22 @@ class DrupalDeveloperAgent(BaseDeveloperAgent):
     Loads Drupal-specific overlay for system prompt enrichment.
     """
 
+    _VALID_EXTENSIONS: frozenset = frozenset({
+        # PHP / Drupal
+        ".php", ".module", ".inc", ".install", ".theme", ".profile",
+        ".engine", ".test",
+        # Config / services
+        ".yml", ".yaml",
+        # Templates
+        ".twig", ".html.twig",
+        # Frontend assets
+        ".js", ".css", ".scss", ".less",
+        # Drupal libraries / info
+        ".info", ".libraries",
+        # Schema / SQL
+        ".sql",
+    })
+
     def __init__(self) -> None:
         """Initialize Drupal developer agent."""
         super().__init__(
