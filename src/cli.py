@@ -430,6 +430,21 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 else:
                     click.echo("   ⚠️  Some tests failing - review needed")
 
+                # Config validation result
+                config_result = result.get("config_validation", {})
+                if config_result.get("output") and config_result.get("success"):
+                    click.echo("   🔧 Config validation passed")
+                elif not config_result.get("success", True):
+                    click.echo("   🔧 Config validation FAILED (after fix attempts)")
+                    config_output = config_result.get("output", "")
+                    if config_output:
+                        click.echo(f"      {config_output[:500]}")
+                    click.echo(
+                        "\n❌ Config still broken after fix attempts — not pushing",
+                        err=True,
+                    )
+                    sys.exit(1)
+
                 # Push changes to remote
                 click.echo("\n4️⃣  Pushing changes to remote...")
                 try:
@@ -562,6 +577,24 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                     click.echo("   Check the developer agent logs above for failure details")
                     sys.exit(1)
 
+                # Config validation gate (e.g. Drupal config sync)
+                config_result = dev_result.get("config_validation", {})
+                if config_result.get("output") and config_result.get("success"):
+                    click.echo("   🔧 Config: Validation passed")
+                elif not config_result.get("success", True):
+                    click.echo("   🔧 Config: Validation FAILED")
+                    # Show first 500 chars of output for visibility
+                    config_output = config_result.get("output", "")
+                    if config_output:
+                        click.echo(f"      {config_output[:500]}")
+                    if iteration < max_iterations:
+                        click.echo("      ↻  Developer will address config issues...")
+                        continue
+                    else:
+                        click.echo("\n❌ Config validation failed after max iterations", err=True)
+                        click.echo("   Config dependencies are broken — manual fix required")
+                        sys.exit(1)
+
                 # Security reviews the implementation
                 click.echo("   🔒 Security: Reviewing code...")
                 sec_result = security.run(worktree_path=worktree_path, ticket_id=ticket_id)
@@ -612,6 +645,8 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 if push_result.returncode == 0:
                     click.echo(f"   ✓ Pushed to origin/{branch_name}")
 
+                    mr_web_url = None
+
                     # Mark MR as ready for review (remove draft status)
                     try:
                         from src.gitlab_client import GitLabClient
@@ -633,6 +668,7 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
 
                         if mrs:
                             mr_iid = mrs[0]["iid"]
+                            mr_web_url = mrs[0].get("web_url")
                             gitlab.mark_as_ready(project_id=project_path, mr_iid=mr_iid)
                             click.echo("   ✓ MR marked as ready for review")
                             
@@ -658,6 +694,23 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                     except Exception as e:
                         logger.warning(f"Failed to mark MR as ready: {e}")
                         # Non-fatal - just log and continue
+
+                    # Notify Jira that execution is complete
+                    try:
+                        jira_client = get_jira_client()
+                        comment = (
+                            f"Sentinel has completed execution for {ticket_id}. "
+                            "Code is ready for developer review."
+                        )
+                        jira_client.add_comment(
+                            ticket_id,
+                            comment,
+                            link_text="View Merge Request" if mr_web_url else None,
+                            link_url=mr_web_url,
+                        )
+                        click.echo("   ✓ Jira notification posted")
+                    except Exception as e:
+                        logger.warning(f"Failed to post Jira notification: {e}")
 
                 else:
                     error_output = push_result.stderr

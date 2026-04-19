@@ -198,15 +198,32 @@ class SecurityReviewerAgent(ReviewAgent):
             logger.warning(f"OWASP scan command not available, using fallback: {e}")
 
         # Targeted scans on changed files
-        findings.extend(self._scan_for_secrets(worktree_path, files))
-        findings.extend(self._scan_for_sql_injection(worktree_path, files))
-        findings.extend(self._scan_for_xss(worktree_path, files))
+        secrets_findings = self._scan_for_secrets(worktree_path, files)
+        logger.info(f"Secrets scan found {len(secrets_findings)} issues")
+        findings.extend(secrets_findings)
+
+        sqli_findings = self._scan_for_sql_injection(worktree_path, files)
+        logger.info(f"SQL injection scan found {len(sqli_findings)} issues")
+        findings.extend(sqli_findings)
+
+        xss_findings = self._scan_for_xss(worktree_path, files)
+        logger.info(f"XSS scan found {len(xss_findings)} issues")
+        findings.extend(xss_findings)
 
         # Deduplicate findings by file:line:category
         findings = self._deduplicate_findings(findings)
 
+        severity_counts = {}
+        for f in findings:
+            sev = f.get("severity", "unknown")
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+        severity_summary = ", ".join(
+            f"{count} {sev}" for sev, count in sorted(severity_counts.items())
+        )
+
         logger.info(
-            f"Security scan complete: {len(findings)} findings (after deduplication)"
+            f"Security scan complete: {len(findings)} findings "
+            f"(after deduplication) [{severity_summary}]"
         )
 
         return findings

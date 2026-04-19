@@ -104,6 +104,26 @@ class BaseDeveloperAgent(ImplementationAgent):
         """
 
     # ------------------------------------------------------------------
+    # Config validation
+    # ------------------------------------------------------------------
+
+    def validate_config(self, worktree_path: Path) -> Dict[str, Any]:
+        """Validate project configuration after implementation.
+
+        Override in stack-specific subclasses to add config validation
+        (e.g. Drupal config sync, Django migrations check).
+
+        Default is a no-op that returns success.
+
+        Args:
+            worktree_path: Path to git worktree
+
+        Returns:
+            Dictionary with success, output, return_code
+        """
+        return {"success": True, "output": "", "return_code": 0}
+
+    # ------------------------------------------------------------------
     # Output file validation
     # ------------------------------------------------------------------
 
@@ -408,21 +428,12 @@ Return the task list now, one task per line:"""
         return self._run_tests_on_host(test_cmd, worktree_path)
 
     def _ensure_composer_deps(self) -> None:
-        """Ensure composer dependencies are installed inside the container.
+        """Ensure composer dependencies and scaffold files are installed.
 
-        Checks whether vendor/bin/phpunit exists. If not, runs
-        ``composer install --no-interaction`` so the test runner is available.
+        Always runs ``composer install`` to guarantee all dependencies,
+        scaffold files (e.g. default.settings.php), and binaries are present.
         """
-        check = self._env_manager.exec(
-            ticket_id=self._env_ticket_id,
-            service="appserver",
-            command=["test", "-f", "vendor/bin/phpunit"],
-            workdir="/app",
-        )
-        if check.returncode == 0:
-            return
-
-        logger.info("phpunit not found in container — running composer install")
+        logger.info("Running composer install in container")
         result = self._env_manager.exec(
             ticket_id=self._env_ticket_id,
             service="appserver",
@@ -681,10 +692,57 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         # Run all tests
         test_results = self.run_tests(worktree_path)
 
+        # Validate project config (e.g. Drupal config sync)
+        config_validation = self.validate_config(worktree_path)
+
+        # If config validation failed due to actual config issues (not env),
+        # let the developer attempt to fix it
+        max_config_retries = 2
+        for config_attempt in range(max_config_retries):
+            if config_validation.get("success", True):
+                break
+            if config_validation.get("environment_issue"):
+                logger.warning("Config validation failed due to environment issue — skipping retry")
+                break
+
+            logger.warning(
+                "Config validation failed (attempt %d/%d) — asking developer to fix",
+                config_attempt + 1,
+                max_config_retries,
+            )
+
+            config_output = config_validation.get("output", "")[:2000]
+            fix_task = (
+                "Fix the config validation failure. The Drupal config sync "
+                "(drush site:install --config-dir=../config/sync) failed with:\n\n"
+                f"{config_output}\n\n"
+                "Analyze the error, create or fix the missing config files, "
+                "and ensure config dependencies are satisfied."
+            )
+
+            try:
+                fix_result = self.implement_feature(fix_task, {}, worktree_path)
+                if fix_result.get("success"):
+                    changed = (
+                        fix_result.get("files_created", [])
+                        + fix_result.get("files_modified", [])
+                    )
+                    if changed:
+                        self.commit_changes(
+                            message="fix: resolve config sync validation failure",
+                            files=changed,
+                            worktree_path=worktree_path,
+                        )
+            except Exception as e:
+                logger.error("Config fix attempt failed: %s", e)
+
+            config_validation = self.validate_config(worktree_path)
+
         return {
             "tasks_completed": sum(1 for r in results if r["success"]),
             "tasks_failed": sum(1 for r in results if not r["success"]),
             "test_results": test_results,
+            "config_validation": config_validation,
             "results": results,
         }
 
@@ -987,6 +1045,52 @@ Provide a clear, concise answer (2-3 sentences) explaining:
         # Run tests to verify fixes
         test_results = self.run_tests(worktree_path)
 
+        # Validate project config (e.g. Drupal config sync)
+        config_validation = self.validate_config(worktree_path)
+
+        # If config validation failed due to actual config issues (not env),
+        # let the developer attempt to fix it
+        max_config_retries = 2
+        for config_attempt in range(max_config_retries):
+            if config_validation.get("success", True):
+                break
+            if config_validation.get("environment_issue"):
+                logger.warning("Config validation failed due to environment issue — skipping retry")
+                break
+
+            logger.warning(
+                "Config validation failed (attempt %d/%d) — asking developer to fix",
+                config_attempt + 1,
+                max_config_retries,
+            )
+
+            config_output = config_validation.get("output", "")[:2000]
+            fix_task = (
+                "Fix the config validation failure. The Drupal config sync "
+                "(drush site:install --config-dir=../config/sync) failed with:\n\n"
+                f"{config_output}\n\n"
+                "Analyze the error, create or fix the missing config files, "
+                "and ensure config dependencies are satisfied."
+            )
+
+            try:
+                fix_result = self.implement_feature(fix_task, {}, worktree_path)
+                if fix_result.get("success"):
+                    changed = (
+                        fix_result.get("files_created", [])
+                        + fix_result.get("files_modified", [])
+                    )
+                    if changed:
+                        self.commit_changes(
+                            message="fix: resolve config sync validation failure",
+                            files=changed,
+                            worktree_path=worktree_path,
+                        )
+            except Exception as e:
+                logger.error("Config fix attempt failed: %s", e)
+
+            config_validation = self.validate_config(worktree_path)
+
         # Reply to ALL discussions
         responses_posted = 0
         for item in discussion_tasks:
@@ -1129,6 +1233,7 @@ A human will need to respond to this.
 **Questions:** {questions_answered}/{questions} answered ({questions_failed} failed)
 **Acknowledged:** {acknowledged}
 **Tests:** {'✅ All passing' if test_results.get('success') else '⚠️ Some failures - see output'}
+**Config:** {'✅ Valid' if config_validation.get('success') else '❌ Validation failed — config dependencies broken'}
 
 All discussions have been addressed.
 
@@ -1158,6 +1263,7 @@ All discussions have been addressed.
             "changes_committed": len(all_changed_files) > 0,
             "responses_posted": responses_posted,
             "test_results": test_results,
+            "config_validation": config_validation,
         }
 
     def _format_mr_feedback(self, feedback: list[Dict[str, Any]]) -> str:
