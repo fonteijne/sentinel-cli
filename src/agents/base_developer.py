@@ -289,6 +289,7 @@ Return the task list now, one task per line:"""
         context: Dict[str, Any],
         worktree_path: Path,
         commit_prefix: str = "feat",
+        user_prompt: str | None = None,
     ) -> Dict[str, Any]:
         """Implement a feature following TDD approach.
 
@@ -328,6 +329,7 @@ Return the task list now, one task per line:"""
 
         # Build stack-specific TDD prompt
         tdd_prompt = self._build_tdd_prompt(task, context, worktree_path)
+        tdd_prompt = self._append_operator_prompt(tdd_prompt, user_prompt)
 
         # Execute TDD workflow using Agent SDK
         try:
@@ -630,6 +632,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         self,
         plan_file: Path,
         worktree_path: Path,
+        user_prompt: str | None = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Run the complete implementation workflow.
@@ -670,7 +673,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         for task in tasks:
             try:
                 task_with_context = task + attachment_context if attachment_context else task
-                impl_result = self.implement_feature(task_with_context, {}, worktree_path)
+                impl_result = self.implement_feature(task_with_context, {}, worktree_path, user_prompt=user_prompt)
 
                 if impl_result.get("success"):
                     all_files = (
@@ -721,7 +724,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
             )
 
             try:
-                fix_result = self.implement_feature(fix_task, {}, worktree_path)
+                fix_result = self.implement_feature(fix_task, {}, worktree_path, user_prompt=user_prompt)
                 if fix_result.get("success"):
                     changed = (
                         fix_result.get("files_created", [])
@@ -750,6 +753,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         self,
         ticket_id: str,
         worktree_path: Path,
+        user_prompt: str | None = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Revise implementation based on MR feedback.
@@ -910,6 +914,7 @@ Classify into ONE of these categories:
                         context={},
                         worktree_path=worktree_path,
                         commit_prefix="fix",
+                        user_prompt=user_prompt,
                     )
 
                     if impl_result.get("success"):
@@ -1074,7 +1079,7 @@ Provide a clear, concise answer (2-3 sentences) explaining:
             )
 
             try:
-                fix_result = self.implement_feature(fix_task, {}, worktree_path)
+                fix_result = self.implement_feature(fix_task, {}, worktree_path, user_prompt=user_prompt)
                 if fix_result.get("success"):
                     changed = (
                         fix_result.get("files_created", [])
