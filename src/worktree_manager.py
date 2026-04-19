@@ -130,6 +130,21 @@ class WorktreeManager:
 
         return bare_clone_dir
 
+    def _sync_branch_with_remote(self, worktree_dir: Path, branch_name: str) -> None:
+        """Fast-forward local branch to match remote if remote is ahead."""
+        remote_ref = f"origin/{branch_name}"
+        ref_check = subprocess.run(
+            ["git", "rev-parse", "--verify", remote_ref],
+            cwd=worktree_dir,
+            capture_output=True,
+        )
+        if ref_check.returncode == 0:
+            subprocess.run(
+                ["git", "merge", "--ff-only", remote_ref],
+                cwd=worktree_dir,
+                capture_output=True,
+            )
+
     def create_worktree(self, ticket_id: str, project_key: str) -> Path:
         """Create a git worktree for a ticket.
 
@@ -164,6 +179,17 @@ class WorktreeManager:
                     capture_output=True,
                     check=True,
                 )
+                # Sync with remote in case remote is ahead (e.g. after setup reset)
+                branch_result = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=worktree_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                if branch_result.returncode == 0:
+                    self._sync_branch_with_remote(
+                        worktree_dir, branch_result.stdout.strip()
+                    )
                 return worktree_dir
             except subprocess.CalledProcessError:
                 # Invalid worktree, remove and recreate
@@ -188,12 +214,13 @@ class WorktreeManager:
         )
 
         if result.returncode == 0:
-            # Branch exists locally, just checkout to it
+            # Branch exists locally, checkout and sync with remote
             subprocess.run(
                 ["git", "checkout", branch_name],
                 cwd=worktree_dir,
                 check=True,
             )
+            self._sync_branch_with_remote(worktree_dir, branch_name)
         else:
             # Check if branch exists on remote (e.g. after a reset)
             remote_ref = f"origin/{branch_name}"

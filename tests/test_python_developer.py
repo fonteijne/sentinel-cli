@@ -58,15 +58,6 @@ def mock_prompt():
         yield mock
 
 
-@pytest.fixture
-def mock_beads():
-    """Mock BeadsManager."""
-    with patch("src.agents.base_developer.BeadsManager") as mock:
-        manager = Mock()
-        manager.create_task.return_value = "task-123"
-        mock.return_value = manager
-        yield manager
-
 
 @pytest.fixture
 def temp_worktree():
@@ -114,17 +105,17 @@ Some notes about testing.
 class TestPythonDeveloperAgent:
     """Test suite for PythonDeveloperAgent class."""
 
-    def test_init(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_init(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test agent initialization."""
         agent = PythonDeveloperAgent()
 
         assert agent.agent_name == "python_developer"
         assert agent.model == "claude-4-5-sonnet"
         assert agent.temperature == 0.2
-        assert agent.beads is not None
+        assert agent.system_prompt is not None
 
     def test_break_down_plan_basic(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file
+        self, mock_config, mock_agent_sdk, mock_prompt, sample_plan_file
     ):
         """Test breaking down a plan into tasks."""
         agent = PythonDeveloperAgent()
@@ -140,7 +131,7 @@ class TestPythonDeveloperAgent:
         assert "All tests passing" in tasks
 
     def test_break_down_plan_empty_file(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test breaking down an empty plan."""
         agent = PythonDeveloperAgent()
@@ -153,7 +144,7 @@ class TestPythonDeveloperAgent:
         assert tasks == []
 
     def test_break_down_plan_missing_file(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test breaking down a non-existent plan."""
         agent = PythonDeveloperAgent()
@@ -165,7 +156,7 @@ class TestPythonDeveloperAgent:
         assert tasks == []
 
     def test_break_down_plan_no_checkboxes(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test breaking down a plan with no checklist items."""
         agent = PythonDeveloperAgent()
@@ -178,7 +169,7 @@ class TestPythonDeveloperAgent:
         assert tasks == []
 
     def test_break_down_plan_mixed_content(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that plans without proper section headers return no tasks."""
         agent = PythonDeveloperAgent()
@@ -205,7 +196,7 @@ More text
         assert len(tasks) == 0
 
     def test_break_down_plan_extracts_only_implementation_section(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that only tasks from Implementation Steps section are extracted."""
         agent = PythonDeveloperAgent()
@@ -252,7 +243,7 @@ This is the overview section.
         assert "Run pytest" not in tasks
 
     def test_break_down_plan_implementation_steps_variant(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test extraction works with 'Implementation Steps' header variant."""
         agent = PythonDeveloperAgent()
@@ -281,7 +272,7 @@ This is the overview section.
         assert "Test 1" not in tasks
 
     def test_implement_feature_with_command(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test implementing a feature loads TDD command and runs Agent SDK."""
         agent = PythonDeveloperAgent()
@@ -306,7 +297,7 @@ This is the overview section.
             assert result["success"] is True
 
     def test_implement_feature_command_failure(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test implementing a feature when command fails."""
         agent = PythonDeveloperAgent()
@@ -324,7 +315,7 @@ This is the overview section.
             mock_execute.assert_called_once()
 
     def test_implement_feature_command_exception(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test implementing a feature when command raises exception."""
         agent = PythonDeveloperAgent()
@@ -337,7 +328,7 @@ This is the overview section.
                 agent.implement_feature("Add feature", {}, temp_worktree)
 
     def test_write_tests_creates_file(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test writing tests creates a file."""
         agent = PythonDeveloperAgent()
@@ -350,7 +341,7 @@ This is the overview section.
         assert "import pytest" in test_code
 
     def test_write_tests_creates_directory(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test writing tests creates parent directory."""
         agent = PythonDeveloperAgent()
@@ -363,7 +354,7 @@ This is the overview section.
         assert test_path.exists()
 
     def test_write_tests_content(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test generated test content structure."""
         agent = PythonDeveloperAgent()
@@ -377,7 +368,7 @@ This is the overview section.
         assert "def test_error_handling" in test_code
 
     def test_run_tests_success(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test running tests successfully."""
         agent = PythonDeveloperAgent()
@@ -401,7 +392,7 @@ This is the overview section.
             assert call_args[1]["cwd"] == temp_worktree
 
     def test_run_tests_failure(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test running tests with failures."""
         agent = PythonDeveloperAgent()
@@ -420,7 +411,7 @@ This is the overview section.
             assert "FAILED" in result["output"]
 
     def test_run_tests_timeout(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test running tests with timeout."""
         agent = PythonDeveloperAgent()
@@ -437,7 +428,7 @@ This is the overview section.
             assert result["return_code"] == -1
 
     def test_run_tests_exception(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test running tests with general exception."""
         agent = PythonDeveloperAgent()
@@ -452,7 +443,7 @@ This is the overview section.
             assert result["return_code"] == -1
 
     def test_commit_changes_basic(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test committing changes."""
         agent = PythonDeveloperAgent()
@@ -470,7 +461,7 @@ This is the overview section.
             assert mock_run.call_count == 3
 
     def test_commit_changes_stages_files(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that files are staged correctly."""
         agent = PythonDeveloperAgent()
@@ -492,7 +483,7 @@ This is the overview section.
             assert ["git", "add", "tests/test_feature.py"] in [c[0][0] for c in add_calls]
 
     def test_commit_changes_includes_coauthor(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test that commit includes co-author."""
         agent = PythonDeveloperAgent()
@@ -513,7 +504,7 @@ This is the overview section.
             assert "Co-Authored-By: Claude Sonnet 4.5" in commit_message
 
     def test_commit_changes_failure(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test commit failure raises exception."""
         agent = PythonDeveloperAgent()
@@ -525,7 +516,7 @@ This is the overview section.
                 agent.commit_changes("Message", ["file.py"], temp_worktree)
 
     def test_run_complete_workflow(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, sample_plan_file, temp_worktree
     ):
         """Test complete run workflow."""
         agent = PythonDeveloperAgent()
@@ -556,34 +547,8 @@ This is the overview section.
             # Verify tests were run
             mock_test.assert_called_once_with(temp_worktree)
 
-    def test_run_creates_beads_tasks(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file, temp_worktree
-    ):
-        """Test that run creates beads tasks."""
-        agent = PythonDeveloperAgent()
-
-        # Access the beads mock that was created in the agent's __init__
-        beads_mock = agent.beads
-
-        with patch.object(agent, "implement_feature"), \
-             patch.object(agent, "run_tests") as mock_test:
-
-            mock_test.return_value = {"success": True, "return_code": 0, "output": ""}
-
-            agent.run(plan_file=sample_plan_file, worktree_path=temp_worktree)
-
-            # Should create one task per checklist item
-            assert beads_mock.create_task.call_count == 6
-
-            # Check task parameters
-            first_call = beads_mock.create_task.call_args_list[0]
-            assert first_call[1]["title"] == "Create feature branch"
-            assert first_call[1]["task_type"] == "task"
-            assert first_call[1]["priority"] == 1
-            assert first_call[1]["working_dir"] == str(temp_worktree)
-
     def test_run_handles_task_failures(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, sample_plan_file, temp_worktree
     ):
         """Test run handles task implementation failures."""
         agent = PythonDeveloperAgent()
@@ -625,29 +590,8 @@ This is the overview section.
             assert len(failed_results) == 2
             assert "Implementation error" in failed_results[0]["error"]
 
-    def test_run_handles_beads_error(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file, temp_worktree
-    ):
-        """Test run continues even if beads task creation fails."""
-        agent = PythonDeveloperAgent()
-
-        mock_beads.return_value.create_task.side_effect = Exception("Beads error")
-
-        with patch.object(agent, "implement_feature"), \
-             patch.object(agent, "run_tests") as mock_test:
-
-            mock_test.return_value = {"success": True, "return_code": 0, "output": ""}
-
-            # Should not raise exception
-            result = agent.run(
-                plan_file=sample_plan_file,
-                worktree_path=temp_worktree,
-            )
-
-            assert "tasks_completed" in result
-
     def test_run_returns_test_results(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, sample_plan_file, temp_worktree
     ):
         """Test that run returns test results."""
         agent = PythonDeveloperAgent()
@@ -670,7 +614,7 @@ This is the overview section.
             assert "5 passed" in result["test_results"]["output"]
 
     def test_run_with_empty_plan(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test run with empty plan file."""
         agent = PythonDeveloperAgent()
@@ -690,7 +634,7 @@ This is the overview section.
             assert result["tasks_failed"] == 0
 
     def test_run_with_additional_kwargs(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, sample_plan_file, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, sample_plan_file, temp_worktree
     ):
         """Test run accepts additional kwargs."""
         agent = PythonDeveloperAgent()
@@ -709,13 +653,13 @@ This is the overview section.
 
             assert result is not None
 
-    def test_get_test_command(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_get_test_command(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test Python test command returns pytest."""
         agent = PythonDeveloperAgent()
         cmd = agent._get_test_command()
         assert cmd == ["pytest", "-v", "--tb=short"]
 
-    def test_get_test_stub(self, mock_config, mock_agent_sdk, mock_prompt, mock_beads):
+    def test_get_test_stub(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test Python test stub contains pytest imports."""
         agent = PythonDeveloperAgent()
         stub = agent._get_test_stub()
@@ -723,7 +667,7 @@ This is the overview section.
         assert "def test_basic_functionality" in stub
 
     def test_build_tdd_prompt(
-        self, mock_config, mock_agent_sdk, mock_prompt, mock_beads, temp_worktree
+        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
     ):
         """Test Python TDD prompt references pytest and PEP 8."""
         agent = PythonDeveloperAgent()
@@ -732,3 +676,74 @@ This is the overview section.
         assert "PEP 8" in prompt
         assert "type hints" in prompt
         assert "TASK: Add login" in prompt
+
+
+class TestFilterOutputFiles:
+    """Test _filter_output_files junk and cross-stack filtering."""
+
+    def test_filters_markdown_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that .md files are filtered out."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/feature.py",
+            "/app/TDD_DOCUMENTATION_INDEX.md",
+            "/app/README.md",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/feature.py"]
+
+    def test_filters_txt_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that .txt files are filtered out."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/service.py",
+            "/app/TDD_EXECUTION_SUMMARY_FINAL.txt",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/service.py"]
+
+    def test_keeps_python_code_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that valid Python files are kept."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/feature.py",
+            "/app/tests/test_feature.py",
+            "/app/config.yaml",
+            "/app/setup.cfg",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == files
+
+    def test_python_agent_rejects_php_files(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that Python agent rejects PHP/Drupal files (cross-stack)."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/src/feature.py",
+            "/app/web/modules/custom/mymod/Handler.php",
+            "/app/web/modules/custom/mymod/mymod.module",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/feature.py"]
+
+    def test_filters_empty_strings(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that empty strings are filtered out."""
+        agent = PythonDeveloperAgent()
+        files = ["", "/app/src/feature.py", ""]
+        result = agent._filter_output_files(files)
+        assert result == ["/app/src/feature.py"]
+
+    def test_empty_list(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test with empty file list."""
+        agent = PythonDeveloperAgent()
+        assert agent._filter_output_files([]) == []
+
+    def test_all_junk_returns_empty(self, mock_config, mock_agent_sdk, mock_prompt):
+        """Test that all-junk input returns empty list."""
+        agent = PythonDeveloperAgent()
+        files = [
+            "/app/TDD_DOCUMENTATION_INDEX.md",
+            "/app/EXECUTION_LOG.txt",
+            "/app/SUMMARY.md",
+        ]
+        result = agent._filter_output_files(files)
+        assert result == []

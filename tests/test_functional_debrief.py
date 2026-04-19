@@ -83,12 +83,12 @@ SAMPLE_TICKET_DATA = {
 SAMPLE_DEBRIEF_RESPONSE = json.dumps({
     "understanding": "You want users to export their dashboard as a PDF for sharing with stakeholders.",
     "assumptions": [
-        "[ASSUMPTION] The PDF matches the current dashboard layout",
-        "[ASSUMPTION] Export is triggered from the dashboard page",
+        "The PDF matches the current dashboard layout",
+        "Export is triggered from the dashboard page",
     ],
     "gaps": [
-        "[GAP] Should the PDF include the current date range filter?",
-        "[GAP] Are there branding requirements for the PDF?",
+        "Should the PDF include the current date range filter?",
+        "Are there branding requirements for the PDF?",
     ],
     "questions": [
         "What date range should the PDF cover?",
@@ -333,8 +333,8 @@ class TestRun:
         # Mock LLM to return follow-up (not resolved)
         followup_response = json.dumps({
             "understanding": "Updated understanding with date range info.",
-            "assumptions": ["[ASSUMPTION] No branding needed"],
-            "gaps": ["[GAP] Max file size?"],
+            "assumptions": ["No branding needed"],
+            "gaps": ["Max file size?"],
             "questions": ["Is there a max file size for the PDF?"],
             "cta": "One more question...",
             "gaps_resolved": False,
@@ -467,8 +467,8 @@ class TestPostDebriefComment:
         agent = FunctionalDebriefAgent()
         debrief_data = {
             "understanding": "You want PDF export from the dashboard.",
-            "assumptions": ["[ASSUMPTION] Layout matches dashboard"],
-            "gaps": ["[GAP] Date range unclear"],
+            "assumptions": ["Layout matches dashboard"],
+            "gaps": ["Date range unclear"],
             "questions": ["What date range?"],
             "cta": "Could you clarify?",
         }
@@ -483,7 +483,7 @@ class TestPostDebriefComment:
         assert "Summary" not in comment_body
         assert "You want PDF export" in comment_body
         assert "h3. Assumptions" in comment_body
-        assert "[ASSUMPTION] Layout matches dashboard" in comment_body
+        assert "Layout matches dashboard" in comment_body
         assert "h3. Information Gaps" in comment_body
         assert "h3. Questions" in comment_body
         assert "sentinel debrief TEST-123" in comment_body
@@ -493,7 +493,7 @@ class TestPostDebriefComment:
         debrief_data = {
             "understanding": "Updated understanding.",
             "assumptions": [],
-            "gaps": ["[GAP] One remaining gap"],
+            "gaps": ["One remaining gap"],
             "questions": ["Remaining question?"],
             "cta": "Please answer this.",
         }

@@ -55,39 +55,55 @@ class TestInitProject:
     def test_init_project_already_initialized(self, mock_run, beads_manager):
         """Test when beads is already initialized."""
         # Mock bd stats returning success (already initialized)
-        mock_run.return_value = Mock(returncode=0)
-
-        beads_manager.init_project("ACME-123", "/tmp/test")
-
-        # Should only call bd stats once
-        mock_run.assert_called_once()
-        args = mock_run.call_args[0][0]
-        assert args[0] == "bd"
-        assert args[1] == "stats"
-
-    @patch("subprocess.run")
-    def test_init_project_new_initialization(self, mock_run, beads_manager):
-        """Test initializing a new beads project."""
-        # First call fails (not initialized), second succeeds
+        # and bd dolt status returning server running
         mock_run.side_effect = [
-            Mock(returncode=1),  # bd stats check fails
-            Mock(returncode=0),  # bd stats to initialize
+            Mock(returncode=0, stdout="", stderr=""),  # bd stats
+            Mock(returncode=0, stdout="Dolt server running", stderr=""),  # bd dolt status
         ]
 
         beads_manager.init_project("ACME-123", "/tmp/test")
 
-        # Should call bd stats twice
+        # Should call bd stats + bd dolt status
         assert mock_run.call_count == 2
+        first_args = mock_run.call_args_list[0][0][0]
+        assert first_args[0] == "bd"
+        assert first_args[1] == "stats"
+
+    @patch("subprocess.Popen")
+    @patch("subprocess.run")
+    def test_init_project_new_initialization(self, mock_run, mock_popen, beads_manager):
+        """Test initializing a new beads project."""
+        # bd stats check fails (not initialized)
+        mock_run.return_value = Mock(returncode=1)
+
+        # bd init via Popen succeeds
+        mock_proc = Mock()
+        mock_proc.returncode = 0
+        mock_proc.wait.return_value = None
+        mock_popen.return_value = mock_proc
+
+        beads_manager.init_project("ACME-123", "/tmp/test")
+
+        # bd stats called once, bd init via Popen called once
+        mock_run.assert_called_once()
+        mock_popen.assert_called_once()
+        popen_args = mock_popen.call_args[0][0]
+        assert popen_args[0] == "bd"
+        assert popen_args[1] == "init"
 
     @patch("subprocess.run")
     def test_init_project_with_working_dir(self, mock_run, beads_manager):
         """Test that working directory is passed correctly."""
-        mock_run.return_value = Mock(returncode=0)
+        mock_run.side_effect = [
+            Mock(returncode=0, stdout="", stderr=""),  # bd stats
+            Mock(returncode=0, stdout="Dolt server running", stderr=""),  # bd dolt status
+        ]
 
         beads_manager.init_project("ACME-123", "/custom/path")
 
-        call_args = mock_run.call_args
-        assert call_args.kwargs["cwd"] == "/custom/path"
+        # Both calls should use the working dir
+        for call in mock_run.call_args_list:
+            assert call.kwargs["cwd"] == "/custom/path"
 
 
 class TestCreateTask:

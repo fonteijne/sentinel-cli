@@ -17,6 +17,17 @@ class PythonDeveloperAgent(BaseDeveloperAgent):
     Inherits shared orchestration from BaseDeveloperAgent.
     """
 
+    _VALID_EXTENSIONS: frozenset = frozenset({
+        # Python
+        ".py", ".pyi", ".pyx", ".pxd",
+        # Config
+        ".cfg", ".toml", ".ini", ".yml", ".yaml",
+        # Data / schemas
+        ".json", ".sql",
+        # Templates
+        ".html", ".jinja", ".jinja2", ".j2",
+    })
+
     def __init__(self) -> None:
         """Initialize Python developer agent."""
         super().__init__(

@@ -5,10 +5,12 @@ import logging
 import subprocess
 from abc import abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from src.environment_manager import EnvironmentManager
 
 from src.agents.base_agent import ImplementationAgent
-from src.beads_manager import BeadsManager
 from src.prompt_loader import load_agent_prompt
 from src.worktree_manager import get_branch_name
 
@@ -44,7 +46,27 @@ class BaseDeveloperAgent(ImplementationAgent):
             except FileNotFoundError:
                 logger.warning("Developer system prompt not found at prompts/developer.md")
 
-        self.beads = BeadsManager()
+        # Container environment for test execution (set via set_environment)
+        self._env_manager: Optional["EnvironmentManager"] = None
+        self._env_ticket_id: Optional[str] = None
+
+    def set_environment(
+        self,
+        env_manager: "EnvironmentManager",
+        ticket_id: str,
+    ) -> None:
+        """Attach a container environment for test execution.
+
+        When set, run_tests() will execute inside the container
+        instead of on the host via subprocess.
+
+        Args:
+            env_manager: Active EnvironmentManager instance
+            ticket_id: Ticket ID for this environment
+        """
+        self._env_manager = env_manager
+        self._env_ticket_id = ticket_id
+        logger.info(f"Container environment attached for {ticket_id}")
 
     # ------------------------------------------------------------------
     # Abstract methods — subclasses MUST implement
@@ -80,6 +102,90 @@ class BaseDeveloperAgent(ImplementationAgent):
         Returns:
             Test stub source code string
         """
+
+    # ------------------------------------------------------------------
+    # Config validation
+    # ------------------------------------------------------------------
+
+    def validate_config(self, worktree_path: Path) -> Dict[str, Any]:
+        """Validate project configuration after implementation.
+
+        Override in stack-specific subclasses to add config validation
+        (e.g. Drupal config sync, Django migrations check).
+
+        Default is a no-op that returns success.
+
+        Args:
+            worktree_path: Path to git worktree
+
+        Returns:
+            Dictionary with success, output, return_code
+        """
+        return {"success": True, "output": "", "return_code": 0}
+
+    # ------------------------------------------------------------------
+    # Output file validation
+    # ------------------------------------------------------------------
+
+    #: File extensions that are never valid implementation output.
+    _JUNK_EXTENSIONS: frozenset = frozenset({
+        ".md", ".txt", ".log", ".csv", ".json.bak",
+    })
+
+    #: Allowlist of valid output file extensions for this stack.
+    #: Subclasses MUST override this.  When set, only files whose extension
+    #: appears in the allowlist (or whose extension is empty, e.g. Makefiles)
+    #: are kept.  Files matching _JUNK_EXTENSIONS are always rejected first.
+    _VALID_EXTENSIONS: frozenset = frozenset()  # empty = no allowlist filtering
+
+    def _filter_output_files(self, files: List[str]) -> List[str]:
+        """Remove junk and off-stack files from LLM output.
+
+        Filtering is two-tiered:
+        1. Blocklist — extensions in ``_JUNK_EXTENSIONS`` are always rejected.
+        2. Allowlist — if ``_VALID_EXTENSIONS`` is non-empty, only files whose
+           extension appears in the set are kept.  This catches cross-stack
+           contamination (e.g. ``.py`` files in a Drupal project).
+
+        Args:
+            files: List of file paths produced by Write/Edit tool uses
+
+        Returns:
+            Filtered list with invalid files removed
+        """
+        valid = []
+        for f in files:
+            if not f:
+                continue
+            ext = Path(f).suffix.lower()
+            name = Path(f).name
+
+            # Tier 1: always-reject blocklist
+            if ext in self._JUNK_EXTENSIONS:
+                logger.warning("Filtering junk output file: %s", f)
+                continue
+
+            # Reject ALL_CAPS filenames like TDD_EXECUTION_SUMMARY_FINAL.txt
+            if name.replace("_", "").replace("-", "").replace(".", "").isupper() and ext in {".md", ".txt", ""}:
+                logger.warning("Filtering documentation-style output file: %s", f)
+                continue
+
+            # Tier 2: per-stack allowlist
+            if self._VALID_EXTENSIONS and ext and ext not in self._VALID_EXTENSIONS:
+                logger.warning(
+                    "Filtering off-stack file (ext=%s not in allowlist): %s",
+                    ext, f,
+                )
+                continue
+
+            valid.append(f)
+
+        if len(valid) < len(files):
+            logger.info(
+                "Filtered %d invalid files from %d total output files",
+                len(files) - len(valid), len(files),
+            )
+        return valid
 
     # ------------------------------------------------------------------
     # Shared orchestration methods
@@ -242,6 +348,10 @@ Return the task list now, one task per line:"""
                 elif tool_name == "Edit":
                     files_modified.append(tool_use.get("input", {}).get("file_path", ""))
 
+            # Filter out junk documentation files the LLM may have created
+            files_created = self._filter_output_files(files_created)
+            files_modified = self._filter_output_files(files_modified)
+
             test_results = self.run_tests(worktree_path)
 
             if not test_results.get("success"):
@@ -251,9 +361,14 @@ Return the task list now, one task per line:"""
                 )
 
             task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
+            test_output = test_results.get("output", "")
+            if "skipping" in test_output.lower():
+                test_status = "Tests skipped (no test config found)"
+            else:
+                test_status = "All tests passing"
             commit_message = (
                 f"{commit_prefix}: {task_summary}\n\n"
-                f"- Implemented using TDD approach\n- All tests passing"
+                f"- Implemented using TDD approach\n- {test_status}"
             )
 
             logger.info(f"Task implementation complete: {task}")
@@ -294,6 +409,9 @@ Return the task list now, one task per line:"""
     def run_tests(self, worktree_path: Path) -> Dict[str, Any]:
         """Run tests using the stack's test framework.
 
+        If a container environment is attached (via set_environment),
+        tests run inside the container. Otherwise, tests run on the host.
+
         Args:
             worktree_path: Path to git worktree
 
@@ -302,8 +420,141 @@ Return the task list now, one task per line:"""
         """
         logger.info(f"Running tests in {worktree_path}")
 
+        test_cmd = self._get_test_command()
+
+        if self._env_manager and self._env_ticket_id:
+            return self._run_tests_in_container(test_cmd)
+
+        return self._run_tests_on_host(test_cmd, worktree_path)
+
+    def _ensure_composer_deps(self) -> None:
+        """Ensure composer dependencies and scaffold files are installed.
+
+        Always runs ``composer install`` to guarantee all dependencies,
+        scaffold files (e.g. default.settings.php), and binaries are present.
+        """
+        logger.info("Running composer install in container")
+        result = self._env_manager.exec(
+            ticket_id=self._env_ticket_id,
+            service="appserver",
+            command=["composer", "install", "--no-interaction", "--no-progress"],
+            workdir="/app",
+        )
+        if result.returncode != 0:
+            logger.warning(f"composer install failed: {result.stderr}")
+
+    def _resolve_test_cmd_for_container(self, test_cmd: List[str]) -> Optional[List[str]]:
+        """Adapt the test command to what the container actually supports.
+
+        Checks whether phpunit.xml exists and whether the requested
+        ``--testsuite`` is defined in it.  Returns ``None`` when no
+        phpunit config exists at all (meaning tests should be skipped
+        rather than letting phpunit print its help text and exit non-zero).
+
+        Returns:
+            Adapted command list, or None if tests should be skipped.
+        """
+        # Check if phpunit.xml or phpunit.xml.dist exists
+        check = self._env_manager.exec(
+            ticket_id=self._env_ticket_id,
+            service="appserver",
+            command=["sh", "-c", "test -f phpunit.xml || test -f phpunit.xml.dist"],
+            workdir="/app",
+        )
+        if check.returncode != 0:
+            # No config file at all — cannot run phpunit
+            logger.info("No phpunit.xml found in container — skipping test execution")
+            return None
+
+        # Config exists — check if requested testsuite is defined
+        testsuite_arg = next((a for a in test_cmd if a.startswith("--testsuite=")), None)
+        if testsuite_arg:
+            suite_name = testsuite_arg.split("=", 1)[1]
+            grep = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=["grep", "-q", f'name="{suite_name}"', "phpunit.xml"],
+                workdir="/app",
+            )
+            if grep.returncode != 0:
+                # Also check phpunit.xml.dist
+                grep2 = self._env_manager.exec(
+                    ticket_id=self._env_ticket_id,
+                    service="appserver",
+                    command=["grep", "-q", f'name="{suite_name}"', "phpunit.xml.dist"],
+                    workdir="/app",
+                )
+                if grep2.returncode != 0:
+                    logger.info(
+                        f"Testsuite '{suite_name}' not found in phpunit config — stripping flag"
+                    )
+                    return [arg for arg in test_cmd if not arg.startswith("--testsuite")]
+
+        return test_cmd
+
+    def _run_tests_in_container(self, test_cmd: List[str]) -> Dict[str, Any]:
+        """Execute tests inside the container environment.
+
+        Args:
+            test_cmd: Test command as list of strings
+
+        Returns:
+            Dictionary with success, output, return_code
+        """
+        logger.info(f"Running tests in container (service=appserver)")
+
         try:
-            test_cmd = self._get_test_command()
+            # Ensure composer deps (including phpunit) exist
+            self._ensure_composer_deps()
+
+            # Adapt command to container's phpunit config
+            resolved_cmd = self._resolve_test_cmd_for_container(test_cmd)
+
+            if resolved_cmd is None:
+                # No phpunit config exists — skip tests gracefully
+                return {
+                    "success": True,
+                    "output": "No phpunit configuration found — skipping test execution",
+                    "return_code": 0,
+                }
+
+            result = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=resolved_cmd,
+                workdir="/app",
+            )
+
+            output = result.stdout + result.stderr
+            success = result.returncode == 0
+
+            return {
+                "success": success,
+                "output": output,
+                "return_code": result.returncode,
+            }
+
+        except Exception as e:
+            logger.error(f"Error running tests in container: {e}")
+            return {
+                "success": False,
+                "output": str(e),
+                "return_code": -1,
+            }
+
+    def _run_tests_on_host(
+        self, test_cmd: List[str], worktree_path: Path
+    ) -> Dict[str, Any]:
+        """Execute tests on the host via subprocess.
+
+        Args:
+            test_cmd: Test command as list of strings
+            worktree_path: Path to git worktree
+
+        Returns:
+            Dictionary with success, output, return_code
+        """
+        try:
             result = subprocess.run(
                 test_cmd,
                 cwd=worktree_path,
@@ -414,19 +665,6 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         # Break down plan into tasks
         tasks = self.break_down_plan(plan_file)
 
-        # Create beads tasks for tracking
-        for task in tasks:
-            try:
-                task_id = self.beads.create_task(
-                    title=task,
-                    task_type="task",
-                    priority=1,
-                    working_dir=str(worktree_path),
-                )
-                logger.info(f"Created task: {task_id}")
-            except Exception as e:
-                logger.warning(f"Could not create beads task: {e}")
-
         # Implement each task
         results = []
         for task in tasks:
@@ -454,10 +692,57 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         # Run all tests
         test_results = self.run_tests(worktree_path)
 
+        # Validate project config (e.g. Drupal config sync)
+        config_validation = self.validate_config(worktree_path)
+
+        # If config validation failed due to actual config issues (not env),
+        # let the developer attempt to fix it
+        max_config_retries = 2
+        for config_attempt in range(max_config_retries):
+            if config_validation.get("success", True):
+                break
+            if config_validation.get("environment_issue"):
+                logger.warning("Config validation failed due to environment issue — skipping retry")
+                break
+
+            logger.warning(
+                "Config validation failed (attempt %d/%d) — asking developer to fix",
+                config_attempt + 1,
+                max_config_retries,
+            )
+
+            config_output = config_validation.get("output", "")[:2000]
+            fix_task = (
+                "Fix the config validation failure. The Drupal config sync "
+                "(drush site:install --config-dir=../config/sync) failed with:\n\n"
+                f"{config_output}\n\n"
+                "Analyze the error, create or fix the missing config files, "
+                "and ensure config dependencies are satisfied."
+            )
+
+            try:
+                fix_result = self.implement_feature(fix_task, {}, worktree_path)
+                if fix_result.get("success"):
+                    changed = (
+                        fix_result.get("files_created", [])
+                        + fix_result.get("files_modified", [])
+                    )
+                    if changed:
+                        self.commit_changes(
+                            message="fix: resolve config sync validation failure",
+                            files=changed,
+                            worktree_path=worktree_path,
+                        )
+            except Exception as e:
+                logger.error("Config fix attempt failed: %s", e)
+
+            config_validation = self.validate_config(worktree_path)
+
         return {
             "tasks_completed": sum(1 for r in results if r["success"]),
             "tasks_failed": sum(1 for r in results if not r["success"]),
             "test_results": test_results,
+            "config_validation": config_validation,
             "results": results,
         }
 
@@ -760,6 +1045,52 @@ Provide a clear, concise answer (2-3 sentences) explaining:
         # Run tests to verify fixes
         test_results = self.run_tests(worktree_path)
 
+        # Validate project config (e.g. Drupal config sync)
+        config_validation = self.validate_config(worktree_path)
+
+        # If config validation failed due to actual config issues (not env),
+        # let the developer attempt to fix it
+        max_config_retries = 2
+        for config_attempt in range(max_config_retries):
+            if config_validation.get("success", True):
+                break
+            if config_validation.get("environment_issue"):
+                logger.warning("Config validation failed due to environment issue — skipping retry")
+                break
+
+            logger.warning(
+                "Config validation failed (attempt %d/%d) — asking developer to fix",
+                config_attempt + 1,
+                max_config_retries,
+            )
+
+            config_output = config_validation.get("output", "")[:2000]
+            fix_task = (
+                "Fix the config validation failure. The Drupal config sync "
+                "(drush site:install --config-dir=../config/sync) failed with:\n\n"
+                f"{config_output}\n\n"
+                "Analyze the error, create or fix the missing config files, "
+                "and ensure config dependencies are satisfied."
+            )
+
+            try:
+                fix_result = self.implement_feature(fix_task, {}, worktree_path)
+                if fix_result.get("success"):
+                    changed = (
+                        fix_result.get("files_created", [])
+                        + fix_result.get("files_modified", [])
+                    )
+                    if changed:
+                        self.commit_changes(
+                            message="fix: resolve config sync validation failure",
+                            files=changed,
+                            worktree_path=worktree_path,
+                        )
+            except Exception as e:
+                logger.error("Config fix attempt failed: %s", e)
+
+            config_validation = self.validate_config(worktree_path)
+
         # Reply to ALL discussions
         responses_posted = 0
         for item in discussion_tasks:
@@ -902,6 +1233,7 @@ A human will need to respond to this.
 **Questions:** {questions_answered}/{questions} answered ({questions_failed} failed)
 **Acknowledged:** {acknowledged}
 **Tests:** {'✅ All passing' if test_results.get('success') else '⚠️ Some failures - see output'}
+**Config:** {'✅ Valid' if config_validation.get('success') else '❌ Validation failed — config dependencies broken'}
 
 All discussions have been addressed.
 
@@ -931,6 +1263,7 @@ All discussions have been addressed.
             "changes_committed": len(all_changed_files) > 0,
             "responses_posted": responses_posted,
             "test_results": test_results,
+            "config_validation": config_validation,
         }
 
     def _format_mr_feedback(self, feedback: list[Dict[str, Any]]) -> str:

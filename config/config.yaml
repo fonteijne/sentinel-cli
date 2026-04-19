@@ -15,6 +15,13 @@ agents:
     - pydantic-ai
     - fastapi
     - postgresql
+  drupal_developer:
+    model: claude-4-5-sonnet
+    temperature: 0.2
+    specializations:
+    - drupal
+    - php
+    - phpunit
   security_review:
     model: claude-4-5-sonnet
     temperature: 0.1

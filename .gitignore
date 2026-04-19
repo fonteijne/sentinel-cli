@@ -61,3 +61,8 @@ Thumbs.db
 
 # Workspace directories (created at runtime)
 workspaces/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

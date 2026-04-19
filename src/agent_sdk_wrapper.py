@@ -172,7 +172,7 @@ class AgentSDKWrapper:
             })
         # subscription mode: no additional env vars needed, SDK handles auth
 
-        logger.info(f"Agent SDK execute: model={self.model}, cwd={cwd}, session={session_id}, system_prompt_len={len(system_prompt) if system_prompt else 0}")
+        logger.info(f"[{self.agent_name}] Agent SDK execute: model={self.model}, cwd={cwd}, session={session_id}, system_prompt_len={len(system_prompt) if system_prompt else 0}")
         logger.debug(f"System prompt preview: {system_prompt[:500] if system_prompt else 'None'}")
         logger.debug(f"User prompt: {prompt[:500] if prompt else 'None'}")
 
@@ -201,7 +201,7 @@ class AgentSDKWrapper:
                 logger.info(f"Claude CLI stderr: {line}")
 
         # Log the exact model being used before passing to SDK
-        logger.info(f"Using model: {self.model} (before SDK translation)")
+        logger.info(f"[{self.agent_name}] Using model: {self.model}")
 
         # Build options
         options_kwargs: Dict[str, Any] = {
@@ -225,13 +225,13 @@ class AgentSDKWrapper:
         final_session_id: str | None = None
 
         sdk_start = time.monotonic()
-        logger.info(f"[SDK] Opening ClaudeSDKClient (model={self.model})...")
+        logger.info(f"[{self.agent_name}] Opening ClaudeSDKClient (model={self.model})...")
 
         async with ClaudeSDKClient(options=options) as client:
-            logger.info(f"[SDK] Client opened ({time.monotonic() - sdk_start:.1f}s), sending query ({len(prompt)} chars)...")
+            logger.info(f"[{self.agent_name}] Client opened ({time.monotonic() - sdk_start:.1f}s), sending query ({len(prompt)} chars)...")
             query_start = time.monotonic()
             await client.query(prompt)
-            logger.info(f"[SDK] Query sent ({time.monotonic() - query_start:.1f}s), waiting for response stream...")
+            logger.info(f"[{self.agent_name}] Query sent ({time.monotonic() - query_start:.1f}s), waiting for response stream...")
 
             stream_start = time.monotonic()
             msg_count = 0
@@ -246,12 +246,12 @@ class AgentSDKWrapper:
                                 "tool": block.name,
                                 "input": block.input
                             })
-                            logger.info(f"[SDK] Tool use: {block.name} ({time.monotonic() - stream_start:.1f}s into stream)")
+                            logger.info(f"[{self.agent_name}] Tool use: {block.name} ({time.monotonic() - stream_start:.1f}s into stream)")
                 # Extract session ID from ResultMessage
                 if hasattr(message, 'session_id'):
                     final_session_id = message.session_id
 
-        logger.info(f"[SDK] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {time.monotonic() - sdk_start:.1f}s total")
+        logger.info(f"[{self.agent_name}] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {time.monotonic() - sdk_start:.1f}s total")
 
         # Track the session ID if we got one (with project association)
         if final_session_id:
