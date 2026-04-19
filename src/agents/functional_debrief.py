@@ -42,6 +42,7 @@ class FunctionalDebriefAgent(PlanningAgent):
         ticket_id: str,
         project: str | None = None,
         worktree_path: str | Path | None = None,
+        user_prompt: str | None = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Run the debrief workflow.
@@ -79,7 +80,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
         if state == "initial":
             # Generate debrief, post to Jira, save state
-            debrief_data = self._generate_debrief(ticket_id, ticket_data)
+            debrief_data = self._generate_debrief(ticket_id, ticket_data, user_prompt=user_prompt)
             self._post_debrief_comment(ticket_id, debrief_data, comment_type="initial")
             self._save_state(ticket_id, {
                 "status": "awaiting_reply",
@@ -110,6 +111,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
             followup_data = self._generate_followup(
                 ticket_id, ticket_data, conversation, new_replies,
+                user_prompt=user_prompt,
             )
 
             iteration_count = existing_state.get("iteration_count", 1) + 1
@@ -153,6 +155,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
                 followup_data = self._generate_followup(
                     ticket_id, ticket_data, conversation, new_replies,
+                    user_prompt=user_prompt,
                 )
 
                 iteration_count = existing_state.get("iteration_count", 1) + 1
@@ -292,6 +295,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
     def _generate_debrief(
         self, ticket_id: str, ticket_data: Dict[str, Any],
+        user_prompt: str | None = None,
     ) -> Dict[str, Any]:
         """Generate the initial functional debrief for a ticket.
 
@@ -353,6 +357,8 @@ class FunctionalDebriefAgent(PlanningAgent):
 Generate a functional debrief following your system prompt instructions.
 Return ONLY the JSON object as specified in the "Mode: Initial Debrief" section of your system prompt."""
 
+        prompt = self._append_operator_prompt(prompt, user_prompt)
+
         response = self.send_message(prompt, cwd=self._cwd)
         logger.info(f"Raw debrief response ({len(response)} chars): {response[:300]}...")
 
@@ -376,6 +382,7 @@ Return ONLY the JSON object as specified in the "Mode: Initial Debrief" section 
         ticket_data: Dict[str, Any],
         conversation_history: List[Dict[str, Any]],
         new_replies: List[Dict[str, Any]],
+        user_prompt: str | None = None,
     ) -> Dict[str, Any]:
         """Generate a follow-up response based on client replies.
 
@@ -444,6 +451,8 @@ Return ONLY the JSON object as specified in the "Mode: Initial Debrief" section 
 Generate a follow-up response following your system prompt instructions.
 If all gaps are resolved, set "gaps_resolved" to true and provide a complete summary in "understanding".
 Return ONLY the JSON object as specified in the "Mode: Follow-up" section of your system prompt."""
+
+        prompt = self._append_operator_prompt(prompt, user_prompt)
 
         response = self.send_message(prompt, cwd=self._cwd)
         logger.info(f"Raw followup response ({len(response)} chars): {response[:300]}...")

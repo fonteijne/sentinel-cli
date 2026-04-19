@@ -413,6 +413,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         output_path: Path,
         worktree_path: Path | None = None,
         investigation_findings: str | None = None,
+        user_prompt: str | None = None,
     ) -> str:
         """Generate a detailed implementation plan.
 
@@ -536,6 +537,8 @@ After writing the plan file, respond with ONLY: "Plan written to {plan_file_path
         max_iterations = 3
         plan_content = ""
 
+        plan_prompt = self._append_operator_prompt(plan_prompt, user_prompt)
+
         for iteration in range(max_iterations):
             try:
                 response = self.send_message(plan_prompt, cwd=worktree_cwd, max_turns=30)
@@ -629,6 +632,7 @@ This is iteration {iteration + 2} of {max_iterations}.
         current_plan: str,
         feedback: list[Dict[str, Any]],
         output_path: Path,
+        user_prompt: str | None = None,
     ) -> Dict[str, Any]:
         """Revise an existing plan based on MR feedback.
 
@@ -685,6 +689,8 @@ Return a JSON object with:
 
 Be specific about what changed and why. The team needs to understand how their feedback was incorporated.
 """
+
+        revision_prompt = self._append_operator_prompt(revision_prompt, user_prompt)
 
         # Call LLM
         response = self.send_message(revision_prompt)
@@ -1375,6 +1381,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         ticket_id: str,
         worktree_path: Path,
         force: bool = False,
+        user_prompt: str | None = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Run the unified planning workflow.
@@ -1448,6 +1455,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
             revision_result = self.revise_plan(
                 ticket_id, state_info["existing_plan"],
                 state_info["discussions"], plan_path,
+                user_prompt=user_prompt,
             )
             logger.info(f"[RUN] Step 2a: Revision done ({time.monotonic() - t0:.1f}s)")
             plan_content = revision_result["revised_plan"]
@@ -1480,6 +1488,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
             plan_content = self.generate_plan(
                 ticket_id, analysis, plan_path, worktree_path,
                 investigation_findings=investigation_findings,
+                user_prompt=user_prompt,
             )
             logger.info(f"[RUN] Step 2b: Plan generation done ({time.monotonic() - t0:.1f}s, {len(plan_content)} chars)")
 

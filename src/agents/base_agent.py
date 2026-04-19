@@ -226,6 +226,12 @@ class BaseAgent(ABC):
         """
         return self.messages.copy()
 
+    def _append_operator_prompt(self, prompt: str, user_prompt: str | None) -> str:
+        """Append operator instruction to a prompt if provided."""
+        if not user_prompt:
+            return prompt
+        return f"{prompt}\n\n---\n## Operator Instruction\n\n{user_prompt}\n"
+
     @abstractmethod
     def run(self, **kwargs: Any) -> Any:
         """Run the agent's primary task.
