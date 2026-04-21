@@ -65,8 +65,8 @@ RUN curl -L https://github.com/dolthub/dolt/releases/latest/download/install.sh 
 RUN npm install -g @anthropic-ai/claude-code @beads/bd
 
 # Git identity for commits made inside the container
-RUN git config --global user.email "sentinel@iodigital.com" \
-    && git config --global user.name "iO Sentinel"
+RUN git config --global user.email "sentinel.utrecht@iodigital.com" \
+    && git config --global user.name "Sentinel"
 
 # Create Claude Code directory structure (prevents CLI issues in containers)
 RUN mkdir -p /etc/claude-code/.claude/skills \
