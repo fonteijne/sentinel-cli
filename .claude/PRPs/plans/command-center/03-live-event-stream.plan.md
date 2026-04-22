@@ -90,7 +90,15 @@ Server → client, one JSON object per frame:
 
 Every event frame has the same shape (no replay/live distinction — there's one source). The envelope fields (`seq`, `ts`, `type`, `agent`) sit at the top level; the event-specific fields are nested under `payload` so the frame shape is stable across event types.
 
-Terminal statuses derived from the terminal event type: `execution.completed` → `succeeded`, `execution.failed` → `failed`, `execution.cancelled` → `cancelled`.
+Terminal statuses derived from the terminal event type via an explicit `_END_STATUS` mapping dict (NOT `type.split(".")[-1]`):
+
+| Event type | `execution_status` value |
+|---|---|
+| `execution.completed` | `succeeded` |
+| `execution.failed` | `failed` |
+| `execution.cancelled` | `cancelled` |
+
+These values match the `ExecutionStatus` enum defined in plan 01.
 
 ---
 
@@ -105,7 +113,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 from src.core.events.types import TERMINAL_EVENT_TYPES
 from src.core.execution.repository import ExecutionRepository
@@ -115,6 +123,16 @@ router = APIRouter()
 
 POLL_INTERVAL_S = 0.2
 HEARTBEAT_INTERVAL_S = 30.0
+SEND_TIMEOUT_S = 30.0          # slow-client backpressure cutoff
+
+# Terminal event type → dashboard-friendly status string.
+# MUST match the ExecutionStatus enum values, not the raw type suffix —
+# `execution.completed` maps to `succeeded`, NOT `completed`.
+_END_STATUS = {
+    "execution.completed": "succeeded",
+    "execution.failed":    "failed",
+    "execution.cancelled": "cancelled",
+}
 
 
 def _now_iso() -> str:
@@ -137,7 +155,7 @@ async def stream(
     ws: WebSocket,
     execution_id: str,
     since_seq: int = 0,
-    repo: Annotated[ExecutionRepository, Depends(get_repo)] = ...,
+    repo: Annotated[ExecutionRepository, Depends(get_repo)],
 ) -> None:
     await ws.accept()
     if repo.get(execution_id) is None:
@@ -147,33 +165,41 @@ async def stream(
     last_seq = since_seq
     last_heartbeat = asyncio.get_running_loop().time()
 
+    async def _send(frame: dict) -> None:
+        # Backpressure cutoff: if a slow client cannot absorb a frame in SEND_TIMEOUT_S,
+        # close the socket with 1011 (Internal Error) and let the client reconnect with since_seq.
+        await asyncio.wait_for(ws.send_json(frame), timeout=SEND_TIMEOUT_S)
+
     try:
         while True:
             rows = list(repo.iter_events(execution_id, since_seq=last_seq, limit=500))
 
             for row in rows:
-                await ws.send_json(_frame_from_row(row))
+                await _send(_frame_from_row(row))
                 last_seq = row["seq"]
                 if row["type"] in TERMINAL_EVENT_TYPES:
-                    await ws.send_json({
+                    await _send({
                         "kind": "end",
-                        "execution_status": row["type"].split(".")[-1],
+                        "execution_status": _END_STATUS[row["type"]],
                     })
                     return
 
             now = asyncio.get_running_loop().time()
             if not rows and (now - last_heartbeat) >= HEARTBEAT_INTERVAL_S:
-                await ws.send_json({"kind": "heartbeat", "ts": _now_iso()})
+                await _send({"kind": "heartbeat", "ts": _now_iso()})
                 last_heartbeat = now
 
             await asyncio.sleep(POLL_INTERVAL_S)
     except WebSocketDisconnect:
         return
+    except asyncio.TimeoutError:
+        # Slow client — close with 1011; client reconnects with since_seq.
+        try: await ws.close(code=1011)
+        except Exception: pass
+        return
     finally:
-        try:
-            await ws.close()
-        except Exception:
-            pass
+        try: await ws.close()
+        except Exception: pass
 ```
 
 **GOTCHA — no subscriber, no race.** The old "subscribe first, replay second" dedup is gone. There is exactly one source (the DB) and `seq` is monotonic; `since_seq` + `ORDER BY seq LIMIT 500` is lossless.
@@ -183,6 +209,10 @@ async def stream(
 **GOTCHA — WebSocketDisconnect import.** `from fastapi import WebSocket, WebSocketDisconnect` (re-exported from starlette).
 
 **GOTCHA — stale connection detection.** Browsers don't always fire TCP RST on tab close. The periodic `send_json` (heartbeat or real event) is what surfaces a dead peer — it will raise `WebSocketDisconnect` or `ConnectionClosed` and the loop exits.
+
+**GOTCHA — slow-client backpressure.** A client that opens a socket but never reads will have its server coroutine stalled on `send_json` forever, holding a threadpool slot (from the sync `get_repo` dep). `SEND_TIMEOUT_S = 30` + `asyncio.wait_for` turns that into a clean 1011 close. Events remain in the DB; the client reconnects with `since_seq` and resumes.
+
+**GOTCHA — connection cap.** Every WS connection holds one threadpool thread (via `get_repo` → `get_db_conn` sync generator). With default threadpool size 40, 40 simultaneous WS connections exhaust it. For MVP this is acceptable (single-user dashboard). File as follow-up if/when a multi-tab dashboard lands.
 
 **VALIDATE**: `pytest tests/service/test_stream.py`.
 
@@ -209,6 +239,8 @@ Use FastAPI's `TestClient.websocket_connect` (sync — no pytest-asyncio needed)
 - **Live tail of a subprocess-only run (simulating plan 04)**: seed execution; INSERT events from a thread (simulating another process); assert they appear. **This test is the reason the WS reads from DB, not bus — if it passes here, it passes for subprocess workers.**
 - **Heartbeat on silence**: monkeypatch `HEARTBEAT_INTERVAL_S = 0.5`; seed running execution, no events; assert a `heartbeat` frame arrives within 1s.
 - **Client disconnect**: connect then close; assert the server coroutine exits cleanly (no zombie loop).
+- **Terminal mapping**: seed terminal event `execution.cancelled`; assert `end` frame has `execution_status == "cancelled"`. Seed `execution.completed`; assert `"succeeded"`. (Guards against the `split(".")[-1]` regression.)
+- **Slow-client backpressure**: monkeypatch `SEND_TIMEOUT_S = 0.1`; connect but don't read; assert the server closes with 1011 within 1s.
 
 **VALIDATE**: `pytest tests/service/test_stream.py -v`.
 

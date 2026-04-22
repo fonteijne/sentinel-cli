@@ -226,9 +226,14 @@ CREATE TABLE IF NOT EXISTS executions (
     ended_at          TEXT,
     cost_cents        INTEGER NOT NULL DEFAULT 0,
     error             TEXT,
-    idempotency_key   TEXT UNIQUE,                 -- nullable; set by plan 04 POST endpoint
+    idempotency_token_prefix  TEXT,                -- sha256(token)[:8]; nullable for CLI-triggered runs
+    idempotency_key   TEXT,                        -- nullable; set by plan 04 POST endpoint
     metadata_json     TEXT NOT NULL DEFAULT '{}'
 );
+-- Idempotency is scoped by token so keys from different tokens can't collide (forward-compatible with multi-user).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_idempotency
+    ON executions(idempotency_token_prefix, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_executions_ticket ON executions(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
 CREATE INDEX IF NOT EXISTS idx_executions_started ON executions(started_at DESC);
@@ -349,7 +354,20 @@ Execute in order. Each task is independently testable.
 - **GOTCHA**: **Do not keep a module-level connection**. sqlite3 connections have per-connection state (transactions, row_factory); sharing one across threads/processes corrupts state and raises `ProgrammingError`. Every repo/bus/route gets its own via dependency injection.
 - **GOTCHA**: `isolation_level=None` means *autocommit mode*. Writers MUST explicitly `BEGIN IMMEDIATE` / `COMMIT`. This prevents the Python sqlite3 driver's implicit transaction management from fighting WAL.
 - **GOTCHA**: `SENTINEL_DB_PATH` env override exists because `Path.home()` resolves differently on host vs. inside `sentinel-dev` (not bind-mounted). Ops workflows that must share a DB can point both at `/app/state/sentinel.db` (a mount the user adds).
+- **GOTCHA — validate the override**. `SENTINEL_DB_PATH` is user-controlled; an attacker or misconfig can point it at `/dev/null`, a block device, or a symlink. Reject non-regular targets at startup:
+  ```python
+  import stat as _stat
+  def get_db_path() -> Path:
+      raw = os.environ.get("SENTINEL_DB_PATH")
+      path = Path(raw).expanduser().resolve(strict=False) if raw else Path.home() / ".sentinel" / "sentinel.db"
+      if path.exists() and not _stat.S_ISREG(path.stat().st_mode):
+          raise RuntimeError(f"SENTINEL_DB_PATH must resolve to a regular file, got {path} (mode={path.stat().st_mode:o})")
+      path.parent.mkdir(parents=True, exist_ok=True)
+      return path
+  ```
+  Note `stat()` (not `lstat()`) — we follow symlinks and check the *target*; a symlink to a regular file is fine.
 - **VALIDATE**: `python -c "from src.core.persistence.db import connect, ensure_initialized; ensure_initialized(); c = connect(); c.execute('SELECT 1').fetchone()"` — no exception, `~/.sentinel/sentinel.db` created.
+- **VALIDATE**: `SENTINEL_DB_PATH=/dev/null python -c "from src.core.persistence.db import connect; connect()"` raises RuntimeError.
 
 ### Task 2 — CREATE `src/core/persistence/migrations/001_init.sql`
 
@@ -365,13 +383,14 @@ Execute in order. Each task is independently testable.
     - `ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))` — **tz-aware**, never naive `utcnow()` (deprecated in 3.12)
     - `agent: Optional[str] = None`
     - `type: str` (set by subclass via `Literal`)
-  - Subclasses override `type` with `Literal["execution.started"]`, etc. Payload fields are direct attributes (no nested `payload` dict — the WS serializer in plan 03 re-nests non-envelope fields).
-  - Discriminated union `AnyEvent = Annotated[Union[...], Field(discriminator="type")]` for typed field use; export `AnyEventAdapter = TypeAdapter(AnyEvent)` for parsing raw dicts from the DB.
+  - Subclasses override `type` with `Literal["execution.started"]`, etc. Payload fields are direct attributes (no nested `payload` dict — the WS serializer in plan 03 re-nests non-envelope fields on the way out).
+  - Discriminated union `AnyEvent = Annotated[Union[...], Field(discriminator="type")]` for typed field use; export `AnyEventAdapter = TypeAdapter(AnyEvent)` for **rehydrating events from DB rows**.
   - Constant: `TERMINAL_EVENT_TYPES: frozenset[str] = frozenset({"execution.completed","execution.failed","execution.cancelled"})`.
+- **Persistence contract (critical):** `payload_json` stores the **full** `model_dump(mode="json")` — including `type`. Excluding `type` here would break `AnyEventAdapter.validate_python(json.loads(payload_json))` because the discriminator needs it. The envelope columns (`execution_id`, `seq`, `ts`, `agent`, `type`) duplicate some of what's in `payload_json`; the duplication is intentional (columns for queries, JSON for round-trip fidelity).
 - **MIRROR**: pydantic v2 usage in `src/agents/*` (already v2 across codebase).
 - **GOTCHA**: Event `type` strings are persisted — never rename. Additions are fine.
 - **GOTCHA**: `datetime.utcnow()` is deprecated and returns naive datetimes; a naive/aware mix breaks comparisons. Always `datetime.now(timezone.utc)`.
-- **VALIDATE**: `python -c "from src.core.events.types import ExecutionStarted, TERMINAL_EVENT_TYPES; e = ExecutionStarted(execution_id='x', kind='execute', ticket_id='T-1', project='P'); assert e.ts.tzinfo is not None"` — passes.
+- **VALIDATE**: `python -c "from src.core.events.types import ExecutionStarted, TERMINAL_EVENT_TYPES, AnyEventAdapter; import json; e = ExecutionStarted(execution_id='x', kind='execute', ticket_id='T-1', project='P'); dumped = e.model_dump_json(); rehydrated = AnyEventAdapter.validate_python(json.loads(dumped)); assert rehydrated.ts.tzinfo is not None and rehydrated.type == 'execution.started'"` — passes.
 
 ### Task 4 — CREATE `src/core/events/bus.py`
 
@@ -393,12 +412,13 @@ Execute in order. Each task is independently testable.
                       (event.execution_id,),
                   ).fetchone()
                   seq = row[0] + 1
+                  # Persist the FULL dump (including `type`) so AnyEventAdapter can rehydrate from payload_json alone.
+                  # Envelope columns duplicate a few fields for query speed; source of truth is payload_json.
                   self._conn.execute(
                       "INSERT INTO events(execution_id, seq, ts, agent, type, payload_json) "
                       "VALUES (?, ?, ?, ?, ?, ?)",
                       (event.execution_id, seq, event.ts.isoformat(), event.agent,
-                       event.type, event.model_dump_json(
-                           exclude={"execution_id","ts","agent","type"})),
+                       event.type, event.model_dump_json()),
                   )
                   self._conn.execute("COMMIT")
               except Exception:
@@ -425,25 +445,38 @@ Execute in order. Each task is independently testable.
 
 ### Task 5 — CREATE `src/core/execution/models.py`
 
-- **ACTION**: `ExecutionStatus` (str enum: queued/running/succeeded/failed/cancelled) and `Execution` pydantic model mirroring the `executions` columns.
-- **VALIDATE**: `python -c "from src.core.execution.models import Execution, ExecutionStatus"`.
+- **ACTION**: `ExecutionStatus` (str enum: `queued | running | cancelling | succeeded | failed | cancelled` — **all six**, per §ExecutionStatus enum above) and `ExecutionKind` (str enum: `plan | execute | debrief`) and `Execution` pydantic model mirroring the `executions` columns.
+- **VALIDATE**: `python -c "from src.core.execution.models import Execution, ExecutionStatus, ExecutionKind; assert ExecutionStatus.CANCELLING.value == 'cancelling'"`.
 
 ### Task 6 — CREATE `src/core/execution/repository.py`
 
 - **ACTION**: CRUD + lifecycle transitions over `executions`, `events`, `agent_results`.
-- **IMPLEMENT**: Methods (all accept a `sqlite3.Connection` via constructor or per-call — pick one, stay consistent):
-  - `create(ticket_id, project, kind, idempotency_key=None) -> Execution`
+- **Constructor contract**: `ExecutionRepository(conn: sqlite3.Connection)` — caller owns the connection lifetime. Every repo instance is bound to one connection. **Never share a connection across threads** — FastAPI's `get_db_conn` creates one per request; the worker creates one; the supervisor takes a `connection_factory`, not a single conn (see plan 04).
+- **Methods:**
+  - `create(ticket_id, project, kind, idempotency_key=None, idempotency_token_prefix=None) -> Execution`
   - `get(id) -> Optional[Execution]`
-  - `find_by_idempotency_key(key) -> Optional[Execution]` — used by plan 04's `POST /executions` to dedupe retries
+  - `find_by_idempotency(token_prefix, key) -> Optional[Execution]` — token-scoped; `(token_prefix, key)` is the unique tuple
   - `list(*, project=None, ticket_id=None, status=None, kind=None, before=None, limit=50) -> list[Execution]`
   - `set_status(id, status, error=None)` / `set_phase(id, phase)`
   - `add_cost(id, cents)` — atomic `UPDATE executions SET cost_cents = cost_cents + ?`
   - `record_agent_result(id, agent, result_dict)` / `list_agent_results(id) -> list[dict]`
   - `record_ended(id, status, error=None)` — sets `ended_at = now`, `status`, and `error`
-  - `iter_events(execution_id, since_seq=0, limit=500) -> Iterator[EventRow]` — generator used by plan 02's GET events and plan 03's WebSocket tail
-  - `latest_event_seq(execution_id) -> int` — used by plan 03 to bound live delivery vs replay
+  - `iter_events(execution_id, since_seq=0, limit=500) -> Iterator[EventRow]` — yields `EventRow` objects
+  - `latest_event_seq(execution_id) -> int`
+  - `mark_metadata(id, **kv)` — shallow-merges into `metadata_json`; used for `retry_of`, `compose_projects`, `post_mortem_complete`
+- **`EventRow` shape** (stable contract; plan 02 and plan 03 both consume):
+  ```python
+  class EventRow(TypedDict):
+      seq: int
+      ts: str              # ISO-8601 string from DB; consumers parse if they need datetime
+      agent: Optional[str]
+      type: str
+      payload: dict        # already-parsed from payload_json (not the raw string)
+  ```
+  `iter_events` does the `json.loads(payload_json)` itself — consumers never touch the raw string.
 - **GOTCHA**: Always write `metadata_json` as JSON string, never None — schema default is `'{}'` but code should be explicit.
 - **GOTCHA**: Writers wrap multi-statement operations in `BEGIN IMMEDIATE` / `COMMIT`. Readers don't need transactions (WAL snapshot isolation).
+- **GOTCHA — `find_by_idempotency` semantics**: returns the existing row regardless of its terminal status. A POST with a previously-used `(token_prefix, key)` does NOT re-run a failed execution; caller uses `POST /executions/{id}/retry` for that.
 - **VALIDATE**: `pytest tests/core/test_execution_repository.py`.
 
 ### Task 7 — CREATE `src/core/execution/orchestrator.py`

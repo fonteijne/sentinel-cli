@@ -73,6 +73,8 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 from starlette.websockets import WebSocket
 
+from fastapi import WebSocketException                   # re-export of starlette.exceptions
+
 logger = logging.getLogger(__name__)
 
 TOKEN_FILE = Path.home() / ".sentinel" / "service_token"
@@ -85,14 +87,18 @@ def load_or_create_token() -> str:
         return TOKEN_FILE.read_text().strip()
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(32)
-    # Atomic create: O_EXCL fails if another process got here first; mode bits applied before write.
-    fd = os.open(TOKEN_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        os.write(fd, token.encode("ascii"))
-    finally:
-        os.close(fd)
-    logger.warning("generated new service token at %s", TOKEN_FILE)
-    return token
+        # Atomic create: O_EXCL fails if another process raced us; mode bits applied before write.
+        fd = os.open(TOKEN_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, token.encode("ascii"))
+        finally:
+            os.close(fd)
+        logger.warning("generated new service token at %s", TOKEN_FILE)
+        return token
+    except FileExistsError:
+        # Another process won the race and wrote the file — read theirs.
+        return TOKEN_FILE.read_text().strip()
 
 def _extract_bearer(request: Request | WebSocket) -> str:
     # HTTP: require Authorization header.
@@ -118,9 +124,12 @@ async def require_token_ws(ws: WebSocket) -> str:
     expected = ws.app.state.service_token
     presented = _extract_bearer(ws)
     if not presented or not secrets.compare_digest(presented, expected):
-        # Starlette: close BEFORE accept produces handshake-time 403
-        await ws.close(code=1008)                      # 1008 = Policy Violation
-        raise HTTPException(status_code=403, detail="unauthorized")
+        logger.warning("ws auth failure from %s path=%s",
+                       ws.client.host if ws.client else "?", ws.url.path)
+        # WebSocketException is FastAPI's re-export of starlette's; it surfaces as a clean
+        # close with the given code instead of a stack trace (HTTPException doesn't work on
+        # WS — the socket is already closed by the time the exception bubbles).
+        raise WebSocketException(code=1008)             # 1008 = Policy Violation
     return presented
 ```
 
@@ -128,15 +137,15 @@ async def require_token_ws(ws: WebSocket) -> str:
 
 **GOTCHA — atomic token creation**. `O_CREAT | O_EXCL` with `mode=0o600` at creation avoids the write→chmod window where the file is briefly world-readable. If another process got here first, we raise — caller (the CLI) should retry via the existing-file branch.
 
-**GOTCHA — WebSocket auth status codes**. FastAPI/Starlette WS handshake failures produce 403, not 401 (HTTP semantic mismatch). Tests assert 403 on WS + 401 on HTTP. This is correct behavior, not a bug.
+**GOTCHA — WebSocket auth close codes**. The WS dep raises `WebSocketException(code=1008)`, not `HTTPException`. Starlette translates the close code to an HTTP 403 *during the handshake* (before the upgrade completes), which is what the client sees. Tests assert 403 handshake-level for WS + 401 for HTTP.
 
 **GOTCHA — token in query string**. `?token=` lands in access logs / reverse-proxy logs / browser history. Document and gate behind WS-only; HTTP never accepts query-string token.
 
 **VALIDATE**: Unit tests in Task 6.
 
-### Task 1b — CREATE `src/service/rate_limit.py`
+### Task 1b — CREATE `src/service/rate_limit.py` + wire into write endpoints
 
-Sliding-window per-token counters held in memory (single-process). Persisted? No — restart resets them, which is fine for a throttle.
+Sliding-window per-token counters held in memory (single-process, non-persistent — restart resets).
 
 ```python
 class TokenRateLimiter:
@@ -144,25 +153,79 @@ class TokenRateLimiter:
         self._max_concurrent = max_concurrent
         self._max_per_min = max_per_minute
         self._in_flight: dict[str, int] = defaultdict(int)
-        self._window: dict[str, deque[float]] = defaultdict(deque)
+        self._window:    dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
     def check_and_reserve(self, token_key: str) -> tuple[bool, int]:
-        # returns (allowed, retry_after_seconds_if_denied)
-        ...
+        """Returns (allowed, retry_after_seconds_if_denied)."""
+        with self._lock:
+            now = time.monotonic()
+            # prune window
+            w = self._window[token_key]
+            while w and now - w[0] > 60.0:
+                w.popleft()
+            # check windowed
+            if len(w) >= self._max_per_min:
+                retry = int(60.0 - (now - w[0])) + 1
+                return (False, retry)
+            # check concurrent
+            if self._in_flight[token_key] >= self._max_concurrent:
+                return (False, 1)                      # retry in ~1s; concurrent slot frees on release
+            # reserve
+            w.append(now)
+            self._in_flight[token_key] += 1
+            return (True, 0)
 
-    def release(self, token_key: str) -> None: ...
+    def release(self, token_key: str) -> None:
+        with self._lock:
+            self._in_flight[token_key] = max(0, self._in_flight[token_key] - 1)
 ```
 
-Keyed by the **token itself** (sha256 prefix; never the raw token in logs). A single token is a single subject in this plan's trust model.
+Keyed by **sha256(token)[:8]** — same helper used for audit logs; never the raw token.
 
-`check_and_reserve` called before the route handler; `release` in a `finally`. Wire as a FastAPI dependency that wraps `require_token`.
+### Wiring the limiter
+
+The limiter is applied **only to the write router** (`commands.router` from plan 04). Read and stream routes are exempt by design — polling a read endpoint from a dashboard is expected to exceed 30/minute.
+
+The wiring lives in plan 05's `auth.py`:
+
+```python
+# auth.py
+def require_token_and_write_slot(request: Request) -> str:
+    token = require_token(request)                      # existing dep; raises 401
+    key = _sha256_prefix(token)
+    allowed, retry_after = request.app.state.rate_limiter.check_and_reserve(key)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="rate limit", headers={"Retry-After": str(retry_after)})
+    # Release on response finish via BackgroundTask
+    request.state.release_rl = lambda: request.app.state.rate_limiter.release(key)
+    return token
+
+# Middleware that runs `release_rl` after the response
+class ReleaseRateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        release = getattr(request.state, "release_rl", None)
+        if release: release()
+        return response
+```
+
+In `create_app()` (this plan's Task 2):
+```python
+# Apply limiter to write router (plan 04) only
+http_write_protected = APIRouter(dependencies=[Depends(require_token_and_write_slot)])
+http_write_protected.include_router(commands.router)
+app.include_router(http_write_protected)
+app.add_middleware(ReleaseRateLimitMiddleware)
+```
+
+**GOTCHA**: If the route handler raises, `call_next` still returns (FastAPI converts to 500); `release` runs. If the middleware itself fails mid-dispatch, the concurrent slot leaks until next process restart. Acceptable for an in-memory limiter.
 
 Defaults from config (see Task 5):
 - `service.rate_limits.max_concurrent`: 3
 - `service.rate_limits.max_per_minute`: 30
 
-**VALIDATE**: Unit test concurrent + windowed limits.
+**VALIDATE**: Unit test concurrent + windowed limits; integration test that a 4th concurrent `POST /executions` with the same token returns 429 with `Retry-After`.
 
 ### Task 2 — UPDATE `src/service/app.py` (this plan owns the final factory)
 
@@ -219,17 +282,22 @@ def create_app() -> FastAPI:
         conn.execute("SELECT 1").fetchone()
         return {"status": "ok", "db": "ok"}
 
-    # Protected HTTP routes (bearer auth + rate limit)
-    http_protected = APIRouter(dependencies=[Depends(require_token)])
-    http_protected.include_router(executions.router)      # plan 02 (read)
-    http_protected.include_router(commands.router)        # plan 04 (write)
-    app.include_router(http_protected)
+    # Read-only HTTP routes: bearer auth, no rate limit
+    http_read_protected = APIRouter(dependencies=[Depends(require_token)])
+    http_read_protected.include_router(executions.router)         # plan 02 (read)
+    app.include_router(http_read_protected)
 
-    # Protected WebSocket — separate dep because Starlette raises differently on WS
+    # Write HTTP routes: bearer auth + per-token concurrent/minute rate limit
+    http_write_protected = APIRouter(dependencies=[Depends(require_token_and_write_slot)])
+    http_write_protected.include_router(commands.router)          # plan 04 (write)
+    app.include_router(http_write_protected)
+
+    # WebSocket: separate dep because Starlette raises differently on WS
     ws_protected = APIRouter(dependencies=[Depends(require_token_ws)])
-    ws_protected.include_router(stream.router)            # plan 03 (stream)
+    ws_protected.include_router(stream.router)                    # plan 03 (stream)
     app.include_router(ws_protected)
 
+    app.add_middleware(ReleaseRateLimitMiddleware)                # releases concurrent slot after each write response
     return app
 ```
 
