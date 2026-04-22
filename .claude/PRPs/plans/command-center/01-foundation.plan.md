@@ -284,8 +284,12 @@ Each is a pydantic model with `execution_id`, `ts`, `agent` (opt), and a typed p
 - `FindingPosted` — `{severity, summary}`
 - `CostAccrued` — `{tokens_in, tokens_out, cents}` — emitted by `AgentSDKWrapper` after each SDK call; Orchestrator subscribes and calls `repo.add_cost`
 
+**Interactive / revision:**
+- `DebriefTurn` — `{turn_index, prompt_chars, response_chars}` — one per debrief round-trip (Jira conversation loop).
+- `RevisionRequested` — `{revise_of_execution_id, reason}` — emitted when `execute --revise` starts; cross-links the new execution to its source. See plan 01 Task 10 for same-row-vs-linked-child decision (we create a linked child; `retry_of` already proves the pattern).
+
 **Error-class differentiation:**
-- `RateLimited` — `{retry_after_s}` — Anthropic 429/529 or equivalent; distinguishes "throttled, still runnable" from `ExecutionFailed`
+- `RateLimited` — `{retry_after_s}` — Anthropic 429/529 or equivalent. **Observational only; does NOT transition `ExecutionStatus`.** Run stays `running`; orchestrator handles backoff.
 
 **Constants to export from `types.py`:**
 ```python
@@ -321,6 +325,8 @@ Used in the `executions.kind` column and in plan 04's `POST /executions` body. P
 - **Migrating `~/.sentinel/sessions.json` into the DB** — coexistence only; a follow-up plan can subsume it.
 - **Changing agent behaviour** — no agent output changes.
 - **Retention / archival of `events` and `agent_results`** — deferred. Add `idx_events_ts` now so a future sweep is fast; no TTL yet.
+- **`succeeded_with_warnings` status** — today binary success/failure. If post-implementation work (e.g. GitLab push) fails after agents succeeded, we mark `failed` with the error message; operators read findings/warnings via `agent_results` and `events`.
+- **Forced post-mortem re-run** — operators who need to force re-cleanup of a terminal row do it via `sqlite3 'UPDATE executions SET metadata_json = json_remove(metadata_json, "$.post_mortem_complete") WHERE id = ?'` and restart the service. No endpoint.
 
 ---
 
@@ -403,7 +409,21 @@ Execute in order. Each task is independently testable.
           self._subscribers: list[Callable[[SentinelEvent], None]] = []
           self._seq_lock = threading.Lock()       # serializes seq allocation within this process
 
+      MAX_PAYLOAD_BYTES = 64 * 1024                     # 64 KiB hard cap per event
+
       def publish(self, event: SentinelEvent) -> None:
+          payload = event.model_dump_json()
+          if len(payload) > self.MAX_PAYLOAD_BYTES:
+              # Oversized payload (runaway agent response): truncate rather than drop.
+              # Dashboard can distinguish via the _truncated marker.
+              truncated = {**event.model_dump(), "_truncated": True,
+                           "_original_bytes": len(payload)}
+              # Best-effort: shrink the biggest string field (usually a response dump).
+              for k, v in list(truncated.items()):
+                  if isinstance(v, str) and len(v) > 4096:
+                      truncated[k] = v[:4096] + "…"
+              payload = json.dumps(truncated)[:self.MAX_PAYLOAD_BYTES]
+
           with self._seq_lock:
               self._conn.execute("BEGIN IMMEDIATE")
               try:
@@ -418,7 +438,7 @@ Execute in order. Each task is independently testable.
                       "INSERT INTO events(execution_id, seq, ts, agent, type, payload_json) "
                       "VALUES (?, ?, ?, ?, ?, ?)",
                       (event.execution_id, seq, event.ts.isoformat(), event.agent,
-                       event.type, event.model_dump_json()),
+                       event.type, payload),
                   )
                   self._conn.execute("COMMIT")
               except Exception:
@@ -441,6 +461,7 @@ Execute in order. Each task is independently testable.
 - **GOTCHA — subscriber exceptions MUST NOT bubble**. A dashboard-side bug cannot be allowed to crash a run.
 - **GOTCHA — the `_seq_lock` is process-local**. Two processes (e.g. the service and a plan-04 subprocess worker) each hold their own bus with their own lock — but SQLite's `BEGIN IMMEDIATE` serializes the writes at the DB level, so `seq` stays monotonic per `execution_id` across processes. The in-memory subscriber list, however, is **not** cross-process. Plan 03's live WebSocket tail therefore reads from the DB, not via `subscribe()`. Keep bus subscription for local consumers only (e.g., the CLI's human-readable log adapter in Task 10).
 - **GOTCHA — subscribers run on the publishing thread**. If a subscriber does real work it blocks other publishers waiting on the lock? No — lock is released before dispatch. But a slow subscriber still ties up the publishing thread. Subscribers that bridge to asyncio (none in plan 01; relevant for plan 03) must do only `loop.call_soon_threadsafe(...)` and return immediately.
+- **GOTCHA — payload size cap**. `MAX_PAYLOAD_BYTES=65536` prevents a rogue agent response from filling the DB. On overflow we truncate the largest string field and mark `_truncated: true` — the dashboard can show a placeholder and a link to the full response (future: worker-log GET in plan 06).
 - **VALIDATE**: `pytest tests/core/test_event_bus.py` — see Task 12.
 
 ### Task 5 — CREATE `src/core/execution/models.py`
@@ -453,7 +474,7 @@ Execute in order. Each task is independently testable.
 - **ACTION**: CRUD + lifecycle transitions over `executions`, `events`, `agent_results`.
 - **Constructor contract**: `ExecutionRepository(conn: sqlite3.Connection)` — caller owns the connection lifetime. Every repo instance is bound to one connection. **Never share a connection across threads** — FastAPI's `get_db_conn` creates one per request; the worker creates one; the supervisor takes a `connection_factory`, not a single conn (see plan 04).
 - **Methods:**
-  - `create(ticket_id, project, kind, idempotency_key=None, idempotency_token_prefix=None) -> Execution`
+  - `create(ticket_id, project, kind, *, options: dict | None = None, idempotency_key: str | None = None, idempotency_token_prefix: str | None = None) -> Execution` — `options` is shallow-written into `metadata_json` under key `options`; everything else keyed explicitly.
   - `get(id) -> Optional[Execution]`
   - `find_by_idempotency(token_prefix, key) -> Optional[Execution]` — token-scoped; `(token_prefix, key)` is the unique tuple
   - `list(*, project=None, ticket_id=None, status=None, kind=None, before=None, limit=50) -> list[Execution]`
@@ -483,7 +504,9 @@ Execute in order. Each task is independently testable.
 
 - **ACTION**: Lift orchestration from `cli.execute` (cli.py:478–1009), `cli.plan` (cli.py:89–181), `cli.debrief` (cli.py:197–280) into three methods on `Orchestrator`.
 - **IMPLEMENT**:
-  - `__init__(self, repo, bus, session_tracker, config)`
+  - `__init__(self, repo, bus, session_tracker, config)`:
+    - Register `_cost_subscriber`: `self._bus.subscribe(lambda e: self._repo.add_cost(e.execution_id, e.cents) if e.type == "cost.accrued" else None)`.
+    - This is the **one mandatory Orchestrator subscriber**; others are optional (CLI log adapter, dashboard notifier).
   - `plan(ticket_id, project, **opts) -> Execution`
   - `execute(ticket_id, project, **opts) -> Execution`
   - `debrief(ticket_id, project, **opts) -> Execution`
@@ -511,9 +534,9 @@ Execute in order. Each task is independently testable.
   - On each SDK tool_use: publish `ToolCalled(tool, args_summary)`.
   - On each SDK response with usage info: publish `CostAccrued(tokens_in, tokens_out, cents)`. Compute cents using the project's existing cost table if present; otherwise `cents=0` and only the token counts are carried (still observable).
   - On 429/529 / rate-limit exception: publish `RateLimited(retry_after_s)` before re-raising or backing off.
-  - Ensure `_write_diagnostic` continues to fire with the same shape — ideally both paths share a single `entry_dict()` helper so JSONL and bus carry identical payloads. Add a test asserting equality for one representative event.
-- **GOTCHA — cost as a column needs a writer**. `executions.cost_cents` is useless without `CostAccrued` events flowing; an Orchestrator-side subscriber does `repo.add_cost(execution_id, cents)` for every one. Wire that in Task 7.
-- **VALIDATE**: Existing diagnostics.jsonl output unchanged; new `ToolCalled` / `CostAccrued` rows appear in `events` when executed via Orchestrator; `SELECT SUM(cost_cents) FROM executions` > 0 after a real run.
+  - **Single `entry_dict()` helper MUST back both `_write_diagnostic` JSONL output and `bus.publish`.** Helper lives in `src/agent_sdk_wrapper.py` (same module already owns `_write_diagnostic`). Both paths call it; no drift possible by construction. Named test in Task 11: `tests/test_agent_sdk_wrapper.py::test_entry_dict_jsonl_bus_parity` — builds one event, asserts the JSONL line and the `events.payload_json` row decode to the same dict.
+- **GOTCHA — cost as a column needs a writer**. `executions.cost_cents` is useless without `CostAccrued` events flowing; an Orchestrator-side subscriber does `repo.add_cost(execution_id, cents)` for every one. Wire that in Task 7: Orchestrator `__init__` registers `bus.subscribe(_cost_subscriber)`.
+- **VALIDATE**: Existing diagnostics.jsonl output unchanged; new `ToolCalled` / `CostAccrued` rows appear in `events` when executed via Orchestrator; `SELECT SUM(cost_cents) FROM executions` > 0 after a real run; `tests/test_agent_sdk_wrapper.py::test_entry_dict_jsonl_bus_parity` passes.
 
 ### Task 10 — UPDATE `src/cli.py` (plan / execute / debrief)
 

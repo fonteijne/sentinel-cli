@@ -111,6 +111,41 @@ Suggested branch names:
 
 ---
 
+## Environment variables
+
+Single index of env vars read by the stack; each is documented in its owning plan.
+
+| Variable | Read by | Owning plan | Purpose |
+|---|---|---|---|
+| `SENTINEL_DB_PATH` | CLI, service, worker | 01 | Override default `~/.sentinel/sentinel.db`; validated non-regular rejected |
+| `SENTINEL_SERVICE_TOKEN` | service startup | 05 | Overrides the on-disk service token |
+| `SENTINEL_SERVICE_URL` | CLI `--remote` | 04 | Default base URL for `sentinel execute --remote` (fallback: `http://127.0.0.1:8787`) |
+
+All YAML config keys live under `service.*` in `config/config.yaml`:
+`service.bind_address`, `service.port`, `service.cors_origins`, `service.rate_limits.max_concurrent`, `service.rate_limits.max_per_minute`.
+
+## Migration numbering
+
+Migrations live in `src/core/persistence/migrations/NNN_name.sql`, applied in ascending order, recorded in `schema_migrations`. Never reuse a version number.
+
+| Plan | Migration | Introduces |
+|---|---|---|
+| 01 | `001_init.sql` | `schema_migrations`, `executions`, `events`, `agent_results` |
+| 04 | `002_workers.sql` | `workers` (heartbeat/PID/compose_projects) |
+| later | `003_*.sql` onward | future plans claim in PR-merge order |
+
+Forward-only. No rollback mechanism today — documented as debt.
+
+## Backup
+
+`~/.sentinel/sentinel.db` is WAL-enabled: the file is accompanied by `sentinel.db-wal` and `sentinel.db-shm`. A correct backup is any one of:
+
+- `sqlite3 /path/to/sentinel.db ".backup '/path/to/backup.db'"` (online-safe; preferred)
+- `PRAGMA wal_checkpoint(TRUNCATE);` on the live DB, then `cp sentinel.db backup.db` (brief pause acceptable)
+- Copy all three files atomically (filesystem snapshot)
+
+A `cp sentinel.db backup.db` without any of the above produces a **corrupt** restore. Document this in ops runbooks.
+
 ## Explicitly NOT in any of these plans
 
 - Dashboard UI (HTML/React/anything rendered)
@@ -126,6 +161,10 @@ Suggested branch names:
 - Retention / archival of `events` and `agent_results` — `idx_events_ts` is in place; sweep is follow-up
 - Schema migration rollback — forward-only today
 - Log rotation for `logs/workers/*.log` — ops concern
+- `succeeded_with_warnings` status — binary success/failure today; post-implementation warnings (e.g. GitLab push failure after agents succeeded) surface as `failed` with error + `agent_results` content; operators read via plan 02 GET
+- `RateLimited` does not transition status — it's observational; runs stay `running` and the orchestrator handles backoff
+- Forced re-run of a completed post-mortem — no endpoint; operators use `sqlite3` to clear the `post_mortem_complete` metadata flag and restart the service
+- Windows deployment — POSIX-only target (`O_EXCL | 0o600` semantics, Docker, SIGTERM/SIGKILL behavior)
 
 ---
 
@@ -137,3 +176,5 @@ These are not bugs; they are deliberate scope decisions.
 - **DooD test limits.** Worker paths that spawn `docker compose` cannot run from the Claude Code sandbox (no Docker CLI). Unit tests mock the subprocess; end-to-end validation happens in `sentinel-dev`.
 - **Single-instance assumption.** No HA deploy story. Startup reconciliation will false-fail a peer's in-flight workers if two services target the same DB.
 - **Session-completion rituals** — CLAUDE.md's "Landing the Plane" (quality gates, bd sync, push) applies to every track. Not re-specified in individual plans.
+- **SQLite JSON1 required.** `list_post_mortem_incomplete`, `register_compose_project`, and metadata merges use `json_extract`/`json_set`/`json_insert`. JSON1 is compiled into CPython's `sqlite3` module on official builds for Linux/macOS since 3.9; `ensure_initialized()` asserts it on startup.
+- **FastAPI ≥ 0.110** (pinned). Router-level `dependencies=[Depends(...)]` on WebSocket routes is relied on (plan 03, 05); behavior before 0.100 was inconsistent.

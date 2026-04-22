@@ -31,7 +31,7 @@ After plans 01–03 the service is observe-only. Runs still start from the CLI a
 | Type | NEW_CAPABILITY |
 | Complexity | MEDIUM |
 | Systems Affected | `src/core/execution/worker.py` + `supervisor.py` (new), `src/core/persistence/migrations/002_workers.sql` (new), `src/service/routes/commands.py` (new), `src/service/deps.py`, `src/cli.py`, `src/utils/logging_config.py` (new) |
-| Dependencies | stdlib `multiprocessing` + `signal` + `httpx` (already in requests-family deps, but httpx preferred for the CLI `--remote` path — or stay on `requests`) |
+| Dependencies | stdlib `multiprocessing` + `signal` + `httpx` (or stay on `requests`). **Plan 02's `fastapi` pin must be `>=0.100`** — needed for `APIRouter(dependencies=[...])` to apply to WebSocket routes (plan 03/05). |
 | Estimated Tasks | 9 |
 | Prerequisite | Plan 01 (Foundation) + Plan 02 (Read API; the FastAPI app factory must exist). Plan 05 still owns the final `create_app()` composition. |
 
@@ -47,7 +47,7 @@ After plans 01–03 the service is observe-only. Runs still start from the CLI a
 
 All three are declared with explicit `status_code=202` on the FastAPI route decorator (default is 200).
 
-All accept an optional `Idempotency-Key` header. If present, repo's `find_by_idempotency_key` returns the existing execution instead of creating a new one; response is the same shape but the `seq` counter / subprocess is not started again.
+All accept an optional `Idempotency-Key` header. If present, repo's `find_by_idempotency` returns the existing execution instead of creating a new one; response is the same shape but the `seq` counter / subprocess is not started again.
 
 All are async: the endpoint returns immediately after queueing; real progress is observed via plan 03's stream or plan 02's GET events.
 
@@ -103,7 +103,7 @@ Exceeding either returns `429` with `Retry-After`. Configured under `service.rat
 | `src/core/execution/supervisor.py` | CREATE — `Supervisor` class |
 | `src/service/routes/commands.py` | CREATE — three endpoints |
 | `src/service/routes/__init__.py` | UPDATE — export `commands.router` |
-| `src/core/execution/repository.py` | UPDATE — extend with `get_worker`, `set_worker_heartbeat`, `mark_metadata` helpers |
+| `src/core/execution/repository.py` | UPDATE — extend with `get_worker`, `set_worker_heartbeat`, `list_post_mortem_incomplete`, `mark_metadata`, `register_compose_project` |
 | `src/service/deps.py` | UPDATE — `get_supervisor()` dependency + `lifespan` helper |
 | `src/utils/logging_config.py` | CREATE — `configure_logging()` used by CLI, service, and worker |
 | `src/cli.py` | UPDATE — `execute --remote [--follow]` flag posts to local service with bearer auth |
@@ -121,18 +121,24 @@ Exceeding either returns `429` with `Retry-After`. Configured under `service.rat
 
 - Start method: `multiprocessing.get_context("spawn")` to avoid inheriting uvicorn's open fds / FastAPI state.
 - Entry: `python -m src.core.execution.worker --execution-id <id>` (also allow in-process spawn for tests via the context API).
-- **Env allowlist (not inheritance-by-default)**: Supervisor builds the child env explicitly rather than passing the parent env wholesale. `spawn()` passes `env={...}` to `Process`. Allowlist:
-  - `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ` — baseline system.
-  - `DOCKER_HOST`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY` — DooD requirements.
-  - `SENTINEL_*` — Sentinel config.
-  - `JIRA_*`, `GITLAB_*`, `ANTHROPIC_*` — external API credentials the orchestrator actually needs.
-  - Everything else is dropped. If a future dep needs a var, it gets explicitly added to the allowlist.
+- **Env allowlist (not inheritance-by-default)**: Supervisor builds the child env explicitly rather than passing the parent env wholesale. `spawn()` passes `env={...}` to `Process`. Implementation uses **prefix matching**, not exact names — a prefix list plus a few exact vars.
+  - Exact: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `DOCKER_HOST`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`.
+  - Prefixes: `SENTINEL_`, `JIRA_`, `GITLAB_`, `ANTHROPIC_`, `CLAUDE_`, `XDG_`.
+  - `CLAUDE_*` and `XDG_*` are required for claude-agent-sdk's subscription-mode auth cache under `~/.claude/`.
+  - Everything else is dropped. Adding a var = add to this list explicitly.
+  ```python
+  _ENV_EXACT = {"PATH","HOME","LANG","LC_ALL","TZ","DOCKER_HOST","DOCKER_CERT_PATH","DOCKER_TLS_VERIFY"}
+  _ENV_PREFIXES = ("SENTINEL_","JIRA_","GITLAB_","ANTHROPIC_","CLAUDE_","XDG_")
+  def _build_worker_env() -> dict[str, str]:
+      return {k: v for k, v in os.environ.items()
+              if k in _ENV_EXACT or k.startswith(_ENV_PREFIXES)}
+  ```
 - cwd: repository root (`/app` in sentinel-dev) — the orchestrator itself sets worktree cwd via its existing logic.
 - Exit code: 0 on `ExecutionStatus.SUCCEEDED`, non-zero otherwise. Supervisor reads row status; exit code is a sanity check.
 - **Logs:** worker's `main()` calls `configure_logging()` *first* (before importing anything heavy). `spawn` re-imports the process — `basicConfig` at `cli.py` module top does NOT run in the child. The worker also re-initializes the structured diagnostic file path so `logs/agent_diagnostics.jsonl` keeps being written.
 - **Heartbeat:** a daemon thread inside the worker `UPDATE workers SET last_heartbeat_at = now WHERE execution_id = ?` every 5s. Heartbeat writes use their own connection, `BEGIN IMMEDIATE` + `COMMIT`, `busy_timeout=30000`. The thread checks a `threading.Event` between iterations and exits cleanly on shutdown so SIGTERM doesn't abruptly sever a write.
-- **Child containers — pre-registration ordering**. When the worker is about to start a per-ticket stack (`docker compose up -p sentinel-<ticket>`), it **first** appends the project name to `executions.metadata_json.compose_projects[]` (`repo.mark_metadata`), commits, **then** invokes `docker compose up`. If the worker dies between the metadata write and `up`, reconciliation sees a project name with no containers — `docker compose down` is a no-op. If the worker dies between `up` and the next metadata write, the name is already recorded and cleanup runs. **The only leak window is between `up` starting and the registry write, which is now closed.**
-- **`workers.compose_projects` column duplication:** the same list lives in `workers.compose_projects` (plan 04's migration 002) AND `executions.metadata_json.compose_projects[]`. The `workers` row is source of truth during the run (deleted on reap); the `metadata_json` copy is the archival record used by reconciliation after the worker row is gone. `repo.mark_metadata` writes to both atomically.
+- **Child containers — pre-registration ordering**. When the worker is about to start a per-ticket stack (`docker compose up -p sentinel-<ticket>`), it **first** calls `repo.register_compose_project(execution_id, project_name)`, **then** invokes `docker compose up`. If the worker dies before `up`: reconciliation sees a registered name with no containers; `docker compose down` is a no-op. If the worker dies after `up`: name is already recorded, cleanup runs. The only leak window is between `up` starting and the registry write, which is now closed.
+- **`workers.compose_projects` column duplication:** the same list lives in `workers.compose_projects` (migration 002) AND `executions.metadata_json.compose_projects[]` (plan 01). `workers` is source of truth during the run (deleted on reap); `metadata_json` is the archival record used by reconciliation after the worker row is gone. A dedicated method `repo.register_compose_project(execution_id, project_name)` writes to **both tables in one `BEGIN IMMEDIATE`** — no drift window.
 
 ## Cancellation & cleanup
 
@@ -328,7 +334,10 @@ class Supervisor:
         self._lock = threading.Lock()
         self._connection_factory = connection_factory
 
-    # Every method that touches _workers is @_locked.
+    # Every method that touches _workers is @_locked: spawn, cancel, reap,
+    # adopt_or_reconcile_on_startup, shutdown. post_mortem is NOT locked
+    # (reentrant from reap/reconciliation; uses its own connection; never
+    # touches self._workers).
     @_locked
     def spawn(self, execution_id: str) -> None:
         env = _build_worker_env()                             # allowlist, see Worker Process Model
@@ -362,8 +371,15 @@ class Supervisor:
     @_locked
     def adopt_or_reconcile_on_startup(self) -> tuple[int, int]: ...
 
+    @_locked
+    def shutdown(self) -> None:
+        """Called from lifespan teardown AND from startup-failure except branch."""
+        for eid in list(self._workers):
+            self.cancel(eid)                                   # cancel() is @_locked — safe because we hold it via RLock
+        self._workers.clear()
+
     def post_mortem(self, execution_id: str) -> None:
-        # Not locked — reentrant; uses its own connection
+        # Not locked — reentrant; uses its own connection. MUST NOT touch self._workers.
         with self._connection_factory() as conn:
             ...                                                # see "Cancellation & cleanup" section above
 
@@ -373,13 +389,36 @@ class Supervisor:
         except ProcessLookupError: return False
 ```
 
+`_lock` is declared as `threading.RLock()` so that `shutdown()` can call `cancel()` which is also `@_locked` without deadlocking.
+
 **`@_locked` applies to**: `spawn`, `cancel`, `reap`, `adopt_or_reconcile_on_startup`. `post_mortem` does NOT hold the lock — it's called from `reap` (already locked) and from reconciliation (locked) and opens its own connection, so reentrancy is intentional.
 
 **Repository extension** (update `src/core/execution/repository.py` from plan 01):
-Add three methods:
 - `get_worker(execution_id) -> Optional[WorkerRow]` — SELECT from `workers` table; returns `WorkerRow(execution_id, pid, started_at, last_heartbeat_at, compose_projects)` TypedDict/dataclass, `last_heartbeat_at` parsed to tz-aware datetime.
-- `list_post_mortem_incomplete() -> list[Execution]` — returns terminal rows missing the `post_mortem_complete` metadata flag.
-- `mark_metadata(execution_id, **kv) -> None` — shallow-merges `kv` into `metadata_json`; atomic (`BEGIN IMMEDIATE` + `UPDATE` with `json_patch`).
+- `set_worker_heartbeat(execution_id) -> None` — `UPDATE workers SET last_heartbeat_at = ? WHERE execution_id = ?`. Worker's heartbeat thread calls this instead of raw SQL; lets tests mock the method.
+- `list_post_mortem_incomplete() -> list[Execution]` — returns terminal rows missing the `post_mortem_complete` metadata flag via `json_extract(metadata_json,'$.post_mortem_complete') IS NOT 1`.
+- `mark_metadata(execution_id, **kv) -> None` — shallow-merges `kv` into `metadata_json`; atomic (`BEGIN IMMEDIATE` + `UPDATE` with `json_patch`). Used for scalar flags (`post_mortem_complete`, `retry_of`, `revise_of`).
+- `register_compose_project(execution_id, project_name) -> None` — dual-table write in one transaction:
+  ```python
+  def register_compose_project(self, execution_id: str, project_name: str) -> None:
+      self._conn.execute("BEGIN IMMEDIATE")
+      try:
+          self._conn.execute(
+              "UPDATE workers SET compose_projects = json_insert(compose_projects, '$[#]', ?) "
+              "WHERE execution_id = ?", (project_name, execution_id))
+          self._conn.execute(
+              "UPDATE executions SET metadata_json = json_set(metadata_json, "
+              "'$.compose_projects', coalesce(json_extract(metadata_json,'$.compose_projects'), json('[]'))) "
+              "WHERE id = ?", (execution_id,))
+          self._conn.execute(
+              "UPDATE executions SET metadata_json = json_insert(metadata_json, "
+              "'$.compose_projects[#]', ?) WHERE id = ?", (project_name, execution_id))
+          self._conn.execute("COMMIT")
+      except Exception:
+          self._conn.execute("ROLLBACK")
+          raise
+  ```
+  Uses SQLite JSON1 (built into CPython stdlib sqlite3 ≥ 3.9; verified at `ensure_initialized()`).
 
 **GOTCHA — periodic reap**: schedule via `asyncio.create_task(periodic_reap(...))` in the FastAPI lifespan (Task 6), interval 5s. `reap()` is sync; call from the event loop via `loop.run_in_executor(None, supervisor.reap)`.
 
@@ -389,15 +428,19 @@ Add three methods:
 Three endpoints, pydantic `StartExecutionBody` / `ExecutionOptions` with `extra="forbid"`.
 
 ```python
+# Router-level auth + rate-limit attached by plan 05; this handler does NOT
+# declare require_token itself — 05's dep wraps the router.
+# Python signature rule: all non-defaulted params first, then defaulted.
 @router.post("/executions", status_code=202, response_model=ExecutionOut)
 def start(
     body: StartExecutionBody,
-    token: Annotated[str, Depends(require_token)],                        # plan 05 dep; gives us token value for scoping
-    idempotency_key: Annotated[str | None, Header()] = None,
     repo: Annotated[ExecutionRepository, Depends(get_repo)],
     supervisor: Annotated[Supervisor, Depends(get_supervisor)],
+    request: Request,
+    idempotency_key: Annotated[str | None, Header()] = None,
 ):
-    token_prefix = _sha256_prefix(token)                                  # same helper used for audit log
+    # Token was verified by 05's router dep; it stashed the prefix on request.state.
+    token_prefix: str = request.state.token_prefix
     if idempotency_key:
         existing = repo.find_by_idempotency(token_prefix, idempotency_key)
         if existing:
@@ -415,6 +458,8 @@ def start(
         raise HTTPException(status_code=500, detail=f"spawn failed: {e}")
     return execution
 ```
+
+The helper `token_prefix = sha256(token)[:8]` lives in plan 05's `src/service/auth.py` and is set on `request.state.token_prefix` by `require_token_and_write_slot` (plan 05 Task 1b). Plan 04's handler does not re-auth.
 
 `project` field charset is tight — compose-project-safe regex prevents shell/path/compose-name injection:
 ```python

@@ -79,36 +79,67 @@ logger = logging.getLogger(__name__)
 
 TOKEN_FILE = Path.home() / ".sentinel" / "service_token"
 
+_MIN_TOKEN_LEN = 32                                      # secrets.token_urlsafe(32) → ~43 chars
+
+
+def _read_token_file(path: Path, *, attempts: int = 5, delay_s: float = 0.02) -> str:
+    """Read + validate token file with brief retry to avoid winning-a-race-empty-file."""
+    for _ in range(attempts):
+        try:
+            value = path.read_text().strip()
+        except FileNotFoundError:
+            return ""
+        if len(value) >= _MIN_TOKEN_LEN:
+            return value
+        time.sleep(delay_s)                              # writer still flushing; give it a moment
+    raise RuntimeError(f"{path} exists but is empty or truncated after {attempts} reads")
+
+
 def load_or_create_token() -> str:
     env = os.environ.get("SENTINEL_SERVICE_TOKEN")
     if env:
         return env
     if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text().strip()
+        return _read_token_file(TOKEN_FILE)
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(32)
+    # Write to a sibling temp file then rename — rename is atomic, readers never see a half-written token.
+    tmp = TOKEN_FILE.with_suffix(".tmp")
     try:
-        # Atomic create: O_EXCL fails if another process raced us; mode bits applied before write.
-        fd = os.open(TOKEN_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
             os.write(fd, token.encode("ascii"))
         finally:
             os.close(fd)
+        os.rename(tmp, TOKEN_FILE)                       # atomic rename
         logger.warning("generated new service token at %s", TOKEN_FILE)
         return token
     except FileExistsError:
-        # Another process won the race and wrote the file — read theirs.
-        return TOKEN_FILE.read_text().strip()
+        # Temp file existed (unlikely) — try loser-path.
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        return _read_token_file(TOKEN_FILE)
+
+
+def token_prefix(token: str) -> str:
+    """Stable short identifier for audit + rate-limit keying. 32-bit; collision-negligible at <1e6 tokens."""
+    return hashlib.sha256(token.encode("ascii")).hexdigest()[:8]
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
 
 def _extract_bearer(request: Request | WebSocket) -> str:
-    # HTTP: require Authorization header.
-    # WebSocket: accept header OR ?token= query param (browsers can't set headers on WS).
-    header = request.headers.get("authorization", "") if hasattr(request, "headers") else ""
+    # HTTP: require Authorization header (never accepts ?token=).
+    # WebSocket: Authorization header, OR ?token= query param but ONLY from loopback clients
+    #   (query strings land in proxy/access logs — unsafe over anything other than local).
+    header = request.headers.get("authorization", "")
     scheme, _, presented = header.partition(" ")
     if scheme.lower() == "bearer" and presented:
         return presented
     if isinstance(request, WebSocket):
-        return request.query_params.get("token", "") or ""
+        client_host = request.client.host if request.client else ""
+        if client_host in _LOOPBACK_HOSTS:
+            return request.query_params.get("token", "") or ""
     return ""
 
 def require_token(request: Request) -> str:
@@ -185,41 +216,45 @@ Keyed by **sha256(token)[:8]** — same helper used for audit logs; never the ra
 
 ### Wiring the limiter
 
-The limiter is applied **only to the write router** (`commands.router` from plan 04). Read and stream routes are exempt by design — polling a read endpoint from a dashboard is expected to exceed 30/minute.
+The limiter is applied **only to the write router** (`commands.router` from plan 04). Read and stream routes are exempt by design — a dashboard polling reads from this is expected to exceed 30/minute.
 
-The wiring lives in plan 05's `auth.py`:
+The wiring lives in plan 05's `auth.py` and uses **FastAPI `BackgroundTask`** (attached to the Response), not `BaseHTTPMiddleware`. `BaseHTTPMiddleware` has known quirks with state propagation and `BackgroundTask` quirks; the Response `background` field is the idiomatic FastAPI pattern for post-response cleanup.
 
 ```python
 # auth.py
-def require_token_and_write_slot(request: Request) -> str:
+from fastapi import BackgroundTasks, Depends, HTTPException, Request, Response
+
+def require_token_and_write_slot(
+    request: Request,
+    response: Response,
+    background: BackgroundTasks,
+) -> str:
     token = require_token(request)                      # existing dep; raises 401
-    key = _sha256_prefix(token)
+    key = token_prefix(token)
+    request.state.token_prefix = key                    # surfaced to plan 04's start() handler
+
     allowed, retry_after = request.app.state.rate_limiter.check_and_reserve(key)
     if not allowed:
-        raise HTTPException(status_code=429, detail="rate limit", headers={"Retry-After": str(retry_after)})
-    # Release on response finish via BackgroundTask
-    request.state.release_rl = lambda: request.app.state.rate_limiter.release(key)
+        raise HTTPException(
+            status_code=429,
+            detail="rate limit",
+            headers={"Retry-After": str(retry_after)},
+        )
+    # Schedule the concurrent-slot release to run AFTER the response is sent.
+    background.add_task(request.app.state.rate_limiter.release, key)
     return token
-
-# Middleware that runs `release_rl` after the response
-class ReleaseRateLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        release = getattr(request.state, "release_rl", None)
-        if release: release()
-        return response
 ```
 
 In `create_app()` (this plan's Task 2):
 ```python
-# Apply limiter to write router (plan 04) only
+# Write router — auth + rate limit in one dep
 http_write_protected = APIRouter(dependencies=[Depends(require_token_and_write_slot)])
 http_write_protected.include_router(commands.router)
 app.include_router(http_write_protected)
-app.add_middleware(ReleaseRateLimitMiddleware)
+# No ReleaseRateLimitMiddleware — BackgroundTasks handles it.
 ```
 
-**GOTCHA**: If the route handler raises, `call_next` still returns (FastAPI converts to 500); `release` runs. If the middleware itself fails mid-dispatch, the concurrent slot leaks until next process restart. Acceptable for an in-memory limiter.
+**GOTCHA**: `BackgroundTasks` run after the response is sent, even on handler exceptions — FastAPI's exception middleware still produces a response, and the `background` attached to that response runs. If the dep itself raises before reaching `background.add_task`, no reservation was made, so nothing to release. Invariant holds: every `check_and_reserve` is paired with a `release`.
 
 Defaults from config (see Task 5):
 - `service.rate_limits.max_concurrent`: 3
@@ -297,7 +332,6 @@ def create_app() -> FastAPI:
     ws_protected.include_router(stream.router)                    # plan 03 (stream)
     app.include_router(ws_protected)
 
-    app.add_middleware(ReleaseRateLimitMiddleware)                # releases concurrent slot after each write response
     return app
 ```
 
@@ -345,7 +379,7 @@ logger.info("audit write user=%s ip=%s method=%s path=%s",
             token_prefix(token), request.client.host, request.method, request.url.path)
 ```
 
-Where `token_prefix(token)` = `sha256(token)[:8]` — stable identifier without the secret. Apply as an additional dependency on the `commands.router` (plan 04), not on the read router.
+`token_prefix(token)` is defined in `auth.py` (see Task 1). Apply as an additional dependency on the `commands.router` (plan 04), not on the read router.
 
 **Why not per-route:** all write endpoints get audited the same way; centralising keeps the endpoints clean.
 
@@ -429,10 +463,11 @@ stat -c '%a' ~/.sentinel/service_token                                          
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Token file briefly world-readable (write→chmod window) | (was MED) — RESOLVED | — | `O_CREAT\|O_EXCL` with mode 0o600 at creation; no second syscall. |
+| Token file briefly world-readable (write→chmod window) | (was MED) — RESOLVED | — | `O_CREAT\|O_EXCL` with mode 0o600 on a `.tmp` sibling + atomic `os.rename`; no second syscall. |
+| Loser reads empty file in race window (O_EXCL wins create, write not yet flushed) | (was MED) — RESOLVED | — | Writer uses tmp+rename (atomic); loser-path retries up to 5×20ms via `_read_token_file`. |
 | Token leaks to stdout / scrollback | MED | MED | `--show-token-prefix` is opt-in; default silent. File path printed, not value. |
 | Token env var visible in `ps -eww` | LOW | MED | Documented: prefer the file-based token on shared hosts; env var is for CI. |
-| `?token=` on WS ends up in access logs / reverse-proxy logs | MED | MED | Documented. Recommend header-capable proxies. HTTP never accepts the query-string token. |
+| `?token=` on WS ends up in access logs / reverse-proxy logs | MED | MED | Loopback-only — rejected from non-127.0.0.1/::1 clients. HTTP never accepts query-string token. |
 | `secrets.compare_digest` compares against stored token that's been mutated under us | LOW | LOW | Token loaded once at startup into `app.state.service_token`; file edits require restart. |
 | CORS wildcard + credentials footgun | MED | LOW | `_validate_cors` raises at startup when `"*"` is present. Caught by unit test. |
 | Leaked bearer → unbounded Anthropic spend | MED | HIGH | Per-token rate limits (concurrent + per-minute) default 3/30; configurable. 429 + `Retry-After`. |

@@ -139,7 +139,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _frame_from_row(row) -> dict:
+def _frame_from_row(row: "EventRow") -> dict:
     return {
         "kind": "event",
         "seq": row["seq"],
@@ -153,10 +153,12 @@ def _frame_from_row(row) -> dict:
 @router.websocket("/executions/{execution_id}/stream")
 async def stream(
     ws: WebSocket,
+    repo: Annotated[ExecutionRepository, Depends(get_repo)],
     execution_id: str,
     since_seq: int = 0,
-    repo: Annotated[ExecutionRepository, Depends(get_repo)],
 ) -> None:
+    # Note: param order: non-default (ws, repo via Depends, execution_id path) first,
+    # defaulted (since_seq) last — Python SyntaxError otherwise.
     await ws.accept()
     if repo.get(execution_id) is None:
         await ws.close(code=4404)
@@ -164,6 +166,7 @@ async def stream(
 
     last_seq = since_seq
     last_heartbeat = asyncio.get_running_loop().time()
+    closed = False                          # guards against double-close after timeout
 
     async def _send(frame: dict) -> None:
         # Backpressure cutoff: if a slow client cannot absorb a frame in SEND_TIMEOUT_S,
@@ -191,15 +194,18 @@ async def stream(
 
             await asyncio.sleep(POLL_INTERVAL_S)
     except WebSocketDisconnect:
+        closed = True
         return
     except asyncio.TimeoutError:
         # Slow client — close with 1011; client reconnects with since_seq.
         try: await ws.close(code=1011)
         except Exception: pass
+        closed = True
         return
     finally:
-        try: await ws.close()
-        except Exception: pass
+        if not closed:
+            try: await ws.close()
+            except Exception: pass
 ```
 
 **GOTCHA — no subscriber, no race.** The old "subscribe first, replay second" dedup is gone. There is exactly one source (the DB) and `seq` is monotonic; `since_seq` + `ORDER BY seq LIMIT 500` is lossless.
