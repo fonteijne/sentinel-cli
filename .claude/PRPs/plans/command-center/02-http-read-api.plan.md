@@ -80,14 +80,23 @@ All list endpoints return `{"items": [...], "next_cursor": <opaque or null>}`. N
 ```python
 # SOURCE: src/cli.py (plan/execute/debrief command decorators)
 @cli.command()
-@click.option("--host", default="127.0.0.1", show_default=True)
-@click.option("--port", default=8787, show_default=True, type=int)
-def serve(host: str, port: int) -> None:
-    """Start the Sentinel read-only HTTP API."""
+@click.option("--host", default=None, help="Bind address; defaults to service.bind_address config or 127.0.0.1")
+@click.option("--port", default=None, type=int, help="Port; defaults to service.port config or 8787")
+def serve(host: str | None, port: int | None) -> None:
+    """Start the Sentinel HTTP API."""
     import uvicorn
     from src.service.app import create_app
+    cfg = get_config()
+    host = host or cfg.get("service.bind_address", "127.0.0.1")
+    port = port or int(cfg.get("service.port", 8787))
     uvicorn.run(create_app(), host=host, port=port, log_config=None)
+    # Intentionally pass the app INSTANCE, not a factory string — Supervisor state (plan 04) and
+    # SQLite connections are per-process; single-process is a design constraint, not an oversight.
 ```
+
+**Config keys** (documented in plan 05's `config/config.yaml` update):
+- `service.bind_address` — default `127.0.0.1`
+- `service.port` — default `8787`
 
 **Logger** — every new module starts with the same module-level logger idiom (see Foundation plan).
 
@@ -112,12 +121,30 @@ Response models that mirror Foundation entities but are explicit API shapes (not
 **VALIDATE**: `python -c "from src.service.schemas import ExecutionOut, EventOut"`
 
 ### Task 2 — CREATE `src/service/deps.py`
-- `get_db_conn()` — yields a connection from `core.persistence.db.get_db()`; FastAPI manages lifetime via dependency.
-- `get_repo(conn=Depends(get_db_conn))` — returns `ExecutionRepository(conn)`.
 
-**GOTCHA**: The Foundation DB singleton returns the same connection object; FastAPI workers are single-process for this plan — fine. Plan 04 adds worker concurrency and may need a pool; not our problem yet.
+```python
+from typing import Iterator
+import sqlite3
+from fastapi import Depends
+from src.core.persistence.db import connect, ensure_initialized
+from src.core.execution.repository import ExecutionRepository
 
-**VALIDATE**: Imported by routes without circular imports.
+def get_db_conn() -> Iterator[sqlite3.Connection]:
+    conn = connect()                             # NEW connection per request
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def get_repo(conn: sqlite3.Connection = Depends(get_db_conn)) -> ExecutionRepository:
+    return ExecutionRepository(conn)
+```
+
+**GOTCHA — no module-level DB singleton**. Plan 01 was updated to expose `connect()` (factory), not `get_db()` (singleton). Each request gets its own connection; FastAPI's sync `def` endpoints run on a threadpool, and sqlite3 connections cannot be shared across threads. WAL mode + `check_same_thread=False` on each connection keep readers concurrent with the writer process (plan 04 worker).
+
+**GOTCHA — lifecycle**. The `try/finally` is essential — without the `finally conn.close()`, connections leak under load and eventually exhaust SQLite's file handle budget.
+
+**VALIDATE**: Imported by routes without circular imports; manual `TestClient` hit shows separate connections per request (log at `connect()` if needed).
 
 ### Task 3 — CREATE `src/service/routes/executions.py`
 Five endpoints. Thin — each is `repo.method(...)` → schema conversion → return.
@@ -129,17 +156,31 @@ Five endpoints. Thin — each is `repo.method(...)` → schema conversion → re
 **VALIDATE**: `pytest tests/service/test_executions_routes.py`
 
 ### Task 4 — CREATE `src/service/app.py`
+
+Minimal factory for this plan. **Plan 05 replaces this** with the protected-router composition that wraps 02/03/04's routes behind bearer auth and attaches the plan-04 `lifespan`. Keep 02's factory dumb and stable.
+
 ```python
+from fastapi import FastAPI, Depends
+from src.core.persistence.db import ensure_initialized
+from src.service.deps import get_db_conn
+from src.service.routes import executions
+
 def create_app() -> FastAPI:
+    ensure_initialized()                        # runs migrations once per process
     app = FastAPI(title="Sentinel Command Center API", version="0.1")
     app.include_router(executions.router)
+
     @app.get("/health")
-    def health(conn=Depends(get_db_conn)):
+    def health(conn=Depends(get_db_conn)) -> dict:
         conn.execute("SELECT 1").fetchone()
         return {"status": "ok", "db": "ok"}
+
     return app
 ```
-No middleware yet — plan 05 adds auth + CORS.
+
+No middleware yet — plan 05 adds auth + CORS. No `lifespan` yet — plan 04 introduces `command_center_lifespan`, plan 05 wires it.
+
+**Why `ensure_initialized()` in the factory:** makes `create_app()` self-sufficient for tests without requiring CLI entry. Idempotent, cheap.
 
 **VALIDATE**: `python -c "from src.service.app import create_app; app = create_app(); print([r.path for r in app.routes])"`
 
@@ -195,9 +236,10 @@ curl -s 'http://127.0.0.1:8787/executions?limit=5' | jq '.items[0]'
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| SQLite connection shared across threads under uvicorn workers | MED | MED | Keep uvicorn `--workers 1` default; document; revisit with pool in plan 04 |
+| SQLite connection-shared-across-threads fails under FastAPI threadpool | (was MED) — RESOLVED | — | `connect()` factory + `check_same_thread=False` + per-request yield/close. No singleton anywhere. |
 | Events response grows large for long runs | MED | LOW | Cap `limit` at 1000; require cursor for more |
 | FastAPI adds non-trivial import time to CLI startup | LOW | LOW | Import inside `serve` command body only |
+| `create_app()` diverges from plan 05's composed version | LOW | LOW | 05 replaces this factory wholesale; 02's factory is the fallback for isolated tests |
 
 ## Notes
 

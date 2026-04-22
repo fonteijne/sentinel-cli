@@ -29,7 +29,7 @@ Today `sentinel execute TICKET` runs orchestration inline inside the Click comma
 | Complexity       | HIGH |
 | Systems Affected | `src/cli.py`, `src/agents/*`, `src/agent_sdk_wrapper.py`, `src/session_tracker.py`, `pyproject.toml` |
 | Dependencies     | stdlib `sqlite3`, existing `pydantic ^2.5`, `click ^8.1` — **no new deps** |
-| Estimated Tasks  | 11 |
+| Estimated Tasks  | 12 |
 
 ---
 
@@ -203,7 +203,7 @@ def tracker(tmp_path, monkeypatch):
 | `src/agents/base_agent.py` | UPDATE | Accept optional `event_bus` + `execution_id`; emit `AgentStarted`/`AgentMessageSent`/`AgentResponseReceived` |
 | `src/agent_sdk_wrapper.py` | UPDATE | When event bus present, also publish `ToolCalled` events (keeps writing diagnostics.jsonl too) |
 | `src/cli.py` | UPDATE | `plan`, `execute`, `debrief` build an `Orchestrator` and delegate; stop containing orchestration logic |
-| `src/session_tracker.py` | UPDATE | No structural change; add a migration helper `migrate_legacy_into_db()` called once on first DB open (non-destructive: legacy JSON remains) |
+| `src/session_tracker.py` | (untouched) | No change in this plan. Legacy `sessions.json` coexists with the new DB; a future plan may subsume it. |
 
 ---
 
@@ -216,17 +216,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 CREATE TABLE IF NOT EXISTS executions (
-    id            TEXT PRIMARY KEY,                -- uuid4 hex
-    ticket_id     TEXT NOT NULL,
-    project       TEXT NOT NULL,
-    kind          TEXT NOT NULL,                   -- 'plan' | 'execute' | 'debrief'
-    status        TEXT NOT NULL,                   -- see ExecutionStatus enum
-    phase         TEXT,                            -- current agent/step label
-    started_at    TEXT NOT NULL,
-    ended_at      TEXT,
-    cost_cents    INTEGER NOT NULL DEFAULT 0,
-    error         TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
+    id                TEXT PRIMARY KEY,            -- uuid4 hex
+    ticket_id         TEXT NOT NULL,
+    project           TEXT NOT NULL,
+    kind              TEXT NOT NULL,               -- ExecutionKind enum value
+    status            TEXT NOT NULL,               -- ExecutionStatus enum value
+    phase             TEXT,                        -- current agent/step label
+    started_at        TEXT NOT NULL,
+    ended_at          TEXT,
+    cost_cents        INTEGER NOT NULL DEFAULT 0,
+    error             TEXT,
+    idempotency_key   TEXT UNIQUE,                 -- nullable; set by plan 04 POST endpoint
+    metadata_json     TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_executions_ticket ON executions(ticket_id);
 CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
@@ -236,13 +237,14 @@ CREATE TABLE IF NOT EXISTS events (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     execution_id  TEXT NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
     seq           INTEGER NOT NULL,                -- monotonic per execution
-    ts            TEXT NOT NULL,                   -- ISO-8601 UTC
+    ts            TEXT NOT NULL,                   -- ISO-8601 UTC, tz-aware
     agent         TEXT,                            -- nullable (system events)
-    type          TEXT NOT NULL,                   -- event type name
+    type          TEXT NOT NULL,                   -- event type name (stable identifier)
     payload_json  TEXT NOT NULL,
     UNIQUE(execution_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_events_execution ON events(execution_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);          -- for retention sweeps + cross-execution time filters
 
 CREATE TABLE IF NOT EXISTS agent_results (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -256,22 +258,49 @@ CREATE INDEX IF NOT EXISTS idx_agent_results_execution ON agent_results(executio
 
 ### Event Types (src/core/events/types.py)
 
-Each is a pydantic model with `execution_id`, `ts`, `agent` (opt), and a typed payload. Minimum set for this plan:
+Each is a pydantic model with `execution_id`, `ts`, `agent` (opt), and a typed payload. Event `type` strings are stable identifiers — persisted; never rename.
 
+**Lifecycle:**
 - `ExecutionStarted` — `{kind, ticket_id, project}`
 - `ExecutionCompleted` — `{status, cost_cents}`
 - `ExecutionFailed` — `{error}`
+- `ExecutionCancelling` — `{}` (operator requested stop; worker is winding down)
+- `ExecutionCancelled` — `{}` (terminal)
 - `PhaseChanged` — `{phase}` (e.g. "planning", "implementing", "reviewing")
+
+**Agent / tool:**
 - `AgentStarted` / `AgentFinished` — `{agent, session_id}`
 - `AgentMessageSent` — `{prompt_chars, cwd, max_turns}`
 - `AgentResponseReceived` — `{response_chars, tool_uses_count, elapsed_s}`
 - `ToolCalled` — `{tool, args_summary}`
+
+**Results:**
 - `TestResultRecorded` — `{success, return_code}`
 - `FindingPosted` — `{severity, summary}`
+- `CostAccrued` — `{tokens_in, tokens_out, cents}` — emitted by `AgentSDKWrapper` after each SDK call; Orchestrator subscribes and calls `repo.add_cost`
+
+**Error-class differentiation:**
+- `RateLimited` — `{retry_after_s}` — Anthropic 429/529 or equivalent; distinguishes "throttled, still runnable" from `ExecutionFailed`
+
+**Constants to export from `types.py`:**
+```python
+TERMINAL_EVENT_TYPES: frozenset[str] = frozenset({
+    "execution.completed", "execution.failed", "execution.cancelled"
+})
+```
+Consumers (plan 03 WS tail) use this to decide when to close the stream.
 
 ### ExecutionStatus enum
 
-`queued | running | succeeded | failed | cancelled`
+`queued | running | cancelling | succeeded | failed | cancelled`
+
+`cancelling` is transitional: set by plan 04's cancel endpoint, cleared when the worker reaches a clean stop (becomes `cancelled`) or is force-killed.
+
+### ExecutionKind enum
+
+`plan | execute | debrief`
+
+Used in the `executions.kind` column and in plan 04's `POST /executions` body. Pydantic rejects unknown values at the HTTP boundary, not inside the agent.
 
 ---
 
@@ -284,7 +313,9 @@ Each is a pydantic model with `execution_id`, `ts`, `agent` (opt), and a typed p
 - **Replacing logger calls with events** — events are *added alongside*, existing `logger.info(...)` calls stay.
 - **Replacing `logs/agent_diagnostics.jsonl`** — keep it (sentinel-dev operators rely on tailing this file during development). Event bus publishes the same shape to the DB.
 - **Migrating `beads_manager.py`** — untouched.
+- **Migrating `~/.sentinel/sessions.json` into the DB** — coexistence only; a follow-up plan can subsume it.
 - **Changing agent behaviour** — no agent output changes.
+- **Retention / archival of `events` and `agent_results`** — deferred. Add `idx_events_ts` now so a future sweep is fast; no TTL yet.
 
 ---
 
@@ -294,15 +325,31 @@ Execute in order. Each task is independently testable.
 
 ### Task 1 — CREATE `src/core/persistence/db.py`
 
-- **ACTION**: Create SQLite connection helper and migration runner.
+- **ACTION**: Create SQLite connection factory and migration runner. **No module-level singleton connection** — every caller gets its own connection.
 - **IMPLEMENT**:
-  - `DB_PATH = Path.home() / ".sentinel" / "sentinel.db"` (mirror SessionTracker convention — create parent dir)
-  - `get_connection() -> sqlite3.Connection` — returns connection with `row_factory=sqlite3.Row`, `PRAGMA foreign_keys=ON`, `PRAGMA journal_mode=WAL`
-  - `run_migrations(conn)` — reads `migrations/*.sql` in sorted filename order, executes any whose `version` (leading digits) is not in `schema_migrations`; records applied versions with UTC ISO timestamp
-  - Module-level singleton via `get_db()` mirroring `get_config` pattern (see `src/config_loader.py:431-441`)
-- **MIRROR**: `src/session_tracker.py:19-20` for path convention; `src/config_loader.py:431-441` for singleton.
-- **GOTCHA**: WAL mode needs write permission on the directory — `parent.mkdir(parents=True, exist_ok=True)` is required, same as SessionTracker does.
-- **VALIDATE**: `python -c "from src.core.persistence.db import get_db; get_db()"` — no exception, `~/.sentinel/sentinel.db` created.
+  - `DB_PATH` resolution order: `os.environ["SENTINEL_DB_PATH"]` → `Path.home() / ".sentinel" / "sentinel.db"`. Expose as module-level `get_db_path() -> Path` (called each time, not memoized — test-friendly).
+  - `connect() -> sqlite3.Connection` — returns a **new** connection, fully configured:
+    ```python
+    conn = sqlite3.connect(
+        get_db_path(),
+        timeout=30,
+        isolation_level=None,          # we manage transactions explicitly
+        check_same_thread=False,       # FastAPI threadpool + worker subprocesses need this
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    return conn
+    ```
+  - `ensure_initialized()` — idempotent; opens a connection, runs `run_migrations`, closes. Called once at CLI startup and again by plan 02's FastAPI lifespan.
+  - `run_migrations(conn)` — reads `migrations/*.sql` in sorted filename order, executes any whose `version` (leading digits) is not in `schema_migrations`; records applied versions with UTC ISO timestamp. Wrap each migration in `BEGIN IMMEDIATE` / `COMMIT`.
+- **MIRROR**: `src/session_tracker.py:19-20` for the fallback path convention (`Path.home() / ".sentinel" / ...`) and `parent.mkdir(parents=True, exist_ok=True)`.
+- **GOTCHA**: **Do not keep a module-level connection**. sqlite3 connections have per-connection state (transactions, row_factory); sharing one across threads/processes corrupts state and raises `ProgrammingError`. Every repo/bus/route gets its own via dependency injection.
+- **GOTCHA**: `isolation_level=None` means *autocommit mode*. Writers MUST explicitly `BEGIN IMMEDIATE` / `COMMIT`. This prevents the Python sqlite3 driver's implicit transaction management from fighting WAL.
+- **GOTCHA**: `SENTINEL_DB_PATH` env override exists because `Path.home()` resolves differently on host vs. inside `sentinel-dev` (not bind-mounted). Ops workflows that must share a DB can point both at `/app/state/sentinel.db` (a mount the user adds).
+- **VALIDATE**: `python -c "from src.core.persistence.db import connect, ensure_initialized; ensure_initialized(); c = connect(); c.execute('SELECT 1').fetchone()"` — no exception, `~/.sentinel/sentinel.db` created.
 
 ### Task 2 — CREATE `src/core/persistence/migrations/001_init.sql`
 
@@ -311,45 +358,69 @@ Execute in order. Each task is independently testable.
 
 ### Task 3 — CREATE `src/core/events/types.py`
 
-- **ACTION**: Pydantic models for every event in "Event Types" list.
+- **ACTION**: Pydantic models for every event in "Event Types" list + `TERMINAL_EVENT_TYPES` constant.
 - **IMPLEMENT**:
-  - Base class `SentinelEvent(BaseModel)` with fields: `execution_id: str`, `ts: datetime` (default_factory utcnow), `agent: Optional[str] = None`, `type: str` (set by subclass via `Literal`).
-  - Subclasses override `type` with `Literal["execution.started"]`, etc. Payload fields are direct attributes (no nested `payload` dict).
-  - Discriminated union `AnyEvent = Annotated[Union[...], Field(discriminator="type")]` for serialization.
-- **MIRROR**: pydantic usage in `src/agents/*` (already v2 across codebase).
-- **GOTCHA**: Event `type` strings must be stable — they're persisted; renaming breaks replay.
-- **VALIDATE**: `python -c "from src.core.events.types import ExecutionStarted; ExecutionStarted(execution_id='x', kind='execute', ticket_id='T-1', project='P')"` parses.
+  - Base class `SentinelEvent(BaseModel)` with fields:
+    - `execution_id: str`
+    - `ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))` — **tz-aware**, never naive `utcnow()` (deprecated in 3.12)
+    - `agent: Optional[str] = None`
+    - `type: str` (set by subclass via `Literal`)
+  - Subclasses override `type` with `Literal["execution.started"]`, etc. Payload fields are direct attributes (no nested `payload` dict — the WS serializer in plan 03 re-nests non-envelope fields).
+  - Discriminated union `AnyEvent = Annotated[Union[...], Field(discriminator="type")]` for typed field use; export `AnyEventAdapter = TypeAdapter(AnyEvent)` for parsing raw dicts from the DB.
+  - Constant: `TERMINAL_EVENT_TYPES: frozenset[str] = frozenset({"execution.completed","execution.failed","execution.cancelled"})`.
+- **MIRROR**: pydantic v2 usage in `src/agents/*` (already v2 across codebase).
+- **GOTCHA**: Event `type` strings are persisted — never rename. Additions are fine.
+- **GOTCHA**: `datetime.utcnow()` is deprecated and returns naive datetimes; a naive/aware mix breaks comparisons. Always `datetime.now(timezone.utc)`.
+- **VALIDATE**: `python -c "from src.core.events.types import ExecutionStarted, TERMINAL_EVENT_TYPES; e = ExecutionStarted(execution_id='x', kind='execute', ticket_id='T-1', project='P'); assert e.ts.tzinfo is not None"` — passes.
 
 ### Task 4 — CREATE `src/core/events/bus.py`
 
-- **ACTION**: In-process pub/sub with persist-first semantics.
+- **ACTION**: In-process pub/sub with persist-first semantics. Bus persists every event to SQLite *before* firing subscribers.
 - **IMPLEMENT**:
   ```python
   class EventBus:
       def __init__(self, conn: sqlite3.Connection) -> None:
-          self._conn = conn
+          self._conn = conn                       # caller-owned; one conn per bus instance
           self._subscribers: list[Callable[[SentinelEvent], None]] = []
-          self._seq_lock = threading.Lock()
+          self._seq_lock = threading.Lock()       # serializes seq allocation within this process
 
       def publish(self, event: SentinelEvent) -> None:
           with self._seq_lock:
-              seq = self._next_seq(event.execution_id)
-              self._conn.execute(
-                  "INSERT INTO events(execution_id, seq, ts, agent, type, payload_json) "
-                  "VALUES (?, ?, ?, ?, ?, ?)",
-                  (event.execution_id, seq, event.ts.isoformat(), event.agent,
-                   event.type, event.model_dump_json(exclude={"execution_id","ts","agent","type"})),
-              )
-              self._conn.commit()
+              self._conn.execute("BEGIN IMMEDIATE")
+              try:
+                  row = self._conn.execute(
+                      "SELECT COALESCE(MAX(seq), 0) FROM events WHERE execution_id = ?",
+                      (event.execution_id,),
+                  ).fetchone()
+                  seq = row[0] + 1
+                  self._conn.execute(
+                      "INSERT INTO events(execution_id, seq, ts, agent, type, payload_json) "
+                      "VALUES (?, ?, ?, ?, ?, ?)",
+                      (event.execution_id, seq, event.ts.isoformat(), event.agent,
+                       event.type, event.model_dump_json(
+                           exclude={"execution_id","ts","agent","type"})),
+                  )
+                  self._conn.execute("COMMIT")
+              except Exception:
+                  self._conn.execute("ROLLBACK")
+                  raise
+          # Subscriber dispatch is OUTSIDE the lock — slow subscribers must not serialize publishers
           for sub in list(self._subscribers):
-              try: sub(event)
-              except Exception:  # never let a subscriber take down a run
+              try:
+                  sub(event)
+              except Exception:
                   logger.exception("event subscriber raised")
 
-      def subscribe(self, cb): self._subscribers.append(cb); return lambda: self._subscribers.remove(cb)
+      def subscribe(self, cb: Callable[[SentinelEvent], None]) -> Callable[[], None]:
+          self._subscribers.append(cb)
+          def _unsub() -> None:
+              try: self._subscribers.remove(cb)
+              except ValueError: pass
+          return _unsub
   ```
-- **GOTCHA**: Subscriber exceptions MUST NOT bubble — they'd crash the run for a dashboard bug. Log and continue.
-- **GOTCHA**: `_seq_lock` is required because multiple agents in the same process may publish concurrently. Keep SQLite in WAL so reads from plan 02 don't block writes.
+- **GOTCHA — subscriber exceptions MUST NOT bubble**. A dashboard-side bug cannot be allowed to crash a run.
+- **GOTCHA — the `_seq_lock` is process-local**. Two processes (e.g. the service and a plan-04 subprocess worker) each hold their own bus with their own lock — but SQLite's `BEGIN IMMEDIATE` serializes the writes at the DB level, so `seq` stays monotonic per `execution_id` across processes. The in-memory subscriber list, however, is **not** cross-process. Plan 03's live WebSocket tail therefore reads from the DB, not via `subscribe()`. Keep bus subscription for local consumers only (e.g., the CLI's human-readable log adapter in Task 10).
+- **GOTCHA — subscribers run on the publishing thread**. If a subscriber does real work it blocks other publishers waiting on the lock? No — lock is released before dispatch. But a slow subscriber still ties up the publishing thread. Subscribers that bridge to asyncio (none in plan 01; relevant for plan 03) must do only `loop.call_soon_threadsafe(...)` and return immediately.
 - **VALIDATE**: `pytest tests/core/test_event_bus.py` — see Task 12.
 
 ### Task 5 — CREATE `src/core/execution/models.py`
@@ -359,9 +430,20 @@ Execute in order. Each task is independently testable.
 
 ### Task 6 — CREATE `src/core/execution/repository.py`
 
-- **ACTION**: CRUD + lifecycle transitions over `executions` and `agent_results`.
-- **IMPLEMENT**: `create(ticket_id, project, kind) -> Execution`, `get(id)`, `list(filters)`, `set_status(id, status, error=None)`, `set_phase(id, phase)`, `add_cost(id, cents)`, `record_agent_result(id, agent, result_dict)`, `record_ended(id, status, error=None)`.
+- **ACTION**: CRUD + lifecycle transitions over `executions`, `events`, `agent_results`.
+- **IMPLEMENT**: Methods (all accept a `sqlite3.Connection` via constructor or per-call — pick one, stay consistent):
+  - `create(ticket_id, project, kind, idempotency_key=None) -> Execution`
+  - `get(id) -> Optional[Execution]`
+  - `find_by_idempotency_key(key) -> Optional[Execution]` — used by plan 04's `POST /executions` to dedupe retries
+  - `list(*, project=None, ticket_id=None, status=None, kind=None, before=None, limit=50) -> list[Execution]`
+  - `set_status(id, status, error=None)` / `set_phase(id, phase)`
+  - `add_cost(id, cents)` — atomic `UPDATE executions SET cost_cents = cost_cents + ?`
+  - `record_agent_result(id, agent, result_dict)` / `list_agent_results(id) -> list[dict]`
+  - `record_ended(id, status, error=None)` — sets `ended_at = now`, `status`, and `error`
+  - `iter_events(execution_id, since_seq=0, limit=500) -> Iterator[EventRow]` — generator used by plan 02's GET events and plan 03's WebSocket tail
+  - `latest_event_seq(execution_id) -> int` — used by plan 03 to bound live delivery vs replay
 - **GOTCHA**: Always write `metadata_json` as JSON string, never None — schema default is `'{}'` but code should be explicit.
+- **GOTCHA**: Writers wrap multi-statement operations in `BEGIN IMMEDIATE` / `COMMIT`. Readers don't need transactions (WAL snapshot isolation).
 - **VALIDATE**: `pytest tests/core/test_execution_repository.py`.
 
 ### Task 7 — CREATE `src/core/execution/orchestrator.py`
@@ -390,9 +472,15 @@ Execute in order. Each task is independently testable.
 
 ### Task 9 — UPDATE `src/agent_sdk_wrapper.py`
 
-- **ACTION**: When Orchestrator passes an event bus through to agents, have the wrapper publish `ToolCalled` events (in addition to `_write_diagnostic` — do not remove the diagnostic file).
-- **IMPLEMENT**: Accept `event_bus` + `execution_id` via the BaseAgent that owns this wrapper (thread them through), or attach them as optional attributes set by BaseAgent after construction. Prefer the latter to keep the existing `AgentSDKWrapper(agent_name, config)` signature stable.
-- **VALIDATE**: Existing diagnostics.jsonl output unchanged; new `ToolCalled` rows appear in `events` when executed via Orchestrator.
+- **ACTION**: When Orchestrator passes an event bus through to agents, publish `ToolCalled`, `CostAccrued`, and (on throttle errors) `RateLimited` events — in addition to `_write_diagnostic`. Do not remove the diagnostic file.
+- **IMPLEMENT**:
+  - Accept `event_bus` + `execution_id` as optional attributes set by BaseAgent after construction (keeps the existing `AgentSDKWrapper(agent_name, config)` signature stable).
+  - On each SDK tool_use: publish `ToolCalled(tool, args_summary)`.
+  - On each SDK response with usage info: publish `CostAccrued(tokens_in, tokens_out, cents)`. Compute cents using the project's existing cost table if present; otherwise `cents=0` and only the token counts are carried (still observable).
+  - On 429/529 / rate-limit exception: publish `RateLimited(retry_after_s)` before re-raising or backing off.
+  - Ensure `_write_diagnostic` continues to fire with the same shape — ideally both paths share a single `entry_dict()` helper so JSONL and bus carry identical payloads. Add a test asserting equality for one representative event.
+- **GOTCHA — cost as a column needs a writer**. `executions.cost_cents` is useless without `CostAccrued` events flowing; an Orchestrator-side subscriber does `repo.add_cost(execution_id, cents)` for every one. Wire that in Task 7.
+- **VALIDATE**: Existing diagnostics.jsonl output unchanged; new `ToolCalled` / `CostAccrued` rows appear in `events` when executed via Orchestrator; `SELECT SUM(cost_cents) FROM executions` > 0 after a real run.
 
 ### Task 10 — UPDATE `src/cli.py` (plan / execute / debrief)
 
@@ -401,19 +489,24 @@ Execute in order. Each task is independently testable.
   ```python
   from src.core.execution import Orchestrator, ExecutionRepository
   from src.core.events import EventBus
-  from src.core.persistence import get_db
+  from src.core.persistence import connect, ensure_initialized
 
   # inside the Click command:
-  conn = get_db()
+  ensure_initialized()                       # idempotent; runs migrations first time
+  conn = connect()                           # caller-owned connection
   repo = ExecutionRepository(conn)
   bus = EventBus(conn)
   orchestrator = Orchestrator(repo=repo, bus=bus, session_tracker=SessionTracker(), config=get_config())
-  execution = orchestrator.execute(ticket_id=ticket, project=project, revise=revise, ...)
+  try:
+      execution = orchestrator.execute(ticket_id=ticket, project=project, revise=revise, ...)
+  finally:
+      conn.close()
   if execution.status is ExecutionStatus.FAILED:
       raise click.ClickException(execution.error or "execution failed")
   ```
-- **GOTCHA**: `cli.execute` contains at least two major branches (`--revise` vs. normal, lines 509-720 vs 722+). Both must route through Orchestrator — do not leave one branch inline.
-- **GOTCHA**: Preserve existing stdout output for humans — the CLI's printed messages should not regress. Subscribe a simple `_log_subscriber(event)` on the bus that prints a one-line summary per event when running interactively.
+- **GOTCHA**: `cli.execute` contains at least two major branches (`--revise` vs. normal, starting ~line 509 and ~line 722). Both must route through Orchestrator — do not leave one branch inline. The `--revise` flow reuses the same execution row (or creates a linked child with `metadata_json.revise_of = <original>`) — pick one and document on the `Execution` model.
+- **GOTCHA**: `debrief`'s interactive Jira conversation loop is a single Execution with multiple `DebriefTurn` events (add to event types if driven from the dashboard; for plan 01 the CLI drives turns and emits them).
+- **GOTCHA**: Preserve existing stdout output for humans — subscribe a simple `_log_subscriber(event)` on the bus that prints a one-line summary per event when running interactively.
 - **VALIDATE**: Manual smoke test — `sentinel execute <known-ticket>` completes end-to-end on a fixture project; `SELECT * FROM executions ORDER BY started_at DESC LIMIT 1` shows the run; `SELECT COUNT(*) FROM events WHERE execution_id = ?` > 0.
 
 ### Task 11 — CREATE tests
@@ -511,7 +604,8 @@ Expect: one `succeeded` execution row, non-zero counts for `execution.started`, 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Extraction from `cli.py` misses an incidental side-effect (e.g. a specific Jira comment) | MED | MED | Extract by *moving* helpers and calling them from Orchestrator rather than rewriting; checklist existing MR/Jira interactions from cli.py:478-1009 before approving |
-| SQLite write contention if two `sentinel` processes run concurrently | LOW | LOW | WAL mode + short transactions handle this; single-writer-per-run is the norm; plan 04 adds supervisor-coordinated workers |
+| SQLite `database is locked` under concurrent writes (e.g. plan 04 worker + plan 02 read endpoints + event bus commits) | MED | MED | `PRAGMA busy_timeout=30000`, `BEGIN IMMEDIATE` for writers, WAL for concurrent readers, `check_same_thread=False` on all connections, *no* module-level shared connection |
+| Shared DB ambiguity: `Path.home()` differs host vs. sentinel-dev container (host HOME not bind-mounted) | MED | LOW | `SENTINEL_DB_PATH` env override documented; operators who need a shared DB point both at a mounted path |
 | Event schema churn breaks replay after real data accumulates | MED | MED | Event `type` strings are now stable identifiers; any change ships with a migration that rewrites payload_json or adds a new type rather than renaming |
 | Added constructor kwarg on BaseAgent breaks third-party agents | LOW | LOW | Kwargs default to `None`; existing call sites unchanged |
 | `~/.sentinel/sentinel.db` ends up committed if a user runs from the repo root | LOW | LOW | Path is under `$HOME`, not cwd; `.gitignore` already covers `*.db`; verify once |
@@ -520,6 +614,9 @@ Expect: one `succeeded` execution row, non-zero counts for `execution.started`, 
 
 ## Notes
 
-- This plan deliberately keeps two parallel telemetry sinks alive (`logger.info` + `logs/agent_diagnostics.jsonl` + new `events` table). Collapse is a later decision — today operators rely on tailing the jsonl file in `sentinel-dev`, and we shouldn't trade a working workflow for a cleaner diagram.
+- This plan deliberately keeps two parallel telemetry sinks alive (`logger.info` + `logs/agent_diagnostics.jsonl` + new `events` table). Collapse is a later decision — today operators rely on tailing the jsonl file in `sentinel-dev`, and we shouldn't trade a working workflow for a cleaner diagram. A single `entry_dict()` helper backs both so the shapes cannot drift.
 - `cli.py` is 2500 lines. Extract narrowly. Anything that isn't orchestration (projects, auth, validate, info, reset, status) stays put.
+- **HOME ambiguity:** `~/.sentinel/sentinel.db` resolves to the container HOME inside `sentinel-dev` and to the host HOME outside. Running `sentinel` in both places creates two independent DBs. If sharing is required, set `SENTINEL_DB_PATH` (e.g. to a path under the `sentinel-projects` volume) in both environments.
+- **Retention:** `events` and `agent_results` grow unbounded. `idx_events_ts` is in place; a retention-sweep plan is a follow-up, not a blocker.
+- **Out-of-process executions (plan 04):** the bus subscriber list is process-local. Consumers that need events from subprocess workers (plan 03's WebSocket tail) read from the DB, not via `subscribe()`.
 - Commit the work on `experimental/command-center-01-foundation` per session branch rule.

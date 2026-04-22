@@ -17,11 +17,12 @@ After plans 01–03 the service is observe-only. Runs still start from the CLI a
 
 ## Solution Statement
 
-1. `ExecutionWorker` (subprocess entry point) — takes `--execution-id`, loads the row, constructs an `Orchestrator`, runs it, exits.
-2. `Supervisor` (in-process object owned by the service) — `spawn(execution_id)`, `cancel(execution_id)`, `reap()`, `reconcile_on_startup()`. Tracks live workers by PID.
-3. Three write endpoints on the existing FastAPI app.
-4. Startup hook that marks any `status='running'` execution without a live worker as `failed` with `error='orphaned_on_restart'`.
-5. CLI gains `execute --remote` flag that POSTs to the local service instead of running in-process.
+1. `ExecutionWorker` (subprocess entry point) — takes `--execution-id`, configures logging, loads the row, constructs an `Orchestrator`, runs it, exits.
+2. `workers` table (new migration 002) — persists `(execution_id PK, pid, started_at, last_heartbeat_at)`. Worker heartbeats every 5s. Lets the service tell a *legitimately running detached worker* apart from an *orphaned row*.
+3. `Supervisor` (in-process object owned by the service) — `spawn`, `cancel`, `reap`, `adopt_or_reconcile_on_startup`. Tracks live workers by PID and DB heartbeat.
+4. Three write endpoints on the FastAPI app (plan 05 owns `create_app()` composition; this plan contributes the router).
+5. Startup hook: for every row in `running/cancelling`, read `workers.last_heartbeat_at` + `os.kill(pid, 0)`; if alive, adopt back into supervisor registry; if stale and dead, mark `failed` with `error='orphaned_on_restart'`; stale-but-alive logs a warning and adopts anyway.
+6. `sentinel execute --remote` — POSTs to local service with bearer auth, optionally `--follow` tails the plan 03 stream.
 
 ## Metadata
 
@@ -29,10 +30,10 @@ After plans 01–03 the service is observe-only. Runs still start from the CLI a
 |---|---|
 | Type | NEW_CAPABILITY |
 | Complexity | MEDIUM |
-| Systems Affected | `src/core/execution/worker.py` + `supervisor.py` (new), `src/service/routes/commands.py` (new), `src/service/app.py`, `src/cli.py` |
-| Dependencies | stdlib `multiprocessing` + `signal` (no new deps) |
-| Estimated Tasks | 7 |
-| Prerequisite | Plan 01 (Foundation). Independent of 02/03 at the module level but shares the FastAPI app, so 02 should land first. |
+| Systems Affected | `src/core/execution/worker.py` + `supervisor.py` (new), `src/core/persistence/migrations/002_workers.sql` (new), `src/service/routes/commands.py` (new), `src/service/deps.py`, `src/cli.py`, `src/utils/logging_config.py` (new) |
+| Dependencies | stdlib `multiprocessing` + `signal` + `httpx` (already in requests-family deps, but httpx preferred for the CLI `--remote` path — or stay on `requests`) |
+| Estimated Tasks | 9 |
+| Prerequisite | Plan 01 (Foundation) + Plan 02 (Read API; the FastAPI app factory must exist). Plan 05 still owns the final `create_app()` composition. |
 
 ---
 
@@ -40,11 +41,45 @@ After plans 01–03 the service is observe-only. Runs still start from the CLI a
 
 | Method | Path | Body | Returns |
 |---|---|---|---|
-| POST | `/executions` | `{ticket_id, project, kind, options?}` | `202` + `Execution` row (status `queued` → `running`) |
-| POST | `/executions/{id}/cancel` | — | `202` + `Execution` (status `cancelling`) |
-| POST | `/executions/{id}/retry` | — | `202` + new `Execution` linking to original via `metadata_json.retry_of` |
+| POST | `/executions` | `StartExecutionBody` (see below) | `202` + `ExecutionOut` (status `queued`, worker transitions it to `running`) |
+| POST | `/executions/{id}/cancel` | — | `202` + `ExecutionOut` (status `cancelling`) |
+| POST | `/executions/{id}/retry` | — | `202` + new `ExecutionOut` linking to original via `metadata_json.retry_of` |
 
-All are async: the endpoint returns immediately after queueing; real progress comes via plan 03's stream or plan 02's GET.
+All three are declared with explicit `status_code=202` on the FastAPI route decorator (default is 200).
+
+All accept an optional `Idempotency-Key` header. If present, repo's `find_by_idempotency_key` returns the existing execution instead of creating a new one; response is the same shape but the `seq` counter / subprocess is not started again.
+
+All are async: the endpoint returns immediately after queueing; real progress is observed via plan 03's stream or plan 02's GET events.
+
+### Request schemas (pydantic v2, `extra="forbid"`)
+
+```python
+class ExecutionOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revise: bool = False
+    max_turns: int | None = Field(default=None, ge=1, le=200)
+    follow_up_ticket: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9]+-\d+$")
+    # add explicit fields only — never a free-form dict
+
+class StartExecutionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ticket_id: str = Field(pattern=r"^[A-Z][A-Z0-9]+-\d+$")
+    project: str = Field(min_length=1, max_length=64)
+    kind: ExecutionKind                          # imported from src.core.execution.models
+    options: ExecutionOptions = ExecutionOptions()
+```
+
+**Why `extra="forbid"`:** the body flows into `metadata_json` and is later read by the worker → orchestrator → agent prompts → `Bash` tool calls. Any free-form dict is a prompt-injection vector. Only explicit, enumerated fields pass the boundary.
+
+### Rate limiting
+
+Per-token cap enforced by the auth dependency (introduced in plan 05):
+- `max_concurrent_executions` per token (default 3)
+- `max_new_executions_per_minute` per token (default 30)
+
+Exceeding either returns `429` with `Retry-After`. Configured under `service.rate_limits.*` in `config.yaml`.
 
 ---
 
@@ -63,14 +98,21 @@ All are async: the endpoint returns immediately after queueing; real progress co
 
 | File | Action |
 |---|---|
+| `src/core/persistence/migrations/002_workers.sql` | CREATE — `workers` table |
 | `src/core/execution/worker.py` | CREATE — subprocess entry point |
 | `src/core/execution/supervisor.py` | CREATE — `Supervisor` class |
 | `src/service/routes/commands.py` | CREATE — three endpoints |
-| `src/service/app.py` | UPDATE — init Supervisor on startup, reconcile, include router |
-| `src/service/deps.py` | UPDATE — `get_supervisor()` dependency |
-| `src/cli.py` | UPDATE — `execute --remote` flag posts to local service |
+| `src/service/routes/__init__.py` | UPDATE — export `commands.router` |
+| `src/service/deps.py` | UPDATE — `get_supervisor()` dependency + `lifespan` helper |
+| `src/utils/logging_config.py` | CREATE — `configure_logging()` used by CLI, service, and worker |
+| `src/cli.py` | UPDATE — `execute --remote [--follow]` flag posts to local service with bearer auth |
 | `tests/core/test_supervisor.py` | CREATE |
+| `tests/core/test_worker_logging.py` | CREATE — assert spawned worker writes logs + jsonl |
 | `tests/service/test_commands_routes.py` | CREATE |
+| `tests/integration/test_end_to_end.py` | CREATE — start → stream → cancel → reconcile |
+
+**Not touched here** (plan 05 owns `create_app()`):
+- `src/service/app.py` — 05 wires the `lifespan` that owns Supervisor + reconciliation.
 
 ---
 
@@ -81,104 +123,215 @@ All are async: the endpoint returns immediately after queueing; real progress co
 - Env: inherits `SENTINEL_*`, `DOCKER_HOST`, `PATH`, etc. — important for DooD to keep working.
 - cwd: repository root (`/app` in sentinel-dev) — the orchestrator itself sets worktree cwd via its existing logic.
 - Exit code: 0 on `ExecutionStatus.SUCCEEDED`, non-zero otherwise. Supervisor reads row status; exit code is a sanity check.
-- Logs: inherit stdout/stderr from supervisor; get captured into `logs/workers/<execution_id>.log` if configured.
+- **Logs:** worker's `main()` calls `configure_logging()` *first* (before importing anything heavy). `spawn` re-imports the process — `basicConfig` at `cli.py` module top does NOT run in the child. The worker also re-initializes the structured diagnostic file path so `logs/agent_diagnostics.jsonl` keeps being written.
+- **Heartbeat:** a daemon thread inside the worker `UPDATE workers SET last_heartbeat_at = now WHERE execution_id = ?` every 5s. Heartbeat writes use their own connection, `BEGIN IMMEDIATE` + `COMMIT`, `busy_timeout=30000`.
+- **Child containers:** the worker records compose project names in `executions.metadata_json.compose_projects[]` as it starts per-ticket `appserver-*` stacks.
 
-## Cancellation
+## Cancellation & cleanup
 
-- `Supervisor.cancel(execution_id)` → `os.kill(pid, signal.SIGTERM)`.
-- Worker installs a SIGTERM handler that:
-  1. Sets an `execution.cancelling` flag (published as event + row update).
-  2. Lets the current agent request finish (best-effort; agent SDK call is synchronous).
-  3. Updates row to `status='cancelled'` and exits cleanly.
-- If the worker doesn't exit within 30s after SIGTERM, supervisor sends SIGKILL and marks the row `cancelled` with `error='terminated_after_timeout'`.
+Two-stage signal dance:
 
-**GOTCHA**: The current claude-agent-sdk call is synchronous and may not be interruptible mid-turn. Cancellation is therefore best-effort between agent turns — document this. Do not attempt to interrupt mid-turn.
+1. `Supervisor.cancel(execution_id)`:
+   - Row `status → cancelling`; publish `ExecutionCancelling`.
+   - `os.kill(pid, signal.SIGTERM)`.
+2. Worker SIGTERM handler (main thread):
+   - Set internal cancel flag; lets current agent turn finish.
+   - Publish `ExecutionCancelled` after the current turn; row `status → cancelled`.
+   - Exit 0.
+3. If the worker hasn't exited within **grace=20s**: `os.kill(pid, signal.SIGINT)` (second try; some SDK calls handle SIGINT but not SIGTERM).
+4. If still alive at **kill=30s**: `os.kill(pid, signal.SIGKILL)`.
+5. **Post-mortem cleanup (always runs, regardless of how the worker died):**
+   - For each compose project in `metadata_json.compose_projects[]`:
+     `docker compose -p <name> down -v --timeout 5`.
+   - Prune worktree branch if the orchestrator's finally didn't run.
+   - Row: if currently `cancelling` → `cancelled` (success), else `failed` with `error='terminated_after_timeout'`.
+   - Publish the terminal event (`ExecutionCancelled` or `ExecutionFailed`).
+6. Post-mortem is **idempotent** — it may have partially completed inside the worker's `finally` already. Each step is defensive (`docker compose down` on a non-existent project is a no-op warning, not an error).
 
-## Startup Reconciliation
+**GOTCHA — best-effort mid-turn cancel.** The claude-agent-sdk call is synchronous. Cancellation takes effect between turns, which can be minutes. The 30s escalation window is the operator's backstop.
 
-On service boot (`@app.on_event("startup")`):
+**GOTCHA — container leak on SIGKILL without post-mortem.** If the supervisor itself is killed mid-cancel (operator `kill -9`s the service), the post-mortem never runs. Next startup's reconciliation has access to the compose project names (they're in `metadata_json`) and runs the same cleanup on reconciled rows.
 
-```sql
-UPDATE executions
-SET status = 'failed', ended_at = :now, error = 'orphaned_on_restart'
-WHERE status IN ('running','cancelling') AND id NOT IN (:live_pids);
+## Startup reconciliation (with heartbeat)
+
+On service boot, `Supervisor.adopt_or_reconcile_on_startup(repo)`:
+
+```python
+for row in repo.list(status=("running","cancelling")):
+    worker = repo.get_worker(row.id)             # reads workers table
+    alive = worker and _pid_alive(worker.pid)
+    fresh = worker and (now - worker.last_heartbeat_at) < timedelta(seconds=30)
+    if alive and fresh:
+        _workers[row.id] = _adopt_existing(worker.pid)      # track but don't respawn
+        continue
+    # Orphaned — mark failed and run post-mortem cleanup
+    repo.record_ended(row.id, ExecutionStatus.FAILED, error="orphaned_on_restart")
+    bus.publish(ExecutionFailed(execution_id=row.id, error="orphaned_on_restart"))
+    for project in row.metadata.get("compose_projects", []):
+        _docker_compose_down_best_effort(project)
 ```
 
-Since PID tracking is process-local, *all* in-progress rows at startup are considered orphaned — there is no persisted worker registry. Plan documents this. (A later plan could add a `workers` table if we ever run the service in an HA pair.)
+`_pid_alive(pid)` is `os.kill(pid, 0)`; raises `ProcessLookupError` if dead.
+
+This preserves the user story "runs survive the service restarting" for legitimate in-flight workers and keeps clean reconciliation for actually-dead ones.
 
 ---
 
 ## Tasks
 
-### Task 1 — CREATE `src/core/execution/worker.py`
-Stand-alone entry point (`python -m src.core.execution.worker --execution-id X`). Loads config, opens DB, instantiates `Orchestrator`, calls the kind-specific method (read `kind` off the row), exits with appropriate code. Registers SIGTERM handler.
+### Task 1 — CREATE `src/core/persistence/migrations/002_workers.sql`
+```sql
+CREATE TABLE IF NOT EXISTS workers (
+    execution_id      TEXT PRIMARY KEY REFERENCES executions(id) ON DELETE CASCADE,
+    pid               INTEGER NOT NULL,
+    started_at        TEXT NOT NULL,
+    last_heartbeat_at TEXT NOT NULL,
+    compose_projects  TEXT NOT NULL DEFAULT '[]'    -- JSON array, populated by worker as it starts per-ticket stacks
+);
+CREATE INDEX IF NOT EXISTS idx_workers_heartbeat ON workers(last_heartbeat_at);
+```
 
-**GOTCHA**: Worker must re-read `Execution.options` from `metadata_json` rather than accepting them via argv — keeps the endpoint body small, avoids escaping games.
+**VALIDATE**: `sqlite3 ~/.sentinel/sentinel.db ".schema workers"` after `ensure_initialized()`.
 
-**VALIDATE**: `python -m src.core.execution.worker --help` works; invoking on a seeded execution row runs it to completion.
+### Task 2 — CREATE `src/utils/logging_config.py`
+Extract logging setup from `cli.py`'s module-level `basicConfig` into a reusable `configure_logging(level: int = logging.INFO, *, enable_jsonl: bool = True) -> None`. Called by CLI, by FastAPI lifespan, and — critically — by the worker entrypoint *before* any other import.
 
-### Task 2 — CREATE `src/core/execution/supervisor.py`
+**GOTCHA**: `spawn` re-imports; without this, workers run silently. A test must assert the spawned worker writes a line to the log file.
+
+**VALIDATE**: `pytest tests/core/test_worker_logging.py`.
+
+### Task 3 — CREATE `src/core/execution/worker.py`
+Stand-alone entry point (`python -m src.core.execution.worker --execution-id X`).
+
+```python
+def main() -> int:
+    from src.utils.logging_config import configure_logging
+    configure_logging()
+    # ... now safe to import orchestration, SDK, etc.
+    from src.core.persistence.db import connect, ensure_initialized
+    from src.core.execution.repository import ExecutionRepository
+    from src.core.execution.orchestrator import Orchestrator
+    # ... parse argv for --execution-id, register SIGTERM/SIGINT handlers, start heartbeat thread, run orchestrator.
+```
+
+- Heartbeat daemon thread: opens its own sqlite connection, `UPDATE workers SET last_heartbeat_at = ? WHERE execution_id = ?` every 5s.
+- SIGTERM/SIGINT → set cancel flag; cleanup in `finally`: publish terminal event, run `docker compose down` for any project the orchestrator registered, close DB.
+- Exit code: 0 on success, non-zero otherwise.
+
+**GOTCHA**: Options are read from `executions.metadata_json`, never argv — keeps the endpoint body small and escape-free.
+
+**VALIDATE**: `python -m src.core.execution.worker --help` works; invoking on a seeded execution row runs it to completion and produces events in the DB.
+
+### Task 4 — CREATE `src/core/execution/supervisor.py`
+
 ```python
 class Supervisor:
-    def __init__(self, ctx=None):
-        self._ctx = ctx or multiprocessing.get_context("spawn")
+    def __init__(self, repo: ExecutionRepository, bus: EventBus):
+        self._ctx = multiprocessing.get_context("spawn")
         self._workers: dict[str, multiprocessing.Process] = {}
         self._lock = threading.Lock()
+        self._repo = repo
+        self._bus = bus
 
     def spawn(self, execution_id: str) -> None: ...
     def cancel(self, execution_id: str) -> None: ...
-    def reap(self) -> None: ...            # remove finished entries; called periodically + on request
-    def reconcile_on_startup(self, repo: ExecutionRepository) -> int: ...  # returns # orphaned
+    def reap(self) -> int: ...                   # called by periodic task + on request
+    def adopt_or_reconcile_on_startup(self) -> tuple[int, int]: ...   # (adopted, reconciled)
+    def post_mortem(self, execution_id: str) -> None: ...             # docker compose down, etc.
+
+    def _pid_alive(self, pid: int) -> bool:
+        try: os.kill(pid, 0); return True
+        except ProcessLookupError: return False
 ```
 
-**GOTCHA**: `reap()` needs to run periodically — schedule via `asyncio.create_task(periodic_reap(...))` on app startup, interval 5s.
+All reads/writes of `_workers` take `_lock` — enforce with a small `@_locked` decorator.
+
+**GOTCHA — periodic reap**: schedule via `asyncio.create_task(periodic_reap(...))` in the FastAPI lifespan (Task 6), interval 5s.
 
 **VALIDATE**: `pytest tests/core/test_supervisor.py`.
 
-### Task 3 — CREATE `src/service/routes/commands.py`
-Three endpoints. Bodies validated with pydantic schemas. Each:
-- `POST /executions` → `repo.create(..., status=queued)` → `supervisor.spawn(id)` → `repo.set_status(running)` (or let worker do that — prefer worker to avoid a race where spawn fails after row is `running`).
-- `POST /executions/{id}/cancel` → 404 if not found; 409 if not in a cancellable status; else `supervisor.cancel(id)`.
-- `POST /executions/{id}/retry` → 404 if not found; 409 if original still running; else create new row with `metadata_json.retry_of = original.id`, copy `ticket_id/project/kind/options`, spawn.
+### Task 5 — CREATE `src/service/routes/commands.py`
+Three endpoints, pydantic `StartExecutionBody` / `ExecutionOptions` with `extra="forbid"`.
+
+```python
+@router.post("/executions", status_code=202, response_model=ExecutionOut)
+def start(
+    body: StartExecutionBody,
+    idempotency_key: Annotated[str | None, Header()] = None,
+    repo: Annotated[ExecutionRepository, Depends(get_repo)] = ...,
+    supervisor: Annotated[Supervisor, Depends(get_supervisor)] = ...,
+):
+    if idempotency_key:
+        existing = repo.find_by_idempotency_key(idempotency_key)
+        if existing:
+            return existing
+    execution = repo.create(..., idempotency_key=idempotency_key)
+    supervisor.spawn(execution.id)                 # worker transitions row to 'running'
+    return execution
+```
+
+Cancel: 404 if not found; 409 if not in `running`/`queued`/`cancelling`; else `supervisor.cancel(id)`.
+
+Retry: 404 if not found; 409 if original still running; else new row with `metadata_json.retry_of = original.id`, copy `ticket_id/project/kind/options`, `supervisor.spawn`.
+
+**GOTCHA — race on spawn failure**: if `supervisor.spawn` raises after `repo.create`, the row is `queued` with no worker. Catch in the endpoint, `repo.record_ended(id, FAILED, error="spawn_failed: ...")`, return 500 with a descriptive body.
 
 **VALIDATE**: `pytest tests/service/test_commands_routes.py`.
 
-### Task 4 — UPDATE `src/service/app.py`
-```python
-@app.on_event("startup")
-async def _startup():
-    app.state.supervisor = Supervisor()
-    n = app.state.supervisor.reconcile_on_startup(get_repo_from_state(app))
-    logger.info("reconciled %d orphaned executions", n)
-    app.state.reaper_task = asyncio.create_task(_reaper(app.state.supervisor))
+### Task 6 — UPDATE `src/service/deps.py` and add lifespan helper
 
-@app.on_event("shutdown")
-async def _shutdown():
-    app.state.reaper_task.cancel()
-    for eid in list(app.state.supervisor._workers):
-        app.state.supervisor.cancel(eid)
+```python
+# deps.py
+def get_supervisor(request: Request) -> Supervisor:
+    return request.app.state.supervisor
+
+@asynccontextmanager
+async def command_center_lifespan(app: FastAPI):
+    ensure_initialized()
+    conn = connect()
+    repo = ExecutionRepository(conn)
+    bus = EventBus(conn)
+    supervisor = Supervisor(repo=repo, bus=bus)
+    adopted, reconciled = supervisor.adopt_or_reconcile_on_startup()
+    logger.info("startup: adopted=%d reconciled=%d", adopted, reconciled)
+    app.state.supervisor = supervisor
+    app.state.reaper_task = asyncio.create_task(_periodic_reap(supervisor))
+    try:
+        yield
+    finally:
+        app.state.reaper_task.cancel()
+        for eid in list(supervisor._workers):
+            supervisor.cancel(eid)
+        conn.close()
 ```
 
-**GOTCHA**: Shutdown is best-effort — a cold kill (SIGKILL from the container) leaves `status='running'`. The next startup's reconciliation will clean up.
+Plan 05's `create_app()` does `app = FastAPI(lifespan=command_center_lifespan)`. No `@app.on_event(...)` — deprecated.
 
-**VALIDATE**: `create_app()` startup/shutdown runs without error in tests.
+**GOTCHA — uvicorn single-process**: `uvicorn.run(create_app(), host=..., port=...)` on an app *instance* (not factory string) keeps a single process, which is required because Supervisor state and SQLite writes are per-process. Document this as intentional in plan 02 and plan 05 (not a "we forgot to scale" bug).
 
-### Task 5 — UPDATE `src/service/deps.py`
-Add `get_supervisor(request: Request) -> Supervisor` that returns `request.app.state.supervisor`.
+### Task 7 — UPDATE `src/cli.py` — add `execute --remote [--follow]`
 
-### Task 6 — UPDATE `src/cli.py`
-Add `--remote` flag on `execute` (and optionally `plan`, `debrief`). When set, HTTP POST to `http://127.0.0.1:${SENTINEL_SERVICE_PORT:-8787}/executions` with the options body; print the returned execution id; optionally tail the stream (plan 03) if stdout is a TTY and `--follow` flag is set.
+- Read bearer token from `SENTINEL_SERVICE_TOKEN` env or `~/.sentinel/service_token` file (file path + permission semantics defined in plan 05).
+- Base URL: `SENTINEL_SERVICE_URL` env (default `http://127.0.0.1:8787`), with `service.port` / `service.bind_address` also readable from config as fallback.
+- POST to `/executions` with `Authorization: Bearer <token>` and JSON body built from CLI options. Support `Idempotency-Key` header if user passes `--idempotency-key K` (otherwise omit).
+- If `--follow`: open `ws://.../executions/{id}/stream?since_seq=0` with the same bearer token (via `Authorization` header or `?token=` fallback per plan 05's WS auth) and print incoming events as plain-text one-liners.
+- Clear errors:
+  - Service unreachable → exit 3 with "service not running at {url} — start it with `sentinel serve`".
+  - 401 → exit 4 with "invalid token at ~/.sentinel/service_token".
+  - 429 → exit 5 with "rate limit reached; retry after {Retry-After}s".
 
-**GOTCHA**: When the service isn't running, `--remote` should fail fast with a clear message, not fall back to in-process — ambiguity would mask real failures.
+**GOTCHA**: `--remote` must never silently fall back to in-process. Ambiguity masks real failures.
 
-**VALIDATE**: `sentinel execute --remote TICKET` returns an id; the run proceeds in a subprocess owned by the service; the CLI can exit without killing the run.
+**VALIDATE**: `sentinel execute --remote TICKET --follow` starts a run, streams events, survives the CLI exiting before the run completes.
 
-### Task 7 — tests
+### Task 8 — tests
 
-- `tests/core/test_supervisor.py` — spawn a no-op worker (a trivial `python -c "import sys; sys.exit(0)"` subprocess swapped in via dependency injection); assert tracking; cancel via SIGTERM; reap removes from dict.
-- `tests/service/test_commands_routes.py` — POST start → row created, worker spawned (mock Supervisor); cancel happy + 409 paths; retry creates new row with `retry_of` set.
+- `tests/core/test_supervisor.py` — spawn a no-op worker (trivial `sys.exit(0)` entrypoint); assert `_workers` tracks it; cancel via SIGTERM; reap removes from dict. Reconcile: seed `running` row with dead PID → `failed`; seed `running` row with live PID + fresh heartbeat → adopted (dict size +=1).
+- `tests/core/test_worker_logging.py` — spawn the real worker with a seeded no-op execution; assert that `logs/cli_stderr.log` (or the configured file) contains at least one INFO line, and `logs/agent_diagnostics.jsonl` is appended to.
+- `tests/service/test_commands_routes.py` — POST start with valid body → 202 + row; `extra="forbid"` rejects unknown keys → 422; idempotency key deduplicates; cancel happy + 409 paths; retry creates linked row.
+- `tests/integration/test_end_to_end.py` — drive the full flow using `TestClient` + a fake Orchestrator that emits 5 events then completes. Assert: POST → stream → events arrive in order → terminal frame → row is `succeeded`. Also: POST → cancel → row is `cancelled` with matching events.
 
-**VALIDATE**: `pytest tests/core tests/service -v`.
+**VALIDATE**: `pytest tests/core tests/service tests/integration -v`.
 
 ---
 
@@ -206,10 +359,14 @@ sentinel serve --port 8787 &
 ## Acceptance Criteria
 
 - [ ] `POST /executions` starts a subprocess; CLI exit does not kill it
-- [ ] `POST /executions/{id}/cancel` transitions row to `cancelled` within 30s (or kills + marks after)
+- [ ] `POST /executions/{id}/cancel` transitions row to `cancelled` within 30s (or kills + marks after with post-mortem cleanup)
 - [ ] `POST /executions/{id}/retry` creates a new linked row
-- [ ] Service restart reconciles orphaned rows
-- [ ] DooD still works from inside the worker (container ops in `sentinel execute` still succeed)
+- [ ] `extra="forbid"` rejects unknown body fields with 422
+- [ ] `Idempotency-Key` deduplicates retries of the same POST
+- [ ] Service restart **adopts** live detached workers (heartbeat + PID check) and **reconciles** dead ones
+- [ ] Per-ticket `appserver-*` containers are cleaned up on cancel/failure/orphan (no leaks)
+- [ ] Worker writes to both `logs/*.log` (via `configure_logging`) AND `logs/agent_diagnostics.jsonl`
+- [ ] Integration test covers start → stream → cancel → reconcile
 - [ ] Foundation + plans 02/03 tests still green
 
 ## Risks & Mitigations
@@ -218,11 +375,17 @@ sentinel serve --port 8787 &
 |---|---|---|---|
 | `spawn` context can't pickle config/orchestrator | HIGH | HIGH | Worker is a module entry point with argv; nothing is pickled — the child reconstructs state from the DB + env |
 | Subprocess inherits file descriptors it shouldn't (DB connection, sockets) | MED | MED | Use `spawn`, not `fork`. Verify with `lsof` during a test run |
-| Cancel takes too long because agent SDK call is uninterruptible | MED | MED | 30s grace window, then SIGKILL; document best-effort semantics |
-| Orphan-on-restart marks *correctly-running* workers as failed during zero-downtime deploys | LOW | HIGH | Out of scope — we have no zero-downtime deploy story; single-instance assumption documented |
-| Workers pile up under `/app/logs/workers/` | LOW | LOW | Log rotation is an ops concern; not solved here |
+| Cancel takes too long because agent SDK call is uninterruptible | MED | MED | 20s SIGTERM → 10s SIGINT → SIGKILL escalation; post-mortem cleanup runs regardless |
+| Worker logging silently disabled because `spawn` re-imports without running `basicConfig` | HIGH (if unaddressed) | MED | `configure_logging()` is the first call in `worker.main`; `test_worker_logging` guards this |
+| Per-ticket `appserver-*` containers leak on SIGKILL | HIGH (if unaddressed) | MED | Supervisor post-mortem reads `metadata_json.compose_projects[]` and runs `docker compose down` idempotently |
+| `_workers` dict mutated from both HTTP thread and asyncio reaper | MED | MED | `threading.Lock` enforced on all read/write paths via `@_locked` decorator |
+| HA deploy false-reconciles a peer's in-flight workers | LOW | HIGH | Out of scope — explicit single-instance assumption. Documented. |
+| Worker log files grow unbounded under `/app/logs/workers/` | LOW | LOW | Log rotation is ops; file issue as follow-up debt |
+| Leaked bearer token triggers unlimited runs (Anthropic $$) | MED | HIGH | Per-token concurrency + per-minute rate cap enforced in plan 05's auth dep; config-driven |
 
 ## Notes
 
 - Branch: `experimental/command-center-04-commands-workers`.
 - Why not asyncio tasks instead of subprocesses? A raise/crash inside an asyncio task can take down the service or leak handles. Subprocesses give real isolation at the OS level, and `spawn` sidesteps uvicorn/fork hazards. Also: a subprocess is what the existing CLI flow effectively is today — minimal conceptual distance.
+- Why DB-heartbeats instead of a PID file? Two reasons: (a) the `workers` table survives reboots and is queryable for operator tooling; (b) SQLite-level coordination reuses the WAL we already need. A PID file is fine fallback if `workers` ever has to be dropped.
+- Plan 05's auth dep layers **on top of** these endpoints; this plan deliberately leaves the routes unauthenticated in isolation so tests can exercise them without the token dance. When 05 lands, the `protected` router wraps all three endpoints.

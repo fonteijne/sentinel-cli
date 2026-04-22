@@ -2,30 +2,40 @@
 
 ## Summary
 
-Add a WebSocket endpoint `/executions/{id}/stream` that replays events from the `events` table (catch-up) and then tails the in-process `EventBus` for new events until the execution ends or the client disconnects.
+Add a WebSocket endpoint `/executions/{id}/stream` that tails events by polling the `events` table and streams them as JSON frames until the execution ends or the client disconnects.
 
 ## User Story
 
 As a Command Center dashboard
 I want a single long-lived connection per execution that delivers events in order
-So that I can render live progress without polling.
+So that I can render live progress without HTTP polling from the browser.
 
 ## Problem Statement
 
-After plans 01 + 02 a dashboard can fetch paginated events, but polling is wasteful, lossy at the boundary, and adds dashboard-side complexity. A tail-of-the-bus stream is the natural surface.
+After plans 01 + 02 a dashboard can fetch paginated events, but client-side HTTP polling is wasteful, lossy at the boundary, and pushes complexity onto every consumer.
 
 ## Solution Statement
 
-Single WebSocket route:
+**Server-side DB polling, client-side single stream.** The browser sees one WebSocket; the server translates that into a tight DB-poll loop.
+
+Rationale for DB-polling over an in-memory bus subscription:
+
+- Plan 04 runs executions in **subprocess workers**. Those workers own their own `EventBus` Python object — the service's bus cannot see their events via `subscribe()`. Persistence is the only cross-process truth.
+- Single code path for the in-process CLI case and the out-of-process worker case. No "subscribe first, replay second" race to get wrong.
+- SQLite WAL readers never block writers; a 200ms poll on an indexed `(execution_id, seq)` scan is cheap and predictable.
+
+Route flow:
 
 1. Client opens `ws://…/executions/{id}/stream?since_seq=N` (optional).
-2. Server reads events from DB where `execution_id=? AND seq>?` in batches, sends as JSON frames.
-3. Server then subscribes to `EventBus` for this process; pushes new matching events until:
-   - Execution's final event (`execution.completed` / `execution.failed` / `execution.cancelled`) is sent → close with code 1000.
-   - Client disconnects → unsubscribe, close.
-   - Idle > 30s → send heartbeat ping frame; disconnect on timeout.
+2. Server `accept()`s. If execution does not exist → close `4404` and return.
+3. Loop:
+   a. `SELECT ... WHERE execution_id = ? AND seq > ? ORDER BY seq LIMIT 500` via `repo.iter_events(...)`.
+   b. For each row: `await ws.send_json({"kind": "event", ...})`.
+   c. If the last row's `type` is in `TERMINAL_EVENT_TYPES`: send `{"kind":"end","execution_status":...}` and close.
+   d. If no rows this tick: send `{"kind":"heartbeat","ts":...}` every ~30s of silence; else idle-sleep 200ms.
+4. Client disconnect → `WebSocketDisconnect` → exit loop cleanly.
 
-An `asyncio.Queue` bridges the sync `EventBus.publish` into the route's async loop; the subscriber callback is a one-line `loop.call_soon_threadsafe(queue.put_nowait, event)`.
+No in-memory queue, no subscriber thread, no race between replay and live feed. `since_seq` is just the initial `last_seq` in the loop.
 
 ## Metadata
 
@@ -33,9 +43,9 @@ An `asyncio.Queue` bridges the sync `EventBus.publish` into the route's async lo
 |---|---|
 | Type | NEW_CAPABILITY |
 | Complexity | MEDIUM |
-| Systems Affected | `src/service/routes/stream.py` (new), `src/service/app.py`, `src/core/events/bus.py` (minor) |
+| Systems Affected | `src/service/routes/stream.py` (new), `src/service/app.py`, `src/service/deps.py` |
 | Dependencies | None new |
-| Estimated Tasks | 5 |
+| Estimated Tasks | 4 |
 | Prerequisite | Plans 01 + 02 |
 
 ---
@@ -56,10 +66,14 @@ An `asyncio.Queue` bridges the sync `EventBus.publish` into the route's async lo
 
 | File | Action |
 |---|---|
-| `src/service/routes/stream.py` | CREATE |
-| `src/service/app.py` | UPDATE — `include_router(stream.router)` |
-| `src/core/events/bus.py` | UPDATE — expose `subscribe()` return value (unsubscribe callable) if not already; ensure thread-safety of the subscriber list (already locked in plan 01) |
+| `src/service/routes/stream.py` | CREATE — WebSocket endpoint, DB-polling tail |
+| `src/service/routes/__init__.py` | UPDATE — export the new router |
 | `tests/service/test_stream.py` | CREATE |
+
+**Not touched here** (plan 05 owns `create_app()` composition):
+- `src/service/app.py` — 05 wires the stream router behind auth.
+- `src/service/deps.py` — `get_repo` and `get_db_conn` already exist from plan 02; we reuse them.
+- `src/core/events/bus.py` — unchanged. The bus stays in-process for local consumers (CLI log adapter); WS tail does not subscribe.
 
 ---
 
@@ -68,97 +82,133 @@ An `asyncio.Queue` bridges the sync `EventBus.publish` into the route's async lo
 Server → client, one JSON object per frame:
 
 ```json
-{"kind":"replay","seq":42,"ts":"...","type":"agent.message_sent","agent":"python_developer","payload":{...}}
-{"kind":"live","seq":43,"ts":"...","type":"tool.called","agent":"python_developer","payload":{...}}
+{"kind":"event","seq":42,"ts":"...","type":"agent.message_sent","agent":"python_developer","payload":{...}}
+{"kind":"event","seq":43,"ts":"...","type":"tool.called","agent":"python_developer","payload":{...}}
 {"kind":"heartbeat","ts":"..."}
 {"kind":"end","execution_status":"succeeded"}
 ```
 
-Client need not distinguish `replay`/`live` for rendering, but debugging and reconnection logic benefit from the hint.
+Every event frame has the same shape (no replay/live distinction — there's one source). The envelope fields (`seq`, `ts`, `type`, `agent`) sit at the top level; the event-specific fields are nested under `payload` so the frame shape is stable across event types.
+
+Terminal statuses derived from the terminal event type: `execution.completed` → `succeeded`, `execution.failed` → `failed`, `execution.cancelled` → `cancelled`.
 
 ---
 
 ## Tasks
 
-### Task 1 — UPDATE `src/core/events/bus.py`
-Ensure `subscribe(cb) -> Callable[[], None]` returns an unsubscribe fn (plan 01 already specifies this — verify in code, add if missing). Add a `topic` filter param (optional `execution_id`) so the stream route doesn't receive events for other runs it would then drop. If kept simple, filter on the caller side — acceptable for now.
+### Task 1 — CREATE `src/service/routes/stream.py`
 
-**GOTCHA**: Subscriber is invoked on the thread that published. For the stream route, the subscriber must *not* do async work — only `queue.put_nowait` via `loop.call_soon_threadsafe`.
-
-**VALIDATE**: `pytest tests/core/test_event_bus.py` still passes.
-
-### Task 2 — CREATE `src/service/routes/stream.py`
 ```python
-@router.websocket("/executions/{execution_id}/stream")
-async def stream(ws: WebSocket, execution_id: str, since_seq: int = 0,
-                 repo: ExecutionRepository = Depends(get_repo),
-                 bus: EventBus = Depends(get_bus)):
-    await ws.accept()
-    execution = repo.get(execution_id)
-    if execution is None:
-        await ws.close(code=4404); return
+from __future__ import annotations
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-    loop = asyncio.get_running_loop()
-    unsubscribe = bus.subscribe(
-        lambda ev: ev.execution_id == execution_id
-            and loop.call_soon_threadsafe(queue.put_nowait, ev)
-    )
+import asyncio
+from datetime import datetime, timezone
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, status
+
+from src.core.events.types import TERMINAL_EVENT_TYPES
+from src.core.execution.repository import ExecutionRepository
+from src.service.deps import get_repo
+
+router = APIRouter()
+
+POLL_INTERVAL_S = 0.2
+HEARTBEAT_INTERVAL_S = 30.0
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _frame_from_row(row) -> dict:
+    return {
+        "kind": "event",
+        "seq": row["seq"],
+        "ts": row["ts"],
+        "type": row["type"],
+        "agent": row["agent"],
+        "payload": row["payload"],            # repo returns already-parsed dict
+    }
+
+
+@router.websocket("/executions/{execution_id}/stream")
+async def stream(
+    ws: WebSocket,
+    execution_id: str,
+    since_seq: int = 0,
+    repo: Annotated[ExecutionRepository, Depends(get_repo)] = ...,
+) -> None:
+    await ws.accept()
+    if repo.get(execution_id) is None:
+        await ws.close(code=4404)
+        return
+
+    last_seq = since_seq
+    last_heartbeat = asyncio.get_running_loop().time()
 
     try:
-        # 1. Replay
-        last_seq = since_seq
-        for row in repo.iter_events(execution_id, since_seq=since_seq, batch=500):
-            await ws.send_json({"kind":"replay", **_serialize(row)})
-            last_seq = row.seq
-
-        # 2. Live tail
         while True:
-            try:
-                ev = await asyncio.wait_for(queue.get(), timeout=30)
-            except asyncio.TimeoutError:
-                await ws.send_json({"kind":"heartbeat","ts":_now()})
-                continue
-            if ev.seq <= last_seq:
-                continue                                # already sent via replay
-            await ws.send_json({"kind":"live", **_serialize(ev)})
-            last_seq = ev.seq
-            if ev.type in _TERMINAL_TYPES:
-                await ws.send_json({"kind":"end","execution_status":ev.type.split(".")[-1]})
-                break
+            rows = list(repo.iter_events(execution_id, since_seq=last_seq, limit=500))
+
+            for row in rows:
+                await ws.send_json(_frame_from_row(row))
+                last_seq = row["seq"]
+                if row["type"] in TERMINAL_EVENT_TYPES:
+                    await ws.send_json({
+                        "kind": "end",
+                        "execution_status": row["type"].split(".")[-1],
+                    })
+                    return
+
+            now = asyncio.get_running_loop().time()
+            if not rows and (now - last_heartbeat) >= HEARTBEAT_INTERVAL_S:
+                await ws.send_json({"kind": "heartbeat", "ts": _now_iso()})
+                last_heartbeat = now
+
+            await asyncio.sleep(POLL_INTERVAL_S)
     except WebSocketDisconnect:
-        pass
+        return
     finally:
-        unsubscribe()
-        with suppress(Exception):
+        try:
             await ws.close()
+        except Exception:
+            pass
 ```
 
-**GOTCHA — dedup**: events emitted between the replay query and subscription must not be missed. Subscribe FIRST into the queue, then run the replay, then drain the queue skipping anything with `seq <= last_seq`. The snippet above subscribes first — **follow that order**.
+**GOTCHA — no subscriber, no race.** The old "subscribe first, replay second" dedup is gone. There is exactly one source (the DB) and `seq` is monotonic; `since_seq` + `ORDER BY seq LIMIT 500` is lossless.
 
-**GOTCHA — queue bound**: `maxsize=1000` prevents memory blowout if a client reads slowly. If full, drop oldest with a `dropped_events` counter sent as a frame. Alternative: close the socket with `1013 (Try Again Later)` — prefer this, simpler and honest.
+**GOTCHA — polling cost.** 200ms × one indexed SELECT per connection is cheap, but multiply by connected clients. Cap concurrent WS connections per execution in plan 05 if this becomes real; for now documented as follow-up.
 
-**GOTCHA — execution already finished**: If `execution.ended_at is not None`, replay then close immediately with `{"kind":"end",...}` — no subscribe needed.
+**GOTCHA — WebSocketDisconnect import.** `from fastapi import WebSocket, WebSocketDisconnect` (re-exported from starlette).
+
+**GOTCHA — stale connection detection.** Browsers don't always fire TCP RST on tab close. The periodic `send_json` (heartbeat or real event) is what surfaces a dead peer — it will raise `WebSocketDisconnect` or `ConnectionClosed` and the loop exits.
 
 **VALIDATE**: `pytest tests/service/test_stream.py`.
 
-### Task 3 — UPDATE `src/service/app.py`
-`app.include_router(stream.router)`. Ensure `get_bus` dependency is wired (new addition: app holds the EventBus singleton created alongside the DB on startup).
+### Task 2 — UPDATE `src/service/routes/__init__.py`
+Re-export the `stream.router` alongside the `executions.router` added in plan 02.
 
-**VALIDATE**: `create_app().routes` includes the ws route.
+**VALIDATE**: `from src.service.routes import stream` works.
 
-### Task 4 — CREATE `repo.iter_events`
-Add a generator method `iter_events(execution_id, since_seq, batch)` on `ExecutionRepository` if not present from plan 01.
+### Task 3 — Verify `repo.iter_events` + `TERMINAL_EVENT_TYPES` exist (from plan 01)
+Both are mandated by plan 01 Task 6 and Task 3 respectively. This task is a checkpoint: if either is missing, fix in plan 01's scope, not here.
 
-**VALIDATE**: Unit test iterating a seeded fixture.
+- `iter_events(execution_id, since_seq=0, limit=500) -> Iterator[RowLike]` — rows have `seq`, `ts`, `type`, `agent`, `payload` (dict, already parsed from `payload_json`).
+- `TERMINAL_EVENT_TYPES` — importable from `src.core.events.types`.
 
-### Task 5 — CREATE `tests/service/test_stream.py`
-Use FastAPI's `TestClient.websocket_connect`:
-- Seed DB with an execution and 3 events (seq 1..3), all final.
-- Connect, assert 3 replay frames + `end` frame.
-- Connect with `since_seq=2`, assert 1 replay frame (seq=3) + `end`.
-- Connect to non-existent execution → closed with 4404.
-- For live behaviour: publish a 4th event *after* connect (use a bus fixture), assert a `live` frame arrives before `end`.
+**VALIDATE**: `python -c "from src.core.events.types import TERMINAL_EVENT_TYPES; from src.core.execution.repository import ExecutionRepository; assert hasattr(ExecutionRepository, 'iter_events')"`
+
+### Task 4 — CREATE `tests/service/test_stream.py`
+Use FastAPI's `TestClient.websocket_connect` (sync — no pytest-asyncio needed):
+
+- **Replay-only, finished execution**: seed 3 events seq=1..3 with final `execution.completed`; connect → assert 3 `event` frames + `end` frame with `execution_status=succeeded`.
+- **since_seq cursor**: same fixture, connect with `?since_seq=2` → assert 1 `event` frame (seq=3) + `end`.
+- **Non-existent execution**: connect to unknown id → closed with 4404.
+- **Live tail of an in-flight run**: seed execution without terminal event; connect; in parallel publish a new event via `bus.publish` (or direct INSERT into the test DB); assert frame arrives within 1s.
+- **Live tail of a subprocess-only run (simulating plan 04)**: seed execution; INSERT events from a thread (simulating another process); assert they appear. **This test is the reason the WS reads from DB, not bus — if it passes here, it passes for subprocess workers.**
+- **Heartbeat on silence**: monkeypatch `HEARTBEAT_INTERVAL_S = 0.5`; seed running execution, no events; assert a `heartbeat` frame arrives within 1s.
+- **Client disconnect**: connect then close; assert the server coroutine exits cleanly (no zombie loop).
 
 **VALIDATE**: `pytest tests/service/test_stream.py -v`.
 
@@ -176,23 +226,25 @@ websocat ws://127.0.0.1:8787/executions/<id>/stream?since_seq=0
 
 ## Acceptance Criteria
 
-- [ ] Replay delivers all historical events in seq order
-- [ ] Live events arrive without gaps vs. replay (no duplicates, no drops)
+- [ ] Events delivered in strict `seq` order with no gaps or duplicates
+- [ ] `since_seq` cursor resumes cleanly from any point
+- [ ] Works for in-process executions AND subprocess-worker executions (plan 04) without code change
 - [ ] Heartbeat frame every ~30s of silence
-- [ ] Socket closes cleanly with `{"kind":"end",...}` on terminal events
-- [ ] Dead-client disconnect doesn't leak the subscriber
+- [ ] Socket closes with `{"kind":"end",...}` on terminal event
+- [ ] Client disconnect exits the server coroutine cleanly (no leaked tasks)
 - [ ] No change to Foundation tests
 
 ## Risks & Mitigations
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Replay/live race produces duplicate or dropped events at the boundary | HIGH | HIGH | Subscribe FIRST, replay SECOND, dedup by `seq`. Covered by a specific test. |
-| Slow client backs up the queue, blocks publisher | MED | MED | Bounded queue (1000); on full, close socket with 1013 |
-| Publisher thread accidentally does async work in subscriber | LOW | HIGH | The one-line `call_soon_threadsafe(put_nowait)` is the *only* work allowed in the subscriber |
-| Dashboard reconnect storm after a server restart | LOW | LOW | Dashboard concern; document reconnect-with-backoff expectation |
+| Polling load scales linearly with connected clients | MED | LOW | 200ms × indexed SELECT is cheap; cap concurrent WS per execution in plan 05 if needed |
+| SQLite reader starves under heavy write contention | LOW | MED | WAL readers don't block writers; `busy_timeout=30000` on the reader connection |
+| Browser tab close doesn't fire disconnect | MED | LOW | Heartbeat send surfaces the dead peer within 30s |
+| Dashboard reconnect storm after a server restart | LOW | LOW | Client uses `since_seq` + backoff — documented in dashboard contract |
 
 ## Notes
 
 - Branch: `experimental/command-center-03-event-stream`.
 - SSE was considered instead of WebSocket. Chose WS because (a) pydantic payloads serialize cleanly as JSON frames either way, (b) bidirectional leaves room for client-side filter subscriptions without a breaking change, (c) starlette WS is already in-tree via FastAPI.
+- **Why DB-polling instead of bus subscription?** Plan 04 runs executions in a subprocess. A subprocess has its own `EventBus` object; the service process cannot `subscribe()` to it. The DB is the only cross-process source of truth, and SQLite WAL makes the poll cheap. This also eliminates the replay/live race that dogged the earlier design.
