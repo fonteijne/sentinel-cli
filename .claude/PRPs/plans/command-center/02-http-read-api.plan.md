@@ -35,7 +35,7 @@ A minimal FastAPI app (factory pattern) mounted with a single `executions` route
 
 | Method | Path | Returns | Query params |
 |---|---|---|---|
-| GET | `/healthz` | `{"status":"ok","db":"ok"}` | — |
+| GET | `/health` | `{"status":"ok","db":"ok"}` | — |
 | GET | `/executions` | Paginated list of `Execution` | `project`, `ticket_id`, `status`, `kind`, `limit` (default 50, max 200), `before` (ISO timestamp) |
 | GET | `/executions/{id}` | Single `Execution` or 404 | — |
 | GET | `/executions/{id}/events` | Paginated list of events | `since_seq` (default 0), `limit` (default 200, max 1000) |
@@ -133,8 +133,8 @@ Five endpoints. Thin — each is `repo.method(...)` → schema conversion → re
 def create_app() -> FastAPI:
     app = FastAPI(title="Sentinel Command Center API", version="0.1")
     app.include_router(executions.router)
-    @app.get("/healthz")
-    def healthz(conn=Depends(get_db_conn)):
+    @app.get("/health")
+    def health(conn=Depends(get_db_conn)):
         conn.execute("SELECT 1").fetchone()
         return {"status": "ok", "db": "ok"}
     return app
@@ -159,7 +159,7 @@ Use `fastapi.testclient.TestClient`. Fixture that seeds a temp DB with a handful
 - events pagination via `since_seq`
 - `limit` clamped when client requests 10000
 - invalid ISO `before` → 422
-- `/healthz` returns ok
+- `/health` returns ok
 
 **VALIDATE**: `pytest tests/service -v`
 
@@ -177,7 +177,7 @@ poetry run python -c "from src.service.app import create_app; create_app()"
 Manual (in sentinel-dev):
 ```bash
 sentinel serve --port 8787 &
-curl -s http://127.0.0.1:8787/healthz | jq
+curl -s http://127.0.0.1:8787/health | jq
 curl -s 'http://127.0.0.1:8787/executions?limit=5' | jq '.items[0]'
 ```
 

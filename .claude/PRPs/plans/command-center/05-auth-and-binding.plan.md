@@ -111,15 +111,15 @@ def create_app() -> FastAPI:
                            allow_methods=["GET","POST"],
                            allow_headers=["authorization","content-type"])
 
-    # Auth applies to every route EXCEPT /healthz
+    # Auth applies to every route EXCEPT /health
     protected = APIRouter(dependencies=[Depends(require_token)])
     protected.include_router(executions.router)
     protected.include_router(stream.router)          # plan 03
     protected.include_router(commands.router)        # plan 04
     app.include_router(protected)
 
-    @app.get("/healthz")                              # unauthenticated on purpose
-    def healthz(...): ...
+    @app.get("/health")                              # unauthenticated on purpose
+    def health(...): ...
 
     return app
 ```
@@ -166,7 +166,7 @@ service:
 - Wrong scheme (`Basic`) → 401
 - Correct token → 200
 - Timing-safe comparison (hard to test; assert `secrets.compare_digest` is called via monkeypatch)
-- `/healthz` reachable without a token
+- `/health` reachable without a token
 - WebSocket rejects without token, accepts with `?token=`
 - Token file auto-created with mode 0600; env var wins over file
 
@@ -189,14 +189,14 @@ sentinel serve &
 TOKEN=$(cat ~/.sentinel/service_token)
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/executions | jq
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/executions        # expect 401
-curl -s http://127.0.0.1:8787/healthz                                            # expect 200
+curl -s http://127.0.0.1:8787/health                                            # expect 200
 stat -c '%a' ~/.sentinel/service_token                                           # expect 600
 ```
 
 ## Acceptance Criteria
 
 - [ ] All protected routes reject requests without a valid bearer token (401)
-- [ ] `/healthz` is reachable unauthenticated
+- [ ] `/health` is reachable unauthenticated
 - [ ] WebSocket route accepts `?token=` or `Authorization` header
 - [ ] Binding to `0.0.0.0` requires the escape-hatch flag
 - [ ] Token file auto-created with mode 0600
@@ -217,4 +217,4 @@ stat -c '%a' ~/.sentinel/service_token                                          
 
 - Branch: `experimental/command-center-05-auth`.
 - Deliberately single shared-secret auth. A real user/role model is a follow-up, out of scope here.
-- `healthz` is unauthenticated so container health probes (future compose `healthcheck`) don't need the token.
+- `health` is unauthenticated so container health probes (future compose `healthcheck`) don't need the token.
