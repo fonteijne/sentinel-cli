@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 from src.agents.base_agent import PlanningAgent
 from src.jira_factory import get_jira_client
-from src.utils.adf_parser import parse_adf_to_text
+from src.ticket_context import TicketContextBuilder
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,8 @@ class FunctionalDebriefAgent(PlanningAgent):
             self.set_project(project)
 
         # Step 1: Fetch ticket (validates it exists)
-        ticket_data = self.jira.get_ticket(ticket_id)
+        ctx = TicketContextBuilder(self.jira, ticket_id)
+        ticket_data = ctx.ticket_data
         logger.info(f"Fetched ticket: {ticket_data.get('summary', 'N/A')}")
 
         # Step 2: Detect state
@@ -80,7 +81,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
         if state == "initial":
             # Generate debrief, post to Jira, save state
-            debrief_data = self._generate_debrief(ticket_id, ticket_data, user_prompt=user_prompt)
+            debrief_data = self._generate_debrief(ticket_id, ticket_data, user_prompt=user_prompt, ctx=ctx)
             self._post_debrief_comment(ticket_id, debrief_data, comment_type="initial")
             self._save_state(ticket_id, {
                 "status": "awaiting_reply",
@@ -111,7 +112,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
             followup_data = self._generate_followup(
                 ticket_id, ticket_data, conversation, new_replies,
-                user_prompt=user_prompt,
+                user_prompt=user_prompt, ctx=ctx,
             )
 
             iteration_count = existing_state.get("iteration_count", 1) + 1
@@ -155,7 +156,7 @@ class FunctionalDebriefAgent(PlanningAgent):
 
                 followup_data = self._generate_followup(
                     ticket_id, ticket_data, conversation, new_replies,
-                    user_prompt=user_prompt,
+                    user_prompt=user_prompt, ctx=ctx,
                 )
 
                 iteration_count = existing_state.get("iteration_count", 1) + 1
@@ -296,35 +297,25 @@ class FunctionalDebriefAgent(PlanningAgent):
     def _generate_debrief(
         self, ticket_id: str, ticket_data: Dict[str, Any],
         user_prompt: str | None = None,
+        ctx: TicketContextBuilder | None = None,
     ) -> Dict[str, Any]:
         """Generate the initial functional debrief for a ticket.
 
         Args:
             ticket_id: Jira ticket ID
             ticket_data: Ticket data from Jira
+            ctx: Shared ticket context builder
 
         Returns:
             Structured debrief data (understanding, assumptions, gaps, questions, cta)
         """
-        description = ticket_data.get("description", "")
-        if isinstance(description, dict):
-            description = parse_adf_to_text(description)
+        if ctx is None:
+            ctx = TicketContextBuilder(self.jira, ticket_id)
 
-        # Fetch existing comments for context
-        comments = self.jira.get_ticket_comments(ticket_id)
-        comments_context = ""
-        if comments:
-            comments_text = "\n".join(
-                f"- [{c['author']}]: {c['body']}" for c in comments
-            )
-            comments_context = f"\n**Existing Comments**:\n{comments_text}\n"
-
-        # Handle both dict and string formats for issuetype and priority
-        issuetype = ticket_data.get("issuetype", "Unknown")
-        issuetype_name = issuetype.get("name", "Unknown") if isinstance(issuetype, dict) else str(issuetype)
-
-        priority = ticket_data.get("priority", "Medium")
-        priority_name = priority.get("name", "Medium") if isinstance(priority, dict) else str(priority)
+        description = ctx.description
+        comments_context = ctx.format_comments()
+        issuetype_name = ctx.type_name
+        priority_name = ctx.priority_name
 
         codebase_instruction = (
             "\n**CODEBASE**: You have access to the project codebase. "
@@ -383,6 +374,7 @@ Return ONLY the JSON object as specified in the "Mode: Initial Debrief" section 
         conversation_history: List[Dict[str, Any]],
         new_replies: List[Dict[str, Any]],
         user_prompt: str | None = None,
+        ctx: TicketContextBuilder | None = None,
     ) -> Dict[str, Any]:
         """Generate a follow-up response based on client replies.
 
@@ -391,13 +383,14 @@ Return ONLY the JSON object as specified in the "Mode: Initial Debrief" section 
             ticket_data: Ticket data from Jira
             conversation_history: All comments up to and including the last debrief
             new_replies: Client replies since the last debrief comment
+            ctx: Shared ticket context builder
 
         Returns:
             Structured follow-up data (same format as debrief)
         """
-        description = ticket_data.get("description", "")
-        if isinstance(description, dict):
-            description = parse_adf_to_text(description)
+        if ctx is None:
+            ctx = TicketContextBuilder(self.jira, ticket_id)
+        description = ctx.description
 
         # Format conversation history
         history_text = ""

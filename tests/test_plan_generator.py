@@ -38,9 +38,20 @@ def mock_agent_sdk():
     """Mock Agent SDK wrapper."""
     with patch("src.agents.base_agent.AgentSDKWrapper") as mock:
         wrapper = Mock()
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
+            import json as _json
+            if "Analyze this Jira ticket" in prompt:
+                content = _json.dumps({
+                    "requirements": ["Implement user authentication", "Add login endpoint"],
+                    "technical_approach": "TDD implementation with FastAPI",
+                    "risks": ["Token expiry handling"],
+                    "estimated_complexity": "medium",
+                    "rationale": "Standard auth implementation"
+                })
+            else:
+                content = "Test LLM response"
             return {
-                "content": "Test LLM response",
+                "content": content,
                 "tool_uses": [],
                 "session_id": "test-session-123"
             }
@@ -75,6 +86,7 @@ def mock_jira():
             "type": "Story",
             "status": "To Do",
         }
+        client.get_ticket_comments.return_value = []
         client.add_comment.return_value = {"id": "12345"}
         mock_factory.return_value = client
         yield mock_factory
