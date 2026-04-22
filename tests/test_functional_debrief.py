@@ -35,7 +35,7 @@ def mock_agent_sdk():
     with patch("src.agents.base_agent.AgentSDKWrapper") as mock:
         wrapper = Mock()
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": "Test LLM response",
                 "tool_uses": [],
@@ -247,7 +247,7 @@ class TestRun:
         agent = FunctionalDebriefAgent()
 
         # Mock LLM to return structured debrief
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": SAMPLE_DEBRIEF_RESPONSE,
                 "tool_uses": [],
@@ -273,7 +273,7 @@ class TestRun:
 
         captured_cwd = {}
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             captured_cwd["value"] = cwd
             return {
                 "content": SAMPLE_DEBRIEF_RESPONSE,
@@ -296,7 +296,7 @@ class TestRun:
 
         captured_cwd = {}
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             captured_cwd["value"] = cwd
             return {
                 "content": SAMPLE_DEBRIEF_RESPONSE,
@@ -340,7 +340,7 @@ class TestRun:
             "gaps_resolved": False,
         })
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": followup_response,
                 "tool_uses": [],
@@ -365,7 +365,7 @@ class TestRun:
             {"author": "Client", "body": "All clear, date range is current selection, no branding."},
         ]
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": SAMPLE_FOLLOWUP_RESPONSE,
                 "tool_uses": [],
@@ -402,7 +402,7 @@ class TestRun:
             "gaps_resolved": True,
         })
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": confirmation_response,
                 "tool_uses": [],
@@ -439,7 +439,7 @@ class TestRun:
             "gaps_resolved": False,
         })
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": correction_response,
                 "tool_uses": [],

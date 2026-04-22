@@ -46,6 +46,26 @@ iteration_limits:
 beads:
   auto_create: true
   task_prefix: sentinel
+guardrails:
+  enabled: true
+  timeout_seconds: 1800
+  agent_timeouts:
+    plan_generator: 1800
+    python_developer: 7200
+    drupal_developer: 7200
+  rules:
+    blocked_paths:
+      - "/dev/*"
+      - "/proc/*"
+      - "/sys/*"
+      - "/etc/passwd"
+      - "/etc/shadow"
+    blocked_commands:
+      - "rm -rf /"
+    max_consecutive_repeats: 10
+    path_boundary:
+      enabled: true
+      extra_allowed: []
 agent_sdk:
   default_tools:
   - Read

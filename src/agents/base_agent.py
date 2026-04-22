@@ -128,7 +128,7 @@ class BaseAgent(ABC):
 
     async def _send_message_async(
         self, content: str, role: str = "user", cwd: str | None = None,
-        max_turns: int | None = None,
+        max_turns: int | None = None, timeout: int | None = None,
     ) -> str:
         """Internal async implementation using Agent SDK.
 
@@ -137,6 +137,7 @@ class BaseAgent(ABC):
             role: Message role ("user" or "assistant")
             cwd: Working directory for tool execution
             max_turns: Optional max agentic turns
+            timeout: Optional execution timeout in seconds
 
         Returns:
             Agent's response text
@@ -159,6 +160,7 @@ class BaseAgent(ABC):
             system_prompt=self.system_prompt if self.system_prompt else None,
             cwd=cwd,
             max_turns=max_turns,
+            timeout=timeout,
         )
         elapsed = time.monotonic() - t0
         logger.info(
@@ -179,7 +181,7 @@ class BaseAgent(ABC):
 
     def send_message(
         self, content: str, role: str = "user", cwd: str | None = None,
-        max_turns: int | None = None,
+        max_turns: int | None = None, timeout: int | None = None,
     ) -> str:
         """Send a message to the agent and get a response.
 
@@ -191,13 +193,14 @@ class BaseAgent(ABC):
             role: Message role ("user" or "assistant")
             cwd: Working directory for tool execution (important for agents with tools)
             max_turns: Optional max agentic turns
+            timeout: Optional execution timeout in seconds
 
         Returns:
             Agent's response text
         """
         # Run async execution in sync context
         logger.info(f"[LLM] {self.agent_name}: send_message called (cwd={cwd}, max_turns={max_turns})")
-        result = asyncio.run(self._send_message_async(content, role, cwd, max_turns=max_turns))
+        result = asyncio.run(self._send_message_async(content, role, cwd, max_turns=max_turns, timeout=timeout))
         return result
 
     def execute_command(
