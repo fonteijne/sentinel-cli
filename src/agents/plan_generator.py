@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
+from requests.exceptions import HTTPError
+
 from src.agents.base_agent import PlanningAgent
 from src.attachment_manager import AttachmentManager
 from src.jira_factory import get_jira_client
@@ -188,17 +190,23 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
             logger.error(error_msg)
             raise ValueError(error_msg) from e
 
-        except Exception as e:
+        except HTTPError as e:
             error_msg = (
-                f"Failed to analyze ticket {ticket_id} - Unexpected error.\n\n"
-                f"Error: {str(e)}\n\n"
-                f"This may indicate:\n"
-                f"  - Jira API connectivity issues\n"
-                f"  - Invalid ticket ID format\n"
-                f"  - Missing ticket data\n\n"
-                f"Please verify the ticket exists and is accessible."
+                f"Failed to analyze ticket {ticket_id} - Jira API error.\n\n"
+                f"Error: {e}\n\n"
+                f"Verify the ticket exists, the ID is valid, and Jira is reachable."
             )
             logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to analyze ticket {ticket_id} - {type(e).__name__}: {e}\n\n"
+                f"This failure occurred outside of Jira (the ticket data was already "
+                f"fetched). Likely a Claude Agent SDK or LLM provider issue — check "
+                f"the sentinel-dev logs, notably /app/logs/cli_stderr.log."
+            )
+            logger.error(error_msg, exc_info=True)
             raise RuntimeError(error_msg) from e
 
         return analysis
@@ -1459,6 +1467,13 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
             )
             logger.info(f"[RUN] Step 2a: Revision done ({time.monotonic() - t0:.1f}s)")
             plan_content = revision_result["revised_plan"]
+
+            # Reset session — revise_plan used a tool-enabled session with a different cwd;
+            # analyze_ticket is a standalone text-only call that must not resume it.
+            # Resuming across incompatible cwds makes the Claude CLI subprocess exit 1
+            # during initialize(), surfacing as a misleading "Jira connectivity" error.
+            self.session_id = None
+            self.messages.clear()
 
             t0 = time.monotonic()
             logger.info(f"[RUN] Step 2b: Analyzing ticket (post-revision)...")
