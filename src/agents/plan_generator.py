@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
+from requests.exceptions import HTTPError
+
 from src.agents.base_agent import PlanningAgent
 from src.attachment_manager import AttachmentManager
 from src.jira_factory import get_jira_client
@@ -17,6 +19,7 @@ from src.gitlab_client import GitLabClient
 from src.config_loader import get_config
 from src.stack_profiler import generate_profile_markdown
 from src.worktree_manager import get_branch_name
+from src.ticket_context import TicketContextBuilder
 from src.utils.adf_parser import parse_adf_to_text
 
 
@@ -42,7 +45,8 @@ class PlanGeneratorAgent(PlanningAgent):
         self.config = get_config()
 
     def analyze_ticket(
-        self, ticket_id: str, worktree_path: Path | None = None
+        self, ticket_id: str, worktree_path: Path | None = None,
+        ctx: TicketContextBuilder | None = None,
     ) -> Dict[str, Any]:
         """Analyze a Jira ticket and extract requirements.
 
@@ -59,11 +63,11 @@ class PlanGeneratorAgent(PlanningAgent):
         """
         logger.info(f"Analyzing ticket: {ticket_id}")
 
-        # Fetch ticket data
-        ticket_data = self.jira.get_ticket(ticket_id)
+        if ctx is None:
+            ctx = TicketContextBuilder(self.jira, ticket_id)
 
-        # Fetch existing comments for re-entry context (e.g., PO answered triage questions)
-        comments = self.jira.get_ticket_comments(ticket_id)
+        ticket_data = ctx.ticket_data
+        comments = ctx.comments
         if comments:
             logger.info(f"Found {len(comments)} existing comment(s) on {ticket_id}")
 
@@ -87,28 +91,10 @@ class PlanGeneratorAgent(PlanningAgent):
         elif attachments_metadata:
             attachment_context = attachment_mgr.format_metadata_only(attachments_metadata)
 
-        # Extract and parse description
-        description_raw = ticket_data.get("description", "")
-        if isinstance(description_raw, dict):
-            description = parse_adf_to_text(description_raw)
-        else:
-            description = str(description_raw)
-
-        # Build analysis prompt
-        # Handle both dict and string formats for issuetype and priority
-        issuetype = ticket_data.get('issuetype', 'Unknown')
-        issuetype_name = issuetype.get('name', 'Unknown') if isinstance(issuetype, dict) else str(issuetype)
-
-        priority = ticket_data.get('priority', 'Medium')
-        priority_name = priority.get('name', 'Medium') if isinstance(priority, dict) else str(priority)
-
-        # Build comments context for re-entry
-        comments_context = ""
-        if comments:
-            comments_text = "\n".join(
-                f"- [{c['author']}]: {c['body']}" for c in comments
-            )
-            comments_context = f"\n**Existing Comments/Discussion**:\n{comments_text}\n\n"
+        description = ctx.description
+        issuetype_name = ctx.type_name
+        priority_name = ctx.priority_name
+        comments_context = ctx.format_comments("**Existing Comments/Discussion**:")
 
         # Self-contained prompt for ticket analysis - returns JSON only, no tool use
         analysis_prompt = f"""Analyze this Jira ticket and return ONLY a JSON object.
@@ -167,6 +153,8 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
                 "estimated_complexity": ai_analysis.get("estimated_complexity", "medium"),
                 "attachments_data": attachments_data,
                 "comments": comments,
+                "type_name": issuetype_name,
+                "priority_name": priority_name,
             }
 
             logger.info(f"Ticket analysis complete: {len(analysis['requirements'])} requirements")
@@ -188,17 +176,23 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
             logger.error(error_msg)
             raise ValueError(error_msg) from e
 
-        except Exception as e:
+        except HTTPError as e:
             error_msg = (
-                f"Failed to analyze ticket {ticket_id} - Unexpected error.\n\n"
-                f"Error: {str(e)}\n\n"
-                f"This may indicate:\n"
-                f"  - Jira API connectivity issues\n"
-                f"  - Invalid ticket ID format\n"
-                f"  - Missing ticket data\n\n"
-                f"Please verify the ticket exists and is accessible."
+                f"Failed to analyze ticket {ticket_id} - Jira API error.\n\n"
+                f"Error: {e}\n\n"
+                f"Verify the ticket exists, the ID is valid, and Jira is reachable."
             )
             logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
+
+        except Exception as e:
+            error_msg = (
+                f"Failed to analyze ticket {ticket_id} - {type(e).__name__}: {e}\n\n"
+                f"This failure occurred outside of Jira (the ticket data was already "
+                f"fetched). Likely a Claude Agent SDK or LLM provider issue — check "
+                f"the sentinel-dev logs, notably /app/logs/cli_stderr.log."
+            )
+            logger.error(error_msg, exc_info=True)
             raise RuntimeError(error_msg) from e
 
         return analysis
@@ -223,8 +217,8 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         except json.JSONDecodeError:
             pass
 
-        # Try 2: Look for JSON in code blocks
-        code_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response, re.DOTALL)
+        # Try 2: Look for JSON in code blocks (greedy to capture nested braces)
+        code_block_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', response, re.DOTALL)
         if code_block_match:
             try:
                 return json.loads(code_block_match.group(1))
@@ -445,12 +439,8 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         requirements_text = chr(10).join(f"  - {req}" for req in requirements) if requirements else "  - No specific requirements provided"
         risks_text = chr(10).join(f"  - {risk}" for risk in risks) if risks else "  - No specific risks identified"
 
-        # Handle both dict and string formats for issuetype and priority
-        issuetype = ticket_data.get('issuetype', 'Task')
-        issuetype_name = issuetype.get('name', 'Task') if isinstance(issuetype, dict) else str(issuetype)
-
-        priority = ticket_data.get('priority', 'Medium')
-        priority_name = priority.get('name', 'Medium') if isinstance(priority, dict) else str(priority)
+        issuetype_name = context.get("type_name", "Task")
+        priority_name = context.get("priority_name", "Medium")
 
         # Load stack-specific context if available
         effective_worktree = worktree_path or output_path.parent.parent.parent
@@ -471,6 +461,8 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         # System prompt defines the detailed format - user prompt tells agent to write the file
         plan_file_path = str(output_path)
         plan_prompt = f"""Generate a comprehensive implementation plan for ticket {ticket_id}.
+
+**⚠️ DATA CONSTRAINT**: All ticket data, requirements, and feedback below were pre-fetched from Jira. Do NOT search for Jira access, environment variables, CLI tools, or external APIs. Work ONLY with the data provided here and the codebase you can explore via tools.
 {stack_context}
 
 **Ticket Context**:
@@ -633,6 +625,8 @@ This is iteration {iteration + 2} of {max_iterations}.
         feedback: list[Dict[str, Any]],
         output_path: Path,
         user_prompt: str | None = None,
+        cwd: str | None = None,
+        ticket_context: str | None = None,
     ) -> Dict[str, Any]:
         """Revise an existing plan based on MR feedback.
 
@@ -641,6 +635,9 @@ This is iteration {iteration + 2} of {max_iterations}.
             current_plan: Current plan content
             feedback: List of unresolved discussions from MR
             output_path: Path where revised plan should be saved
+            user_prompt: Optional operator instruction
+            cwd: Working directory for tool execution
+            ticket_context: Pre-fetched Jira ticket data (summary, description, comments)
 
         Returns:
             Dictionary with:
@@ -654,9 +651,21 @@ This is iteration {iteration + 2} of {max_iterations}.
         # Format feedback for LLM
         feedback_text = self._format_feedback(feedback)
 
-        # Build revision prompt
+        # Build ticket context section (if provided)
+        ticket_section = ""
+        if ticket_context:
+            ticket_section = f"""
+**Jira Ticket Data (pre-fetched — do NOT search for this externally):**
+{ticket_context}
+"""
+
+        plan_file_path = str(output_path)
+
+        # Build revision prompt — instruct agent to Write the file (matches generate_plan pattern)
         revision_prompt = f"""You are revising an implementation plan based on team feedback.
 
+**⚠️ DATA CONSTRAINT**: All ticket data and feedback is provided below. Do NOT search for Jira access, environment variables, CLI tools, or external APIs. Work ONLY with the data in this prompt.
+{ticket_section}
 **Current Plan:**
 {current_plan}
 
@@ -669,14 +678,15 @@ This is iteration {iteration + 2} of {max_iterations}.
    - If feedback is minor/clarifications → Make **incremental updates** to specific sections
    - If feedback fundamentally challenges the approach → Perform **full rewrite** with new strategy
 3. **Revise the plan** - Update the plan to address all feedback
-4. **Document changes** - For each feedback item, explain what you changed
+4. **Use the Write tool** to save the COMPLETE revised plan to: `{plan_file_path}`
 
-**Output Format:**
-Return a JSON object with:
+## CRITICAL: OUTPUT INSTRUCTIONS
+
+After writing the revised plan file, respond with a brief JSON summary:
+```json
 {{
     "revision_type": "incremental" or "full_rewrite",
     "rationale": "Why you chose this revision approach",
-    "revised_plan": "The complete updated plan in markdown",
     "feedback_responses": [
         {{
             "discussion_id": "...",
@@ -686,36 +696,57 @@ Return a JSON object with:
         }}
     ]
 }}
+```
 
-Be specific about what changed and why. The team needs to understand how their feedback was incorporated.
+**Do NOT include the full plan text in your JSON response** — you already wrote it to the file.
 """
 
         revision_prompt = self._append_operator_prompt(revision_prompt, user_prompt)
 
-        # Call LLM
-        response = self.send_message(revision_prompt)
+        # Record file mtime before LLM call to detect if agent wrote the file
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pre_mtime = output_path.stat().st_mtime if output_path.exists() else None
 
-        # Parse response
+        # Call LLM with max_turns to prevent runaway exploration loops
+        response = self.send_message(revision_prompt, cwd=cwd, max_turns=20)
+
+        # Check if the agent wrote the plan file directly (preferred path)
+        agent_wrote_file = False
+        if output_path.exists():
+            post_mtime = output_path.stat().st_mtime
+            if pre_mtime is None or post_mtime > pre_mtime:
+                agent_wrote_file = True
+                logger.info(f"Agent wrote revised plan directly to {output_path}")
+
+        # Try to extract metadata JSON from the response
         import json
         import re
 
-        result_dict: Dict[str, Any]
-        try:
-            result_dict = json.loads(response)
-        except json.JSONDecodeError:
-            # If LLM didn't return valid JSON, try to extract it
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                result_dict = json.loads(json_match.group())
-            else:
-                raise ValueError("LLM did not return valid JSON response")
+        metadata: Dict[str, Any] = {}
+        extracted = self._extract_json_from_response(response)
+        if extracted:
+            metadata = extracted
 
-        # Write revised plan to file
-        revised_plan = str(result_dict["revised_plan"])
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(revised_plan)
+        if agent_wrote_file:
+            revised_plan = output_path.read_text()
+        elif "revised_plan" in metadata:
+            revised_plan = str(metadata["revised_plan"])
+            output_path.write_text(revised_plan)
+            logger.info(f"Wrote revised plan from JSON response to {output_path}")
+        else:
+            raise RuntimeError(
+                f"Agent did not write the revised plan file and did not return plan content.\n"
+                f"Response preview: {response[:300]}"
+            )
 
-        logger.info(f"Revised plan written to {output_path} ({result_dict.get('revision_type', 'incremental')} revision)")
+        result_dict: Dict[str, Any] = {
+            "revised_plan": revised_plan,
+            "revision_type": metadata.get("revision_type", "incremental"),
+            "rationale": metadata.get("rationale", ""),
+            "feedback_responses": metadata.get("feedback_responses", []),
+        }
+
+        logger.info(f"Revised plan written to {output_path} ({result_dict['revision_type']} revision, {len(revised_plan)} chars)")
 
         return result_dict
 
@@ -829,6 +860,7 @@ Comment: {body}
         ticket_id: str,
         plan_path: Path,
         project_key: str,
+        ctx: TicketContextBuilder | None = None,
     ) -> str:
         """Create a draft merge request with the plan.
 
@@ -853,7 +885,9 @@ Comment: {body}
         plan_content = plan_path.read_text()
 
         # Get ticket data for MR description
-        ticket_data = self.jira.get_ticket(ticket_id)
+        if ctx is None:
+            ctx = TicketContextBuilder(self.jira, ticket_id)
+        ticket_data = ctx.ticket_data
 
         # Create MR description
         mr_description = f"""## Ticket
@@ -904,6 +938,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         ticket_id: str,
         plan_path: Path,
         project_key: str,
+        ctx: TicketContextBuilder | None = None,
     ) -> tuple[str, bool]:
         """Create a draft MR or get existing one if it already exists.
 
@@ -928,7 +963,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
 
         try:
             # Try to create a new MR
-            mr_url = self.create_draft_mr(ticket_id, plan_path, project_key)
+            mr_url = self.create_draft_mr(ticket_id, plan_path, project_key, ctx=ctx)
             return mr_url, True
 
         except Exception as e:
@@ -994,6 +1029,8 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         )
 
         investigation_prompt = f"""You are investigating new client feedback for ticket {ticket_id}.
+
+**⚠️ DATA CONSTRAINT**: All ticket data and client comments below were pre-fetched from Jira. Do NOT search for Jira access, environment variables, CLI tools, or external APIs. Work ONLY with the comments provided here and the codebase you can explore via tools.
 
 The client replied to Sentinel's confidence report with new information. Your job is to
 SEARCH THE CODEBASE to verify and locate anything the client mentions, then report your findings.
@@ -1104,6 +1141,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         ticket_id: str,
         worktree_path: Path,
         project_key: str,
+        ctx: TicketContextBuilder | None = None,
     ) -> Dict[str, Any]:
         """Detect the current state of a plan for a ticket.
 
@@ -1160,7 +1198,9 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
             }
 
         # No discussions — check Jira for new context
-        comments = self.jira.get_ticket_comments(ticket_id)
+        if ctx is None:
+            ctx = TicketContextBuilder(self.jira, ticket_id)
+        comments = ctx.comments
 
         # Find the last Sentinel-authored comment (confidence or investigation report)
         last_sentinel_idx = -1
@@ -1416,6 +1456,9 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         project_key = ticket_id.split("-")[0]
         self.set_project(project_key)
 
+        # Create shared ticket context — fetches lazily, caches across all callees
+        ctx = TicketContextBuilder(self.jira, ticket_id)
+
         # Step 0: Auto-profile project if no profile exists
         t0 = time.monotonic()
         logger.info(f"[RUN] Step 0: Auto-profile check...")
@@ -1425,7 +1468,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         # Step 1: Detect current state
         t0 = time.monotonic()
         logger.info(f"[RUN] Step 1: Detecting plan state...")
-        state_info = self._detect_plan_state(ticket_id, worktree_path, project_key)
+        state_info = self._detect_plan_state(ticket_id, worktree_path, project_key, ctx=ctx)
         state = state_info["state"]
         logger.info(f"[RUN] Step 1: State = {state} ({time.monotonic() - t0:.1f}s)")
 
@@ -1451,23 +1494,35 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
 
         if state == "has_feedback":
             t0 = time.monotonic()
+            logger.info(f"[RUN] Step 2a-pre: Fetching ticket context for revision...")
+            ticket_context = ctx.format_ticket_context()
+            logger.info(f"[RUN] Step 2a-pre: Ticket context fetched ({time.monotonic() - t0:.1f}s, {len(ctx.comments)} comments)")
+
+            t0 = time.monotonic()
             logger.info(f"[RUN] Step 2a: Revising plan based on {len(state_info['discussions'])} discussion(s)...")
             revision_result = self.revise_plan(
                 ticket_id, state_info["existing_plan"],
                 state_info["discussions"], plan_path,
                 user_prompt=user_prompt,
+                cwd=str(worktree_path),
+                ticket_context=ticket_context,
             )
             logger.info(f"[RUN] Step 2a: Revision done ({time.monotonic() - t0:.1f}s)")
             plan_content = revision_result["revised_plan"]
 
+            # Reset session — revise_plan used a tool-enabled session with a different cwd;
+            # analyze_ticket is a standalone text-only call that must not resume it.
+            self.session_id = None
+            self.messages.clear()
+
             t0 = time.monotonic()
             logger.info(f"[RUN] Step 2b: Analyzing ticket (post-revision)...")
-            analysis = self.analyze_ticket(ticket_id, worktree_path)
+            analysis = self.analyze_ticket(ticket_id, worktree_path, ctx=ctx)
             logger.info(f"[RUN] Step 2b: Analysis done ({time.monotonic() - t0:.1f}s)")
         else:
             t0 = time.monotonic()
             logger.info(f"[RUN] Step 2a: Analyzing ticket...")
-            analysis = self.analyze_ticket(ticket_id, worktree_path)
+            analysis = self.analyze_ticket(ticket_id, worktree_path, ctx=ctx)
             logger.info(f"[RUN] Step 2a: Analysis done ({time.monotonic() - t0:.1f}s)")
 
             # Step 2a.5: Investigate client comments (update re-entry only)
@@ -1513,7 +1568,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         # Step 5: Create or get MR
         t0 = time.monotonic()
         logger.info(f"[RUN] Step 5: Creating/getting MR...")
-        mr_url, mr_created = self.create_or_get_mr(ticket_id, plan_path, project_key)
+        mr_url, mr_created = self.create_or_get_mr(ticket_id, plan_path, project_key, ctx=ctx)
         logger.info(f"[RUN] Step 5: MR done (created={mr_created}, {time.monotonic() - t0:.1f}s)")
 
         # Step 6: Post confidence report to Jira
