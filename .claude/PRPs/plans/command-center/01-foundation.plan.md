@@ -354,7 +354,16 @@ Execute in order. Each task is independently testable.
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
     ```
-  - `ensure_initialized()` — idempotent; opens a connection, runs `run_migrations`, closes. Called once at CLI startup and again by plan 02's FastAPI lifespan.
+  - `ensure_initialized()` — idempotent; opens a connection, asserts SQLite JSON1 features + minimum version, runs `run_migrations`, closes. Called once at CLI startup and again by plan 02's FastAPI lifespan. Version assertion:
+    ```python
+    (major, minor, patch) = [int(x) for x in sqlite3.sqlite_version.split(".")[:3]]
+    if (major, minor) < (3, 38):
+        raise RuntimeError(
+            f"SQLite >= 3.38 required for json_insert('$[#]') append syntax; "
+            f"found {sqlite3.sqlite_version}. Upgrade Python / sqlite3."
+        )
+    conn.execute("SELECT json_extract('{}','$.x')")    # fails loudly if JSON1 not compiled in
+    ```
   - `run_migrations(conn)` — reads `migrations/*.sql` in sorted filename order, executes any whose `version` (leading digits) is not in `schema_migrations`; records applied versions with UTC ISO timestamp. Wrap each migration in `BEGIN IMMEDIATE` / `COMMIT`.
 - **MIRROR**: `src/session_tracker.py:19-20` for the fallback path convention (`Path.home() / ".sentinel" / ...`) and `parent.mkdir(parents=True, exist_ok=True)`.
 - **GOTCHA**: **Do not keep a module-level connection**. sqlite3 connections have per-connection state (transactions, row_factory); sharing one across threads/processes corrupts state and raises `ProgrammingError`. Every repo/bus/route gets its own via dependency injection.
@@ -413,16 +422,27 @@ Execute in order. Each task is independently testable.
 
       def publish(self, event: SentinelEvent) -> None:
           payload = event.model_dump_json()
-          if len(payload) > self.MAX_PAYLOAD_BYTES:
-              # Oversized payload (runaway agent response): truncate rather than drop.
-              # Dashboard can distinguish via the _truncated marker.
-              truncated = {**event.model_dump(), "_truncated": True,
-                           "_original_bytes": len(payload)}
+          if len(payload.encode("utf-8")) > self.MAX_PAYLOAD_BYTES:
+              # Oversized payload (runaway agent response): rebuild a smaller valid JSON object.
+              # Never byte-slice a JSON string — can split multibyte chars / escapes → invalid JSON.
+              truncated = {**event.model_dump(mode="json"),
+                           "_truncated": True,
+                           "_original_bytes": len(payload.encode("utf-8"))}
               # Best-effort: shrink the biggest string field (usually a response dump).
               for k, v in list(truncated.items()):
                   if isinstance(v, str) and len(v) > 4096:
                       truncated[k] = v[:4096] + "…"
-              payload = json.dumps(truncated)[:self.MAX_PAYLOAD_BYTES]
+              payload = json.dumps(truncated, ensure_ascii=False)
+              if len(payload.encode("utf-8")) > self.MAX_PAYLOAD_BYTES:
+                  # Fallback: discard all string payload fields, keep envelope + marker only.
+                  envelope_only = {"execution_id": event.execution_id,
+                                   "type": event.type,
+                                   "ts": event.ts.isoformat(),
+                                   "agent": event.agent,
+                                   "_truncated": True,
+                                   "_reason": "oversize_after_shrink",
+                                   "_original_bytes": truncated["_original_bytes"]}
+                  payload = json.dumps(envelope_only)
 
           with self._seq_lock:
               self._conn.execute("BEGIN IMMEDIATE")

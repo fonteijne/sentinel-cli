@@ -31,7 +31,7 @@ After plans 01–03 the service is observe-only. Runs still start from the CLI a
 | Type | NEW_CAPABILITY |
 | Complexity | MEDIUM |
 | Systems Affected | `src/core/execution/worker.py` + `supervisor.py` (new), `src/core/persistence/migrations/002_workers.sql` (new), `src/service/routes/commands.py` (new), `src/service/deps.py`, `src/cli.py`, `src/utils/logging_config.py` (new) |
-| Dependencies | stdlib `multiprocessing` + `signal` + `httpx` (or stay on `requests`). **Plan 02's `fastapi` pin must be `>=0.100`** — needed for `APIRouter(dependencies=[...])` to apply to WebSocket routes (plan 03/05). |
+| Dependencies | stdlib `multiprocessing` + `signal` + `httpx` (or stay on `requests`). **Plan 02 pins `fastapi ^0.110`** — satisfies the `APIRouter(dependencies=[...])` on WebSocket requirement used by plans 03/05. |
 | Estimated Tasks | 9 |
 | Prerequisite | Plan 01 (Foundation) + Plan 02 (Read API; the FastAPI app factory must exist). Plan 05 still owns the final `create_app()` composition. |
 
@@ -121,18 +121,34 @@ Exceeding either returns `429` with `Retry-After`. Configured under `service.rat
 
 - Start method: `multiprocessing.get_context("spawn")` to avoid inheriting uvicorn's open fds / FastAPI state.
 - Entry: `python -m src.core.execution.worker --execution-id <id>` (also allow in-process spawn for tests via the context API).
-- **Env allowlist (not inheritance-by-default)**: Supervisor builds the child env explicitly rather than passing the parent env wholesale. `spawn()` passes `env={...}` to `Process`. Implementation uses **prefix matching**, not exact names — a prefix list plus a few exact vars.
-  - Exact: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `DOCKER_HOST`, `DOCKER_CERT_PATH`, `DOCKER_TLS_VERIFY`.
-  - Prefixes: `SENTINEL_`, `JIRA_`, `GITLAB_`, `ANTHROPIC_`, `CLAUDE_`, `XDG_`.
-  - `CLAUDE_*` and `XDG_*` are required for claude-agent-sdk's subscription-mode auth cache under `~/.claude/`.
-  - Everything else is dropped. Adding a var = add to this list explicitly.
+- **Env allowlist (not inheritance-by-default)**: Supervisor builds the child env explicitly rather than passing the parent env wholesale. `spawn()` passes `env={...}` to `Process`. Implementation uses **prefix matching**, not exact names — a prefix list plus a set of exact vars.
   ```python
-  _ENV_EXACT = {"PATH","HOME","LANG","LC_ALL","TZ","DOCKER_HOST","DOCKER_CERT_PATH","DOCKER_TLS_VERIFY"}
-  _ENV_PREFIXES = ("SENTINEL_","JIRA_","GITLAB_","ANTHROPIC_","CLAUDE_","XDG_")
+  _ENV_EXACT = {
+      # Baseline POSIX
+      "PATH", "HOME", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME",
+      "TMPDIR", "TEMP", "TMP",
+      # Docker-out-of-Docker
+      "DOCKER_HOST", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY",
+      # TLS / corporate CA bundles (httpx, requests, openssl)
+      "SSL_CERT_FILE", "SSL_CERT_DIR",
+      "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+      # Proxy — both upper and lowercase forms are honored by libraries
+      "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+      "http_proxy", "https_proxy", "no_proxy",
+  }
+  _ENV_PREFIXES = (
+      "SENTINEL_",                                 # Sentinel config
+      "JIRA_", "GITLAB_",                          # external APIs
+      "ANTHROPIC_", "CLAUDE_",                     # SDK direct-API + subscription cache
+      "XDG_",                                      # SDK config path conventions
+      "COMPOSE_", "BUILDKIT_",                     # docker compose behaviour
+      "GIT_", "SSH_",                              # worktree operations + git over SSH
+  )
   def _build_worker_env() -> dict[str, str]:
       return {k: v for k, v in os.environ.items()
               if k in _ENV_EXACT or k.startswith(_ENV_PREFIXES)}
   ```
+  Adding a var means adding it here explicitly — defense against unintended leakage and silent missing-config failures.
 - cwd: repository root (`/app` in sentinel-dev) — the orchestrator itself sets worktree cwd via its existing logic.
 - Exit code: 0 on `ExecutionStatus.SUCCEEDED`, non-zero otherwise. Supervisor reads row status; exit code is a sanity check.
 - **Logs:** worker's `main()` calls `configure_logging()` *first* (before importing anything heavy). `spawn` re-imports the process — `basicConfig` at `cli.py` module top does NOT run in the child. The worker also re-initializes the structured diagnostic file path so `logs/agent_diagnostics.jsonl` keeps being written.
@@ -155,12 +171,15 @@ Two-stage signal dance:
 4. If still alive at **kill=30s**: `os.kill(pid, signal.SIGKILL)`.
 5. **Post-mortem cleanup (always runs, regardless of how the worker died):**
 
-   Each step is **independently wrapped in try/except** — a failure in one step must not skip the next:
+   Each step is **independently wrapped in try/except** — a failure in one step must not skip the next. `post_mortem` opens its own connection (reentrant; never touches `self._workers`):
    ```python
    def post_mortem(execution_id: str) -> None:
-       # 1. Publish the terminal event FIRST — appending to event log is the cheapest and most important step.
-       try: bus.publish(terminal_event_for(execution_id))
-       except Exception: logger.exception("post_mortem: publish terminal failed")
+       with self._connection_factory() as conn:
+           repo = ExecutionRepository(conn)
+           bus  = EventBus(conn)                               # explicit; not inherited
+           # 1. Publish the terminal event FIRST — appending to event log is the cheapest and most important step.
+           try: bus.publish(terminal_event_for(execution_id))
+           except Exception: logger.exception("post_mortem: publish terminal failed")
        # 2. Docker compose down for each recorded project
        for project in repo.get(execution_id).metadata.get("compose_projects", []):
            try: subprocess.run(["docker","compose","-p",project,"down","-v","--timeout","5"], check=False)
@@ -210,6 +229,15 @@ for row in repo.list(status=("running","cancelling")):
 for row in repo.list_post_mortem_incomplete():
     post_mortem(row.id)                                     # idempotent re-sweep
 ```
+
+**Set C — orphaned `queued` rows** (service died between `repo.create` and `supervisor.spawn`):
+```python
+for row in repo.list(status="queued"):
+    if repo.get_worker(row.id) is None:                     # no worker row means spawn never happened
+        repo.record_ended(row.id, ExecutionStatus.FAILED, error="spawn_interrupted")
+        bus.publish(ExecutionFailed(execution_id=row.id, error="spawn_interrupted"))
+```
+Without this, a `queued` row that never got a worker stays `queued` forever — invisible to the two prior sweeps.
 
 `_pid_alive(pid)` is `os.kill(pid, 0)`; returns False on `ProcessLookupError`.
 
@@ -292,7 +320,9 @@ def main() -> int:
         execution = repo.get(args.execution_id)
         method = {"plan": orchestrator.plan, "execute": orchestrator.execute,
                   "debrief": orchestrator.debrief}[execution.kind]
-        result = method(execution_id=args.execution_id, **execution.options)
+        # Options live under metadata_json.options (see plan 01 Task 6 — `create(... options=...)`).
+        options = (execution.metadata or {}).get("options", {})
+        result = method(execution_id=args.execution_id, **options)
         return 0 if result.status == ExecutionStatus.SUCCEEDED else 1
     finally:
         _shutdown.set()
@@ -331,7 +361,8 @@ class Supervisor:
     def __init__(self, connection_factory: ConnectionFactory):
         self._ctx = multiprocessing.get_context("spawn")
         self._workers: dict[str, multiprocessing.Process] = {}
-        self._lock = threading.Lock()
+        # RLock (not Lock) — shutdown() calls cancel() which is also @_locked; plain Lock deadlocks.
+        self._lock = threading.RLock()
         self._connection_factory = connection_factory
 
     # Every method that touches _workers is @_locked: spawn, cancel, reap,
@@ -403,13 +434,16 @@ class Supervisor:
   def register_compose_project(self, execution_id: str, project_name: str) -> None:
       self._conn.execute("BEGIN IMMEDIATE")
       try:
+          # workers.compose_projects is NOT NULL DEFAULT '[]', so json_insert is always safe.
           self._conn.execute(
               "UPDATE workers SET compose_projects = json_insert(compose_projects, '$[#]', ?) "
               "WHERE execution_id = ?", (project_name, execution_id))
+          # metadata_json.compose_projects may be absent — use a conditional init that does NOT
+          # clobber an existing value. json_insert is a no-op when the key already exists, so:
           self._conn.execute(
-              "UPDATE executions SET metadata_json = json_set(metadata_json, "
-              "'$.compose_projects', coalesce(json_extract(metadata_json,'$.compose_projects'), json('[]'))) "
-              "WHERE id = ?", (execution_id,))
+              "UPDATE executions SET metadata_json = json_insert(metadata_json, "
+              "'$.compose_projects', json('[]')) WHERE id = ?", (execution_id,))
+          # Now append to whatever is there (original list or the just-initialized []).
           self._conn.execute(
               "UPDATE executions SET metadata_json = json_insert(metadata_json, "
               "'$.compose_projects[#]', ?) WHERE id = ?", (project_name, execution_id))
@@ -418,7 +452,9 @@ class Supervisor:
           self._conn.execute("ROLLBACK")
           raise
   ```
-  Uses SQLite JSON1 (built into CPython stdlib sqlite3 ≥ 3.9; verified at `ensure_initialized()`).
+  `json_insert` semantics: inserts only if the path doesn't exist (no-op if it does); `json_set` would overwrite. The two-step init-then-append is safe on both first and subsequent calls.
+
+  Requires SQLite ≥ 3.38 for the `$[#]` append syntax — asserted in plan 01's `ensure_initialized()`.
 
 **GOTCHA — periodic reap**: schedule via `asyncio.create_task(periodic_reap(...))` in the FastAPI lifespan (Task 6), interval 5s. `reap()` is sync; call from the event loop via `loop.run_in_executor(None, supervisor.reap)`.
 

@@ -73,7 +73,17 @@ from pathlib import Path
 from fastapi import HTTPException, Request
 from starlette.websockets import WebSocket
 
-from fastapi import WebSocketException                   # re-export of starlette.exceptions
+import contextlib
+import hashlib
+import logging
+import os
+import secrets
+import time
+from pathlib import Path
+from typing import Iterator
+
+from fastapi import Depends, HTTPException, Request, Response, WebSocketException
+from starlette.websockets import WebSocket
 
 logger = logging.getLogger(__name__)
 
@@ -218,18 +228,12 @@ Keyed by **sha256(token)[:8]** — same helper used for audit logs; never the ra
 
 The limiter is applied **only to the write router** (`commands.router` from plan 04). Read and stream routes are exempt by design — a dashboard polling reads from this is expected to exceed 30/minute.
 
-The wiring lives in plan 05's `auth.py` and uses **FastAPI `BackgroundTask`** (attached to the Response), not `BaseHTTPMiddleware`. `BaseHTTPMiddleware` has known quirks with state propagation and `BackgroundTask` quirks; the Response `background` field is the idiomatic FastAPI pattern for post-response cleanup.
+The wiring uses a FastAPI **generator dependency**. FastAPI guarantees the code after `yield` runs on both success AND exception paths (success → normal return; exception → `generator.close()` propagates through the `finally`). This is the idiomatic pattern for "reserve a resource, release on any outcome" and strictly cleaner than `BackgroundTasks` (which a `HTTPException`-generating exception handler might not carry) or `BaseHTTPMiddleware` (known state-propagation quirks).
 
 ```python
 # auth.py
-from fastapi import BackgroundTasks, Depends, HTTPException, Request, Response
-
-def require_token_and_write_slot(
-    request: Request,
-    response: Response,
-    background: BackgroundTasks,
-) -> str:
-    token = require_token(request)                      # existing dep; raises 401
+def require_token_and_write_slot(request: Request) -> Iterator[str]:
+    token = require_token(request)                      # raises 401 on invalid token
     key = token_prefix(token)
     request.state.token_prefix = key                    # surfaced to plan 04's start() handler
 
@@ -240,21 +244,23 @@ def require_token_and_write_slot(
             detail="rate limit",
             headers={"Retry-After": str(retry_after)},
         )
-    # Schedule the concurrent-slot release to run AFTER the response is sent.
-    background.add_task(request.app.state.rate_limiter.release, key)
-    return token
+    try:
+        yield token
+    finally:
+        # Runs on any outcome: success, HTTPException, RequestValidationError, raw exception.
+        # FastAPI calls generator.close() after the response is produced (or exception is converted).
+        request.app.state.rate_limiter.release(key)
 ```
 
 In `create_app()` (this plan's Task 2):
 ```python
-# Write router — auth + rate limit in one dep
+# Write router — auth + rate limit in one generator dep
 http_write_protected = APIRouter(dependencies=[Depends(require_token_and_write_slot)])
 http_write_protected.include_router(commands.router)
 app.include_router(http_write_protected)
-# No ReleaseRateLimitMiddleware — BackgroundTasks handles it.
 ```
 
-**GOTCHA**: `BackgroundTasks` run after the response is sent, even on handler exceptions — FastAPI's exception middleware still produces a response, and the `background` attached to that response runs. If the dep itself raises before reaching `background.add_task`, no reservation was made, so nothing to release. Invariant holds: every `check_and_reserve` is paired with a `release`.
+**Invariant**: every successful `check_and_reserve` is paired with a `release`, regardless of handler outcome. If `check_and_reserve` itself returns `(False, ...)`, no reservation was made and the `HTTPException(429)` fires before `yield` — nothing to release. If the rate-limit check succeeds but `require_token` earlier raised 401, we never reach `check_and_reserve` — no reservation. The single `try/yield/finally` covers every post-reservation path.
 
 Defaults from config (see Task 5):
 - `service.rate_limits.max_concurrent`: 3

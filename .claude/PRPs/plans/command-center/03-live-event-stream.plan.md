@@ -185,6 +185,8 @@ async def stream(
                         "kind": "end",
                         "execution_status": _END_STATUS[row["type"]],
                     })
+                    await ws.close()
+                    closed = True
                     return
 
             now = asyncio.get_running_loop().time()
