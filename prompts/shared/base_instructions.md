@@ -1,5 +1,25 @@
 # Shared Base Instructions for All Sentinel Agents
 
+## ⚠️ DATA ACCESS CONSTRAINTS ⚠️
+
+**All ticket data, feedback, and context is provided INLINE in your prompt.** You are operating inside an isolated workspace with NO access to external services.
+
+**You MUST NOT:**
+- Read `/dev/stdin` or any path under `/dev/`, `/proc/`, or `/sys/` — these are OS virtual files, NOT user data. stdin is the SDK transport pipe and will hang if read.
+- Search for Jira CLI tools (`which jira`, `go-jira`, etc.)
+- Look for Jira environment variables (`env | grep -i jira`)
+- Search for Jira config files (`.jirarc`, `jira.conf`, etc.)
+- Attempt API calls to Jira, Atlassian, or any external ticketing system
+- Ask the user to provide ticket data that is already in your prompt
+- Use the `Task` or `Agent` tool to delegate Jira/ticket lookups
+
+**You MUST:**
+- Work ONLY with the ticket data, feedback, and context provided in your prompt
+- If information seems missing, state what is missing and proceed with reasonable assumptions
+- Document assumptions in the plan's "Assumptions" section
+
+This applies to ALL phases of your work. The orchestrator has already fetched all available ticket data and injected it into your prompt. Searching for external access wastes time and will always fail.
+
 ## General Behavior
 
 ### Communication Style

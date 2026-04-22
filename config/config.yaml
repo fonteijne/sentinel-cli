@@ -1,4 +1,12 @@
 version: '1.0'
+# YAML anchor: shared across Drupal agents so a single edit updates both
+# drupal_developer.environment and drupal_reviewer.environment.
+x-drupal-environment: &drupal_environment
+  core_version: "11.1.3"
+  php_version: "8.3"
+  key_contrib: "paragraphs, webform, search_api"
+  ci_pipeline: "GitLab CI"
+  compliance: "GDPR, WCAG 2.2 AA"
 workspace:
   root_dir: ~/sentinel-workspaces
   plans_dir: .agents/plans
@@ -22,11 +30,23 @@ agents:
     - drupal
     - php
     - phpunit
+    environment:
+      <<: *drupal_environment
+      local_dev: "Lando"
+      theme: "custom Starterkit-based"
   security_review:
     model: claude-4-5-sonnet
     temperature: 0.1
     strictness: 5
     veto_power: true
+  drupal_reviewer:
+    model: claude-4-5-sonnet
+    temperature: 0.1
+    veto_power: true
+    environment:
+      <<: *drupal_environment
+      hosting: "Lando"
+      shell: "fish"
   confidence_evaluator:
     model: claude-4-5-sonnet
     temperature: 0.1

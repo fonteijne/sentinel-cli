@@ -309,18 +309,24 @@ class TestContainerAwareTests:
             result = agent.run_tests(temp_worktree)
 
             calls = mock_env_mgr.exec.call_args_list
-            # Calls: phpunit exists, phpunit.xml check, grep testsuite, actual test run
+            # Calls: composer install, phpunit.xml check, grep testsuite, actual test run
             assert len(calls) >= 3
 
-            # First call: check if phpunit exists
-            assert calls[0].kwargs["command"] == ["test", "-f", "vendor/bin/phpunit"]
+            # First call: ensure composer deps (phpunit binary is part of vendor/)
+            assert calls[0].kwargs["command"] == [
+                "composer", "install", "--no-interaction", "--no-progress"
+            ]
             assert calls[0].kwargs["workdir"] == "/app"
 
             # Second call: check if phpunit.xml exists
-            assert calls[1].kwargs["command"] == ["sh", "-c", "test -f phpunit.xml || test -f phpunit.xml.dist"]
+            assert calls[1].kwargs["command"] == [
+                "sh", "-c", "test -f phpunit.xml || test -f phpunit.xml.dist"
+            ]
 
             # Last call: actual test execution (suite kept since config+suite exist)
-            assert calls[-1].kwargs["command"] == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+            assert calls[-1].kwargs["command"] == [
+                "vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"
+            ]
             assert calls[-1].kwargs["workdir"] == "/app"
 
             # Host subprocess should NOT be called
@@ -452,6 +458,67 @@ class TestContainerAwareTests:
         # Last call should have --testsuite stripped
         assert calls[-1].kwargs["command"] == ["vendor/bin/phpunit", "--no-coverage"]
         assert result["success"] is True
+
+
+class TestEnvironmentContextInjection:
+    """Test environment context injection into system prompt."""
+
+    def test_init_injects_environment_context(
+        self, mock_agent_sdk, mock_prompt
+    ):
+        """Test that config environment values replace {{ }} placeholders."""
+        with patch("src.agents.base_agent.get_config") as mock_get_config:
+            config = Mock()
+            config.get_agent_config.return_value = {
+                "model": "claude-4-5-sonnet",
+                "temperature": 0.2,
+            }
+            config.get_llm_config.return_value = {
+                "mode": "custom_proxy",
+                "api_key": "test-api-key",
+                "base_url": "https://test.api.com/v1",
+            }
+            env_data = {
+                "core_version": "11.1.3",
+                "php_version": "8.3",
+                "local_dev": "Lando",
+                "key_contrib": "paragraphs, webform",
+                "theme": "custom Starterkit-based",
+                "ci_pipeline": "GitLab CI",
+                "compliance": "GDPR, WCAG 2.2 AA",
+            }
+
+            def config_get_side_effect(key, default=None):
+                if key == "agents.drupal_developer.environment":
+                    return env_data
+                if key == "agent_sdk.default_tools":
+                    return ["Read", "Grep", "Glob"]
+                if key == "agent_sdk.auto_edits":
+                    return True
+                return default
+
+            config.get.side_effect = config_get_side_effect
+            mock_get_config.return_value = config
+
+            agent = DrupalDeveloperAgent()
+
+            assert "11.1.3" in agent.system_prompt
+            assert "8.3" in agent.system_prompt
+            assert "Lando" in agent.system_prompt
+            assert "paragraphs, webform" in agent.system_prompt
+            assert "{{ core_version }}" not in agent.system_prompt
+            assert "{{ php_version }}" not in agent.system_prompt
+
+    def test_init_handles_missing_environment_config(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Test agent initializes without error when no environment config exists."""
+        agent = DrupalDeveloperAgent()
+
+        assert agent.agent_name == "drupal_developer"
+        overlay_path = Path(__file__).parent.parent / "prompts" / "overlays" / "drupal_developer.md"
+        if overlay_path.exists():
+            assert "Drupal Developer Overlay" in agent.system_prompt
 
 
 class TestDrupalFilterOutputFiles:

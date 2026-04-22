@@ -1,6 +1,7 @@
 """Drupal Developer Agent - Implements Drupal/PHP features using TDD."""
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,17 @@ class DrupalDeveloperAgent(BaseDeveloperAgent):
             temperature=0.2,
         )
         self._load_stack_overlay()
+        self._inject_environment_context()
+
+    def _inject_environment_context(self) -> None:
+        """Replace {{ key }} placeholders in system prompt with config values."""
+        env = self.config.get("agents.drupal_developer.environment", {})
+        if not env or not isinstance(env, dict):
+            return
+        def replace_placeholder(match: re.Match) -> str:
+            key = match.group(1).strip()
+            return str(env.get(key, "Not specified"))
+        self.system_prompt = re.sub(r"\{\{\s*(\w+)\s*\}\}", replace_placeholder, self.system_prompt)
 
     def _load_stack_overlay(self) -> None:
         """Append Drupal developer overlay to system prompt."""
