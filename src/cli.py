@@ -1437,6 +1437,48 @@ def info(ticket_id: str, attachment: str | None) -> None:
         sys.exit(1)
 
 
+_VPN_CAPTIVE_PORTAL_HOST = "auth.hosted-tools.com"
+
+
+def _is_vpn_captive_portal_error(exc: BaseException) -> bool:
+    """Detect the GlobalProtect captive-portal hijack pattern.
+
+    When the GlobalProtect VPN is off, Jira/GitLab API requests get redirected
+    to ``https://auth.hosted-tools.com/?req=...`` and come back 403. We look for
+    that host in the final URL, the redirect chain, the response body, and the
+    exception message — any hit is enough.
+    """
+    marker = _VPN_CAPTIVE_PORTAL_HOST
+    if marker in str(exc):
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        if marker in str(getattr(resp, "url", "")):
+            return True
+        for hop in getattr(resp, "history", None) or []:
+            if marker in str(getattr(hop, "url", "")):
+                return True
+            loc = ""
+            try:
+                loc = hop.headers.get("Location", "") or ""
+            except Exception:
+                pass
+            if marker in loc:
+                return True
+        body = ""
+        try:
+            body = (resp.text or "")[:2000]
+        except Exception:
+            pass
+        if marker in body:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 @cli.command()
 def validate() -> None:
     """Validate API credentials and connectivity.
@@ -1456,6 +1498,7 @@ def validate() -> None:
         jira_failed = False
         gitlab_failed = False
         llm_failed = False
+        vpn_hint_needed = False  # True when 403 via auth.hosted-tools.com detected
         llm_mode = "unknown"  # Track LLM mode for fix instructions
         beads_disabled = True  # Beads disabled — re-enable when Dolt stability improves
 
@@ -1480,6 +1523,9 @@ def validate() -> None:
             click.echo(f"   ❌ Jira connection failed: {e}")
             all_valid = False
             jira_failed = True
+            if _is_vpn_captive_portal_error(e):
+                vpn_hint_needed = True
+                click.echo("      ↪ redirect via auth.hosted-tools.com — waarschijnlijk VPN uit (zie tip hieronder)")
 
         # Test GitLab
         click.echo("\n2️⃣  Testing GitLab API...")
@@ -1501,6 +1547,9 @@ def validate() -> None:
             click.echo(f"   ❌ GitLab connection failed: {e}")
             all_valid = False
             gitlab_failed = True
+            if _is_vpn_captive_portal_error(e):
+                vpn_hint_needed = True
+                click.echo("      ↪ redirect via auth.hosted-tools.com — waarschijnlijk VPN uit (zie tip hieronder)")
 
         # Test LLM configuration
         click.echo("\n3️⃣  Testing LLM Configuration...")
@@ -1725,6 +1774,16 @@ def validate() -> None:
             click.echo("✅ All credentials validated successfully!")
         else:
             click.echo("⚠️  Some credentials need attention")
+
+            # VPN captive-portal reminder — in this environment Jira/GitLab
+            # requests that get a 403 via auth.hosted-tools.com almost always
+            # mean the GlobalProtect VPN is disconnected. Show the reminder
+            # first so users don't chase credential red herrings.
+            if vpn_hint_needed:
+                click.echo("")
+                click.echo("🔌 Heads-up: de 403's via auth.hosted-tools.com wijzen op een VPN-redirect.")
+                click.echo("   👉 Zet GlobalProtect VPN aan en run 'sentinel validate' opnieuw vóór je credentials gaat debuggen.")
+
             click.echo("\nTo fix:")
 
             # Provide targeted fix instructions based on what failed
