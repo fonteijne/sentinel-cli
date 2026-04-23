@@ -158,6 +158,15 @@ services:
       - traefik-acme:/acme
     networks:
       - sentinel-edge
+    environment:
+      # Traefik v3 embeds a moby client that defaults to API version 1.24
+      # for its initial handshake. Docker Engine 29.x refuses 1.24 with
+      # HTTP 400 on GET /v1.24/version, which surfaces as the opaque
+      # `Error response from daemon: <empty>` in Traefik logs. Pinning a
+      # modern API version forces moby client to use it end-to-end.
+      # 1.45 is broadly supported (Docker Engine 25+); bump if your engine
+      # advertises a higher minimum in `GET /version`.
+      - DOCKER_API_VERSION=1.45
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
