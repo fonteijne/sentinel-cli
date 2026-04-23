@@ -147,7 +147,6 @@ Verified invariants:
 
 ## Next Steps
 
-- [ ] Operator: `docker network create sentinel-edge` on target host
 - [ ] Operator: fill in `.env` (`SENTINEL_HOSTNAME`, `LETSENCRYPT_EMAIL`) + verify DNS
 - [ ] Operator: `docker compose --profile serve --profile traefik up -d`
 - [ ] Operator: verify `https://$SENTINEL_HOSTNAME/health` returns 200 within 2 min

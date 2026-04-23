@@ -13,7 +13,7 @@ auth, event bus, worker supervisor — lives in plans 01–05.
 |---|---|
 | Dev on your laptop | `docker compose --profile dev up -d sentinel-dev` → `http://localhost:8787/docs` |
 | Prod, bundled Traefik | `cp .env.example .env && $EDITOR .env` → `docker compose --profile serve --profile traefik up -d` |
-| Prod, BYO Traefik | `docker compose --profile serve up -d` → connect your Traefik to `sentinel-edge` |
+| Prod, BYO Traefik | `docker compose --profile serve up -d` → `docker network connect sentinel-edge <your-traefik>` |
 
 ---
 
@@ -41,17 +41,7 @@ sentinel.iobonzai.com.   300   IN   AAAA <host-ipv6>
 - No other webserver may be bound to 80/443 on the host. If one is, choose
   the **BYO-Traefik path** below.
 
-### 0.3 One-time network setup
-
-```bash
-docker network create sentinel-edge
-```
-
-The compose file declares this network with `external: true` so compose will
-not create (or destroy) it. `docker network create` is idempotent — re-runs
-on an existing network are a no-op.
-
-### 0.4 `.env`
+### 0.3 `.env`
 
 ```bash
 cp .env.example .env
@@ -99,7 +89,6 @@ Traefik.
 ```bash
 cp .env.example .env
 $EDITOR .env                                   # set SENTINEL_HOSTNAME + LETSENCRYPT_EMAIL
-docker network create sentinel-edge || true
 docker compose --profile serve --profile traefik up -d
 ```
 
@@ -142,10 +131,22 @@ If the host already runs Traefik (or a shared ingress Traefik on another
 host), skip the bundled one:
 
 ```bash
-docker network create sentinel-edge || true
 docker compose --profile serve up -d          # note: no --profile traefik
 docker network connect sentinel-edge <your-traefik-container>
 ```
+
+Compose creates `sentinel-edge` on first `up`, so `docker network connect`
+comes **after**, not before. No one-shot `docker network create` step.
+
+> **⚠️ `stop` vs `down` when BYO Traefik is attached.**
+>
+> `docker compose down` removes networks compose created — including
+> `sentinel-edge`. That disconnects your BYO Traefik. Use
+> `docker compose stop` / `docker compose start` for routine restarts, and
+> only use `down` when you intend to re-attach your Traefik afterwards
+> (re-run the `docker network connect` above). This trade-off is the cost
+> of having compose create the network instead of requiring a manual
+> `docker network create` step upfront.
 
 The labels on `sentinel-serve` already provide routing rules (`Host()`,
 `entrypoints=websecure`, `tls.certresolver=le`, service port 8787). Your

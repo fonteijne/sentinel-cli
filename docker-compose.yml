@@ -173,10 +173,13 @@ volumes:
     driver: local
 
 networks:
-  # Shared edge network — either the bundled Traefik (profile: traefik) or a
-  # BYO Traefik attaches here to reach sentinel-serve. external: true means
-  # compose will NOT create it. One-time host setup:
-  #   docker network create sentinel-edge
+  # Shared edge network. Compose creates and destroys it with the stack.
+  # BYO-Traefik operators attach their Traefik via
+  #   docker network connect sentinel-edge <their-traefik>
+  # AFTER compose has brought the stack up. IMPORTANT: those operators must
+  # use `docker compose stop` (not `down`) — `down` removes this network and
+  # disconnects any externally-attached container. Fresh `up` re-creates it.
+  # The explicit `name:` keeps the network name stable (no project prefix)
+  # so the Traefik labels' `docker.network=sentinel-edge` always matches.
   sentinel-edge:
-    external: true
     name: sentinel-edge
