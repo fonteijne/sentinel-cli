@@ -95,7 +95,10 @@ services:
     container_name: sentinel-serve
     profiles:
       - serve
-    command: ["sentinel", "serve", "--host", "0.0.0.0", "--i-know-what-im-doing", "--port", "8787"]
+    # The `app` image has ENTRYPOINT ["sentinel"]; command: is argv[1:], so
+    # do NOT repeat `sentinel` here (Click would interpret the duplicate as
+    # a subcommand and fail with `No such command 'sentinel'`).
+    command: ["serve", "--host", "0.0.0.0", "--i-know-what-im-doing", "--port", "8787"]
     volumes:
       - sentinel-workspaces:/workspaces
       - sentinel-projects:/workspace/projects
