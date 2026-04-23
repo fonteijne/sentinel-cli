@@ -117,6 +117,129 @@ def _is_vpn_captive_portal_error(exc: BaseException) -> bool:
     return False
 
 
+def _service_base_url() -> str:
+    return os.environ.get("SENTINEL_SERVICE_URL", "http://127.0.0.1:8787")
+
+
+def _load_service_token() -> Optional[str]:
+    """Read bearer from env var first, then ``~/.sentinel/service_token``."""
+    tok = os.environ.get("SENTINEL_SERVICE_TOKEN")
+    if tok:
+        return tok.strip()
+    tok_path = Path.home() / ".sentinel" / "service_token"
+    if tok_path.exists():
+        try:
+            return tok_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None
+    return None
+
+
+def _remote_execute(
+    *,
+    ticket_id: str,
+    project: str,
+    options: dict,
+    follow: bool,
+    idempotency_key: Optional[str],
+) -> None:
+    """POST /executions to the Command Center service, optionally tail events.
+
+    Exit codes:
+        0 — run reached a terminal state (or request accepted and not following).
+        1 — run reached a terminal *failed* state while following.
+        3 — service unreachable.
+        4 — invalid token.
+        5 — rate-limited.
+    """
+    import json
+
+    import requests
+
+    base = _service_base_url().rstrip("/")
+    token = _load_service_token()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+
+    body = {
+        "ticket_id": ticket_id,
+        "project": project,
+        "kind": "execute",
+        "options": {k: v for k, v in options.items() if v is not None},
+    }
+
+    try:
+        resp = requests.post(
+            f"{base}/executions", json=body, headers=headers, timeout=10
+        )
+    except requests.exceptions.ConnectionError:
+        click.echo(
+            f"❌ service not running at {base} — start it with `sentinel serve`",
+            err=True,
+        )
+        sys.exit(3)
+
+    if resp.status_code == 401:
+        click.echo("❌ invalid token at ~/.sentinel/service_token", err=True)
+        sys.exit(4)
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After", "?")
+        click.echo(
+            f"❌ rate limit reached; retry after {retry_after}s", err=True
+        )
+        sys.exit(5)
+    if not resp.ok:
+        click.echo(
+            f"❌ POST /executions failed: {resp.status_code} {resp.text}",
+            err=True,
+        )
+        sys.exit(1)
+
+    execution = resp.json()
+    execution_id = execution["id"]
+    click.echo(f"✅ started remote execution {execution_id} (status={execution['status']})")
+
+    if not follow:
+        return
+
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except ImportError:
+        click.echo(
+            "❌ `websockets` package required for --follow "
+            "(pip install websockets)",
+            err=True,
+        )
+        sys.exit(1)
+
+    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+    url = f"{ws_base}/executions/{execution_id}/stream?since_seq=0"
+    if token:
+        url = f"{url}&token={token}"
+
+    try:
+        with ws_connect(url, open_timeout=10) as ws:
+            for message in ws:
+                try:
+                    frame = json.loads(message)
+                except Exception:
+                    click.echo(message)
+                    continue
+                t = frame.get("type", "?")
+                seq = frame.get("seq", "-")
+                click.echo(f"[{seq:>4}] {t} {frame}")
+                if t in ("execution.completed", "execution.failed", "execution.cancelled"):
+                    if t == "execution.failed":
+                        sys.exit(1)
+                    return
+    except Exception as exc:
+        click.echo(f"❌ stream error: {exc}", err=True)
+        sys.exit(1)
+
+
 def _open_command_center():
     """Build a fresh (conn, repo, bus, orchestrator) tuple for a CLI command.
 
@@ -603,7 +726,34 @@ def _format_drupal_findings_comment(
     default=None,
     help="Additional instruction to inject into the developer agent session.",
 )
-def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False, no_env: bool = False, prompt: Optional[str] = None) -> None:
+@click.option(
+    "--remote",
+    is_flag=True,
+    help="Start the execution on the Command Center service (POST /executions) "
+    "instead of running in-process. Survives CLI exit.",
+)
+@click.option(
+    "--follow",
+    is_flag=True,
+    help="With --remote: stream live events from the service until the run ends.",
+)
+@click.option(
+    "--idempotency-key",
+    default=None,
+    help="With --remote: Idempotency-Key header value for POST /executions.",
+)
+def execute(
+    ticket_id: str,
+    project: Optional[str] = None,
+    max_iterations: int = 5,
+    force: bool = False,
+    revise: bool = False,
+    no_env: bool = False,
+    prompt: Optional[str] = None,
+    remote: bool = False,
+    follow: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> None:
     """Execute implementation plan for a Jira ticket.
 
     Reads the plan, implements features using TDD, and iterates with security review
@@ -618,10 +768,24 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         force: Force-push to remote if branch has diverged
         revise: Revise existing implementation based on MR feedback
     """
+    # Extract project key from ticket ID if not provided
+    if project is None:
+        project = ticket_id.split("-")[0]
+
+    if remote:
+        _remote_execute(
+            ticket_id=ticket_id,
+            project=project,
+            options={
+                "revise": revise,
+                "max_turns": None,
+            },
+            follow=follow,
+            idempotency_key=idempotency_key,
+        )
+        return
+
     try:
-        # Extract project key from ticket ID if not provided
-        if project is None:
-            project = ticket_id.split("-")[0]
         conn, repo, bus, orchestrator = _open_command_center()
     except Exception as e:
         logger.error(f"Execute command setup failed: {e}", exc_info=True)
