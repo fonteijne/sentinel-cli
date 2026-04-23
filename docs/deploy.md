@@ -266,6 +266,7 @@ schema. The factory gates them as a group.
 | Browser `502 Bad Gateway` | `sentinel-serve` is unhealthy | `docker compose --profile serve logs sentinel-serve`; `docker inspect sentinel-serve --format '{{.State.Health.Status}}'` |
 | `docker compose up` silently did nothing for the backend | Profile not passed | `docker compose --profile serve up -d` (the profile is required) |
 | Two Traefiks fighting over 80/443 | Both bundled and BYO running | `docker ps \| grep traefik` — stop one |
+| Traefik logs `Error response from daemon: <empty>` and no routers load | Direct `docker.sock` talk breaking on recent Docker Engine | Ensure `sentinel-dockerproxy` is running (`docker ps \| grep dockerproxy`); the `traefik` profile should start both. Traefik reads from the proxy over TCP on `sentinel-edge`, not the raw socket. |
 | Let's Encrypt rate-limit hit | Too many failed issuances | Switch to staging CA (§2.1) until green |
 | `LETSENCRYPT_EMAIL required` on compose up | Forgot to set in `.env` | Set it; `docker compose ... up -d` again |
 | `SENTINEL_HOSTNAME required` on compose up | Forgot to set in `.env` | Same — it's intentional; prod without hostname is never correct |
