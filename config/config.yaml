@@ -125,8 +125,14 @@ service:
   # Bind address for `sentinel serve`. 0.0.0.0 requires --i-know-what-im-doing.
   bind_address: "127.0.0.1"
   port: 8787
+  # Expose FastAPI /docs + /redoc + /openapi.json. Off by default so the
+  # schema doesn't leak in prod. Env SENTINEL_ENABLE_DOCS=true overrides
+  # (dev compose sets this automatically; prod compose leaves it false).
+  enable_docs: false
   # CORS allowlist; e.g. ["http://localhost:3000"]. Must NOT contain "*" —
   # browsers reject "*" + allow_credentials=true, and the factory refuses it.
+  # Prod example: ["https://dashboard.iobonzai.com"]
+  # Dev example:  ["http://localhost:5173"]
   cors_origins: []
   rate_limits:
     # Per-token caps applied to write endpoints only (POST /executions*).

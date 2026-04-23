@@ -20,6 +20,7 @@ worker deploy would corrupt both and is deliberately out of scope.
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import APIRouter, Depends, FastAPI
 from starlette.middleware.cors import CORSMiddleware
@@ -55,6 +56,21 @@ def _validate_cors(origins: list[str]) -> None:
         )
 
 
+def _docs_enabled(cfg) -> bool:  # type: ignore[no-untyped-def]
+    """Decide whether to expose ``/docs`` + ``/redoc`` + ``/openapi.json``.
+
+    Precedence: env ``SENTINEL_ENABLE_DOCS`` (truthy string) wins, then
+    ``service.enable_docs`` from config, then ``False``. Prod compose sets the
+    env to ``false`` by default so the schema does not leak; dev compose sets
+    it to ``true`` so ``http://localhost:8787/docs`` just works.
+    """
+
+    raw = os.environ.get("SENTINEL_ENABLE_DOCS")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(cfg.get("service.enable_docs", False))
+
+
 def create_app() -> FastAPI:
     """Build a fully-composed Command Center app with auth + rate limit + CORS.
 
@@ -66,10 +82,19 @@ def create_app() -> FastAPI:
 
     cfg = get_config()
 
+    # Gate /docs, /redoc AND /openapi.json together. Swagger UI fetches
+    # /openapi.json, so leaving that endpoint open while hiding /docs still
+    # leaks the full schema. Setting these constructor kwargs to None removes
+    # the endpoints entirely (404, not 401) because /docs is app-level and
+    # the router-level bearer dep from plan 05 doesn't apply to it.
+    docs_on = _docs_enabled(cfg)
     app = FastAPI(
         title="Sentinel Command Center API",
         version="0.1",
         lifespan=command_center_lifespan,
+        docs_url="/docs" if docs_on else None,
+        redoc_url="/redoc" if docs_on else None,
+        openapi_url="/openapi.json" if docs_on else None,
     )
     app.state.service_token = load_or_create_token()
     app.state.rate_limiter = TokenRateLimiter(
