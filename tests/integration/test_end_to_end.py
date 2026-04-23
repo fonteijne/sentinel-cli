@@ -77,11 +77,17 @@ class _SyntheticSupervisor:
         self.cancelled.append(execution_id)
 
 
+_TEST_TOKEN = "integration-test-token-abc-123456789"
+
+
 @pytest.fixture
 def db_path(tmp_path, monkeypatch):
+    """Per-test env: DB path, logs dir, and the service token (plan 05)."""
+
     path = tmp_path / "sentinel.db"
     monkeypatch.setenv("SENTINEL_DB_PATH", str(path))
     monkeypatch.setenv("SENTINEL_LOGS_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("SENTINEL_SERVICE_TOKEN", _TEST_TOKEN)
     ensure_initialized()
     return path
 
@@ -94,6 +100,7 @@ def client_with_fake_supervisor(db_path):
     fake = _SyntheticSupervisor()
     app.dependency_overrides[get_supervisor] = lambda: fake
     with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {_TEST_TOKEN}"
         yield c, fake
 
 

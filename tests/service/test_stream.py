@@ -1,14 +1,18 @@
-"""WebSocket tests for the Command Center live event stream (plan 03)."""
+"""WebSocket tests for the Command Center live event stream (plan 03).
+
+Plan 05 Task 6: migrated to ``authed_client`` from the central conftest.
+The TestClient has the ``Authorization: Bearer <token>`` header preattached;
+starlette forwards it on the WS handshake. Unauthenticated WS behaviour is
+covered separately in ``test_auth.py``.
+"""
 
 from __future__ import annotations
 
 import json
 import threading
 import time
-from typing import Iterator
 
 import pytest
-from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from src.core.events import (
@@ -21,23 +25,6 @@ from src.core.events import (
 from src.core.execution.models import ExecutionKind, ExecutionStatus
 from src.core.execution.repository import ExecutionRepository
 from src.core.persistence import connect, ensure_initialized
-from src.service.app import create_app
-
-
-@pytest.fixture
-def db_path(tmp_path, monkeypatch):
-    """Route DB access through a per-test SQLite file."""
-    path = tmp_path / "sentinel.db"
-    monkeypatch.setenv("SENTINEL_DB_PATH", str(path))
-    ensure_initialized()
-    return path
-
-
-@pytest.fixture
-def client(db_path) -> Iterator[TestClient]:
-    app = create_app()
-    with TestClient(app) as c:
-        yield c
 
 
 def _seed_execution(
@@ -45,6 +32,10 @@ def _seed_execution(
     project: str = "ACME",
     kind: ExecutionKind = ExecutionKind.PLAN,
 ) -> str:
+    # ``authed_client`` fires the lifespan which calls ``ensure_initialized``,
+    # but seed helpers may run before first request in some test orderings —
+    # belt-and-braces.
+    ensure_initialized()
     conn = connect()
     try:
         repo = ExecutionRepository(conn)
@@ -77,7 +68,7 @@ def _finish(execution_id: str, status: ExecutionStatus) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_replay_finished_execution(client, db_path):
+def test_replay_finished_execution(authed_client):
     """Seed 3 events ending in execution.completed; expect 3 event + end frame."""
     execution_id = _seed_execution()
     _publish(
@@ -96,7 +87,9 @@ def test_replay_finished_execution(client, db_path):
     _finish(execution_id, ExecutionStatus.SUCCEEDED)
 
     frames: list[dict] = []
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         for _ in range(4):
             frames.append(ws.receive_json())
 
@@ -114,7 +107,7 @@ def test_replay_finished_execution(client, db_path):
         assert isinstance(f["payload"], dict)
 
 
-def test_since_seq_resumes_from_cursor(client, db_path):
+def test_since_seq_resumes_from_cursor(authed_client):
     execution_id = _seed_execution()
     _publish(
         execution_id,
@@ -132,7 +125,7 @@ def test_since_seq_resumes_from_cursor(client, db_path):
     _finish(execution_id, ExecutionStatus.SUCCEEDED)
 
     frames: list[dict] = []
-    with client.websocket_connect(
+    with authed_client.websocket_connect(
         f"/executions/{execution_id}/stream?since_seq=2"
     ) as ws:
         for _ in range(2):
@@ -144,9 +137,9 @@ def test_since_seq_resumes_from_cursor(client, db_path):
     assert frames[1] == {"kind": "end", "execution_status": "succeeded"}
 
 
-def test_unknown_execution_closes_4404(client, db_path):
+def test_unknown_execution_closes_4404(authed_client):
     with pytest.raises(WebSocketDisconnect) as excinfo:
-        with client.websocket_connect(
+        with authed_client.websocket_connect(
             "/executions/does-not-exist/stream"
         ) as ws:
             ws.receive_json()
@@ -158,7 +151,7 @@ def test_unknown_execution_closes_4404(client, db_path):
 # ---------------------------------------------------------------------------
 
 
-def test_live_tail_receives_new_event(client, db_path):
+def test_live_tail_receives_new_event(authed_client):
     """Connect to an in-flight execution; publish after connect; frame arrives."""
     execution_id = _seed_execution()
     _publish(
@@ -175,7 +168,9 @@ def test_live_tail_receives_new_event(client, db_path):
             PhaseChanged(execution_id=execution_id, phase="writing"),
         )
 
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         first = ws.receive_json()
         assert first["type"] == "execution.started"
         t = threading.Thread(target=_publish_after_delay)
@@ -187,7 +182,7 @@ def test_live_tail_receives_new_event(client, db_path):
         assert second["type"] == "phase.changed"
 
 
-def test_live_tail_from_cross_process_writer(client, db_path):
+def test_live_tail_from_cross_process_writer(authed_client):
     """Simulate a subprocess worker writing directly to the DB from a thread.
 
     The WS must read from the DB, not from the in-process bus — this test
@@ -230,7 +225,9 @@ def test_live_tail_from_cross_process_writer(client, db_path):
             conn.close()
 
     t = threading.Thread(target=_insert_from_another_connection)
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         t.start()
         try:
             frame = ws.receive_json()
@@ -245,25 +242,31 @@ def test_live_tail_from_cross_process_writer(client, db_path):
 # ---------------------------------------------------------------------------
 
 
-def test_heartbeat_on_silence(client, db_path, monkeypatch):
+def test_heartbeat_on_silence(authed_client, monkeypatch):
     import src.service.routes.stream as stream_module
 
     monkeypatch.setattr(stream_module, "HEARTBEAT_INTERVAL_S", 0.3)
     execution_id = _seed_execution()
 
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         frame = ws.receive_json()
         assert frame["kind"] == "heartbeat"
         assert "ts" in frame
 
 
-def test_client_disconnect_exits_cleanly(client, db_path):
+def test_client_disconnect_exits_cleanly(authed_client):
     execution_id = _seed_execution()
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ):
         pass
     # Reconnecting works — the server coroutine from the first connect
     # exited cleanly and did not leak state.
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         ws.close()
 
 
@@ -272,7 +275,7 @@ def test_client_disconnect_exits_cleanly(client, db_path):
 # ---------------------------------------------------------------------------
 
 
-def test_terminal_mapping_cancelled(client, db_path):
+def test_terminal_mapping_cancelled(authed_client):
     execution_id = _seed_execution()
     _publish(
         execution_id,
@@ -281,7 +284,9 @@ def test_terminal_mapping_cancelled(client, db_path):
     _finish(execution_id, ExecutionStatus.CANCELLED)
 
     frames: list[dict] = []
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         for _ in range(2):
             frames.append(ws.receive_json())
 
@@ -289,7 +294,7 @@ def test_terminal_mapping_cancelled(client, db_path):
     assert frames[1] == {"kind": "end", "execution_status": "cancelled"}
 
 
-def test_terminal_mapping_completed_uses_succeeded(client, db_path):
+def test_terminal_mapping_completed_uses_succeeded(authed_client):
     """Guard against the `split('.')[-1]` regression."""
     execution_id = _seed_execution()
     _publish(
@@ -301,7 +306,9 @@ def test_terminal_mapping_completed_uses_succeeded(client, db_path):
     _finish(execution_id, ExecutionStatus.SUCCEEDED)
 
     frames: list[dict] = []
-    with client.websocket_connect(f"/executions/{execution_id}/stream") as ws:
+    with authed_client.websocket_connect(
+        f"/executions/{execution_id}/stream"
+    ) as ws:
         for _ in range(2):
             frames.append(ws.receive_json())
 
@@ -314,7 +321,7 @@ def test_terminal_mapping_completed_uses_succeeded(client, db_path):
 # ---------------------------------------------------------------------------
 
 
-def test_slow_client_backpressure(client, db_path, monkeypatch):
+def test_slow_client_backpressure(authed_client, monkeypatch):
     """Client that never reads → server closes with 1011 after SEND_TIMEOUT_S.
 
     We can't easily force the starlette TestClient to block send_json so we
@@ -346,7 +353,7 @@ def test_slow_client_backpressure(client, db_path, monkeypatch):
     monkeypatch.setattr(stream_module.asyncio, "wait_for", _timing_out_wait_for)
 
     with pytest.raises(WebSocketDisconnect) as excinfo:
-        with client.websocket_connect(
+        with authed_client.websocket_connect(
             f"/executions/{execution_id}/stream"
         ) as ws:
             ws.receive_json()
