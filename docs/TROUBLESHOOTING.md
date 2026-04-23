@@ -16,6 +16,7 @@ This guide covers the most common problems users encounter when working with Sen
   - [Agent SDK Issues](#agent-sdk-issues)
   - [Installation Problems](#installation-problems)
   - [Configuration Errors](#configuration-errors)
+- [Command Center (`sentinel serve`) operator notes](#command-center-sentinel-serve-operator-notes)
 - [Debugging Techniques](#debugging-techniques)
 - [Reset Command](#reset-command)
 - [Getting Help](#getting-help)
@@ -484,6 +485,69 @@ Because sentinel depends on both package-a (^1.0) and package-b (^2.0) which dep
 3. **Use YAML validator:**
    - Online: https://www.yamllint.com/
    - Or install yamllint: `pip install yamllint`
+
+---
+
+## Command Center (`sentinel serve`) operator notes
+
+Short, non-error notes about the HTTP service that are easy to misread if
+you're wiring it into monitoring for the first time. Not error conditions —
+just behaviour that looks surprising without context.
+
+### `/health` is a deep probe, not a liveness check
+
+`GET /health` is intentionally unauthenticated and executes `SELECT 1` against
+the SQLite database via a real request-scoped connection. That means:
+
+- If the DB file is missing, locked, or otherwise unreachable, `/health`
+  returns **500** even though the Python process is alive and serving.
+- If you use `/health` as a Kubernetes readiness probe or docker-compose
+  `healthcheck:`, this is the desired behaviour — the service isn't useful
+  without the DB, so it shouldn't receive traffic.
+- If you use `/health` as a **liveness** probe, a transient DB lock will
+  restart the process unnecessarily. For liveness, use a plain TCP port
+  check on the bound port, not `/health`.
+
+Bottom line: `/health` == "ready to serve requests"; TCP check == "process
+is up". They are not interchangeable.
+
+### Every audit line means "authorised attempt", not "confirmed write"
+
+Authenticated writes (POST to `/executions*`) emit a structured log line:
+
+```
+INFO audit write user=<token-prefix> ip=<client> method=POST path=/executions
+```
+
+The line is emitted AFTER the bearer check and rate-limit reservation but
+BEFORE the handler runs. Which means:
+
+- A 4xx (e.g. pydantic-422 for a malformed body, 409 for a write on a
+  terminal execution) still produces an audit line — the client had a
+  valid token and passed the rate limit, they just sent a request the
+  handler rejected.
+- A 5xx from inside the handler also produces an audit line, because the
+  attempt itself is what we audit.
+
+When reconciling audit logs with state changes, correlate on the response
+status (access logs) or on the corresponding `execution.started` event in
+the DB — a successful write is "audit line + 202 Accepted + execution row".
+A line without the 202 is a rejected or failed attempt.
+
+### Token file lives at `~/.sentinel/service_token`
+
+Created mode `0600` on first `sentinel serve` if neither the env var nor an
+existing file is present. Safe to delete when you want to rotate — the next
+`sentinel serve` generates a fresh one. On a shared host, prefer the env
+var (`SENTINEL_SERVICE_TOKEN`) so the token isn't at rest on disk, but note
+that env vars are visible to other processes via `ps -eww` on some systems.
+
+### `--host 0.0.0.0` is refused by default
+
+`sentinel serve --host 0.0.0.0` (or `::`) exits non-zero. Use the Docker
+network IP or `127.0.0.1` for local work. The escape hatch is
+`--i-know-what-im-doing`; don't use it without understanding that this
+exposes execution control on the network.
 
 ---
 

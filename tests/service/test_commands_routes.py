@@ -1,14 +1,26 @@
-"""HTTP tests for the Command Center write endpoints (plan 04)."""
+"""HTTP tests for the Command Center write endpoints (plan 04).
+
+Migrated in plan 05 Task 6 to use the central ``authed_client`` fixture.
+A fake Supervisor is still required, but this test file needs a variant of
+``authed_client`` that also overrides ``get_supervisor`` — hence the local
+``authed_client_with_fake_supervisor`` fixture below. It mirrors the env
+monkeypatching from ``conftest.authed_env`` (already applied via param
+injection) then attaches ``app.dependency_overrides[get_supervisor]`` before
+the TestClient enters its lifespan context.
+"""
 
 from __future__ import annotations
+
+from typing import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 
 from src.core.execution.models import ExecutionKind, ExecutionStatus
 from src.core.execution.repository import ExecutionRepository
-from src.core.persistence import connect, ensure_initialized
-from src.service.app import create_app
+from src.core.persistence import connect
+
+from tests.service.conftest import TEST_TOKEN
 
 
 class _FakeSupervisor:
@@ -30,34 +42,38 @@ class _FakeSupervisor:
 
 
 @pytest.fixture
-def db_path(tmp_path, monkeypatch):
-    path = tmp_path / "sentinel.db"
-    monkeypatch.setenv("SENTINEL_DB_PATH", str(path))
-    monkeypatch.setenv("SENTINEL_LOGS_DIR", str(tmp_path / "logs"))
-    ensure_initialized()
-    return path
-
-
-@pytest.fixture
-def fake_supervisor():
+def fake_supervisor() -> _FakeSupervisor:
     return _FakeSupervisor()
 
 
 @pytest.fixture
-def client(db_path, fake_supervisor):
-    """TestClient with a fake supervisor swapped in via dependency_overrides."""
+def authed_client_with_fake_supervisor(
+    authed_env, fake_supervisor
+) -> Iterator[TestClient]:
+    """``authed_client`` variant that swaps in a fake supervisor.
+
+    Mirrors the real ``authed_client`` (env already set by ``authed_env``) but
+    installs ``app.dependency_overrides[get_supervisor]`` before the TestClient
+    enters its lifespan — so every write-endpoint dep that resolves
+    ``get_supervisor`` gets the fake. Auth header is pre-attached.
+    """
+    from src.service.app import create_app
     from src.service.deps import get_supervisor
 
     app = create_app()
     app.dependency_overrides[get_supervisor] = lambda: fake_supervisor
     with TestClient(app) as c:
+        c.headers["Authorization"] = f"Bearer {TEST_TOKEN}"
         yield c
 
 
 # --------------------------------------------------------- start endpoint
 
 
-def test_start_happy_path_returns_202_and_spawns(client, fake_supervisor):
+def test_start_happy_path_returns_202_and_spawns(
+    authed_client_with_fake_supervisor, fake_supervisor
+):
+    client = authed_client_with_fake_supervisor
     resp = client.post(
         "/executions",
         json={
@@ -76,7 +92,8 @@ def test_start_happy_path_returns_202_and_spawns(client, fake_supervisor):
     assert fake_supervisor.spawn_calls[0] == body["id"]
 
 
-def test_start_rejects_extra_fields_with_422(client):
+def test_start_rejects_extra_fields_with_422(authed_client_with_fake_supervisor):
+    client = authed_client_with_fake_supervisor
     resp = client.post(
         "/executions",
         json={
@@ -90,7 +107,8 @@ def test_start_rejects_extra_fields_with_422(client):
     assert resp.status_code == 422
 
 
-def test_start_rejects_bad_ticket_and_project(client):
+def test_start_rejects_bad_ticket_and_project(authed_client_with_fake_supervisor):
+    client = authed_client_with_fake_supervisor
     resp = client.post(
         "/executions",
         json={"ticket_id": "not-valid", "project": "proj", "kind": "execute"},
@@ -105,8 +123,9 @@ def test_start_rejects_bad_ticket_and_project(client):
 
 
 def test_start_spawn_failure_marks_row_failed_and_500s(
-    client, fake_supervisor, db_path
+    authed_client_with_fake_supervisor, fake_supervisor
 ):
+    client = authed_client_with_fake_supervisor
     fake_supervisor.raise_on_spawn = True
     resp = client.post(
         "/executions",
@@ -128,55 +147,43 @@ def test_start_spawn_failure_marks_row_failed_and_500s(
 
 
 def test_idempotency_returns_existing_row_and_does_not_spawn_twice(
-    client, fake_supervisor, db_path
+    authed_client_with_fake_supervisor, fake_supervisor
 ):
-    # Plan 05 sets request.state.token_prefix. For isolated tests we
-    # simulate the same effect by directly stamping both fields on an
-    # existing row, then issuing the request with the same key. Without
-    # a token prefix, the handler skips the idempotency lookup.
-    # Instead of faking auth, seed an idempotent row and monkey-patch
-    # the request state via a custom dependency.
-    from src.service.deps import get_supervisor
+    """With plan 05, ``require_token_and_write_slot`` stamps
+    ``request.state.token_prefix`` for us — no middleware fake needed.
 
-    app = create_app()
-
-    def _set_prefix(request):  # type: ignore[no-untyped-def]
-        request.state.token_prefix = "abcd1234"
-
-    @app.middleware("http")
-    async def _mw(request, call_next):  # type: ignore[no-untyped-def]
-        _set_prefix(request)
-        return await call_next(request)
-
-    app.dependency_overrides[get_supervisor] = lambda: fake_supervisor
-
-    with TestClient(app) as c:
-        r1 = c.post(
-            "/executions",
-            headers={"Idempotency-Key": "key-1"},
-            json={"ticket_id": "PROJ-2", "project": "proj", "kind": "execute"},
-        )
-        assert r1.status_code == 202, r1.text
-        first_id = r1.json()["id"]
-        r2 = c.post(
-            "/executions",
-            headers={"Idempotency-Key": "key-1"},
-            json={"ticket_id": "PROJ-2", "project": "proj", "kind": "execute"},
-        )
-        assert r2.status_code == 202
-        assert r2.json()["id"] == first_id
-        assert len(fake_supervisor.spawn_calls) == 1  # spawn only once
+    Two authed POSTs with the same Idempotency-Key should resolve to the
+    same execution row and spawn exactly once.
+    """
+    client = authed_client_with_fake_supervisor
+    r1 = client.post(
+        "/executions",
+        headers={"Idempotency-Key": "key-1"},
+        json={"ticket_id": "PROJ-2", "project": "proj", "kind": "execute"},
+    )
+    assert r1.status_code == 202, r1.text
+    first_id = r1.json()["id"]
+    r2 = client.post(
+        "/executions",
+        headers={"Idempotency-Key": "key-1"},
+        json={"ticket_id": "PROJ-2", "project": "proj", "kind": "execute"},
+    )
+    assert r2.status_code == 202
+    assert r2.json()["id"] == first_id
+    assert len(fake_supervisor.spawn_calls) == 1  # spawn only once
 
 
 # ---------------------------------------------------------- cancel endpoint
 
 
-def test_cancel_404_for_missing(client):
+def test_cancel_404_for_missing(authed_client_with_fake_supervisor):
+    client = authed_client_with_fake_supervisor
     resp = client.post("/executions/does-not-exist/cancel")
     assert resp.status_code == 404
 
 
-def test_cancel_409_for_terminal_row(client, db_path):
+def test_cancel_409_for_terminal_row(authed_client_with_fake_supervisor):
+    client = authed_client_with_fake_supervisor
     conn = connect()
     try:
         repo = ExecutionRepository(conn)
@@ -189,8 +196,9 @@ def test_cancel_409_for_terminal_row(client, db_path):
 
 
 def test_cancel_happy_path_accepts_and_schedules(
-    client, fake_supervisor, db_path
+    authed_client_with_fake_supervisor, fake_supervisor
 ):
+    client = authed_client_with_fake_supervisor
     conn = connect()
     try:
         repo = ExecutionRepository(conn)
@@ -212,7 +220,10 @@ def test_cancel_happy_path_accepts_and_schedules(
 # ---------------------------------------------------------- retry endpoint
 
 
-def test_retry_creates_linked_execution(client, fake_supervisor, db_path):
+def test_retry_creates_linked_execution(
+    authed_client_with_fake_supervisor, fake_supervisor
+):
+    client = authed_client_with_fake_supervisor
     conn = connect()
     try:
         repo = ExecutionRepository(conn)
@@ -235,7 +246,8 @@ def test_retry_creates_linked_execution(client, fake_supervisor, db_path):
     assert fake_supervisor.spawn_calls == [body["id"]]
 
 
-def test_retry_409_when_original_still_running(client, db_path):
+def test_retry_409_when_original_still_running(authed_client_with_fake_supervisor):
+    client = authed_client_with_fake_supervisor
     conn = connect()
     try:
         repo = ExecutionRepository(conn)

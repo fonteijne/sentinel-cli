@@ -113,22 +113,32 @@ def load_or_create_token() -> str:
         return _read_token_file(TOKEN_FILE)
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(32)
-    # Write to a sibling temp file then rename — rename is atomic, readers never see a half-written token.
-    tmp = TOKEN_FILE.with_suffix(".tmp")
+    # PID-unique tmp + os.link = atomic "create-if-not-exists".
+    # Rationale: a shared `.tmp` + os.rename has TWO races.
+    #   (1) The loser cannot safely `tmp.unlink()` — it may delete the winner's
+    #       in-flight tmp before the winner's rename completes.
+    #   (2) os.rename OVERWRITES the target silently; a slow second-winner who
+    #       wins a fresh O_EXCL on the shared `.tmp` (after the first winner's
+    #       rename consumed it) would silently replace the first token.
+    # os.link raises FileExistsError if the target exists — exactly the
+    # create-if-not-exists atom we want. Each caller uses a unique PID-derived
+    # tmp so stale tmp files from crashed prior processes can't block anyone.
+    tmp = TOKEN_FILE.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            os.write(fd, token.encode("ascii"))
-        finally:
-            os.close(fd)
-        os.rename(tmp, TOKEN_FILE)                       # atomic rename
-        logger.warning("generated new service token at %s", TOKEN_FILE)
-        return token
+        os.write(fd, token.encode("ascii"))
+    finally:
+        os.close(fd)
+    try:
+        os.link(tmp, TOKEN_FILE)                         # atomic create-if-not-exists
     except FileExistsError:
-        # Temp file existed (unlikely) — try loser-path.
         with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
+            tmp.unlink()                                 # our tmp, safe to drop
         return _read_token_file(TOKEN_FILE)
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    logger.warning("generated new service token at %s", TOKEN_FILE)
+    return token
 
 
 def token_prefix(token: str) -> str:
@@ -176,7 +186,7 @@ async def require_token_ws(ws: WebSocket) -> str:
 
 **GOTCHA — timing-safe comparison**. `secrets.compare_digest` is required; `==` short-circuits on first differing byte.
 
-**GOTCHA — atomic token creation**. `O_CREAT | O_EXCL` with `mode=0o600` at creation avoids the write→chmod window where the file is briefly world-readable. If another process got here first, we raise — caller (the CLI) should retry via the existing-file branch.
+**GOTCHA — atomic token creation**. `O_CREAT | O_EXCL` with `mode=0o600` at creation avoids the write→chmod window where the file is briefly world-readable. The publish step MUST use `os.link` (not `os.rename`): `os.rename` overwrites the destination silently, so two concurrent writers could end up with two different tokens — one process reading one value, another reading the second. `os.link` raises `FileExistsError` on collision, which is the correct create-if-not-exists semantic. Each writer uses a PID-unique tmp path so stale tmp files from crashed prior processes can't block fresh callers.
 
 **GOTCHA — WebSocket auth close codes**. The WS dep raises `WebSocketException(code=1008)`, not `HTTPException`. Starlette translates the close code to an HTTP 403 *during the handshake* (before the upgrade completes), which is what the client sees. Tests assert 403 handshake-level for WS + 401 for HTTP.
 
@@ -470,8 +480,10 @@ stat -c '%a' ~/.sentinel/service_token                                          
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Token file briefly world-readable (write→chmod window) | (was MED) — RESOLVED | — | `O_CREAT\|O_EXCL` with mode 0o600 on a `.tmp` sibling + atomic `os.rename`; no second syscall. |
-| Loser reads empty file in race window (O_EXCL wins create, write not yet flushed) | (was MED) — RESOLVED | — | Writer uses tmp+rename (atomic); loser-path retries up to 5×20ms via `_read_token_file`. |
+| Token file briefly world-readable (write→chmod window) | (was MED) — RESOLVED | — | `O_CREAT\|O_EXCL` with mode 0o600 on a PID-unique tmp sibling + atomic `os.link` publish; no second syscall. |
+| Loser reads empty file in race window (O_EXCL wins create, write not yet flushed) | (was MED) — RESOLVED | — | Writer publishes via `os.link` (atomic create-if-not-exists); loser-path `_read_token_file` retries on both `FileNotFoundError` (publish not yet visible) AND short read, bounded attempts × 20ms. |
+| Silent second-winner overwrite (first writer's token replaced by a slower writer who wins a fresh O_EXCL after the first rename consumed the shared tmp) | (was HIGH) — RESOLVED | — | `os.link` raises `FileExistsError` instead of overwriting; the second winner unlinks its own tmp and reads the first winner's token. `os.rename` would NOT catch this — don't use it for publish. |
+| Stale `.tmp` from crashed prior process blocks all future `O_CREAT\|O_EXCL` attempts | (was LOW) — RESOLVED | — | PID-unique tmp name (`*.tmp.<pid>.<hex>`) means leftover tmp files never collide with a fresh caller's path. |
 | Token leaks to stdout / scrollback | MED | MED | `--show-token-prefix` is opt-in; default silent. File path printed, not value. |
 | Token env var visible in `ps -eww` | LOW | MED | Documented: prefer the file-based token on shared hosts; env var is for CI. |
 | `?token=` on WS ends up in access logs / reverse-proxy logs | MED | MED | Loopback-only — rejected from non-127.0.0.1/::1 clients. HTTP never accepts query-string token. |

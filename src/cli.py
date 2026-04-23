@@ -2858,16 +2858,50 @@ def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) 
     type=int,
     help="Port; defaults to service.port config or 8787",
 )
-def serve(host: Optional[str], port: Optional[int]) -> None:
+@click.option(
+    "--show-token-prefix",
+    is_flag=True,
+    help="Print the first 6 chars of the service token on startup. "
+    "Opt-in so CI scrollback doesn't accidentally capture it.",
+)
+@click.option(
+    "--i-know-what-im-doing",
+    is_flag=True,
+    hidden=True,
+)
+def serve(
+    host: Optional[str],
+    port: Optional[int],
+    show_token_prefix: bool,
+    i_know_what_im_doing: bool,
+) -> None:
     """Start the Sentinel HTTP API."""
     # Imports kept local so CLI startup isn't penalised by FastAPI/uvicorn.
     import uvicorn
 
     from src.service.app import create_app
+    from src.service.auth import load_or_create_token
 
     cfg = get_config()
     bind_host = host or cfg.get("service.bind_address", "127.0.0.1")
     bind_port = port if port is not None else int(cfg.get("service.port", 8787))
+
+    # Refuse to bind 0.0.0.0 / :: without the escape hatch. A casual user who
+    # typed `sentinel serve --host 0.0.0.0` on a laptop just exposed execution
+    # control to their whole network; the guard exists so that requires an
+    # explicit opt-in flag.
+    if bind_host in ("0.0.0.0", "::") and not i_know_what_im_doing:
+        raise click.ClickException(
+            f"Refusing to bind {bind_host} without --i-know-what-im-doing. "
+            "Use 127.0.0.1 or the docker network IP."
+        )
+
+    token = load_or_create_token()
+    if show_token_prefix:
+        click.echo(
+            f"Token: {token[:6]}... "
+            f"(full value in ~/.sentinel/service_token)"
+        )
 
     # Intentionally pass the app INSTANCE, not a factory string — Supervisor
     # state (plan 04) and SQLite connections are per-process; single-process
