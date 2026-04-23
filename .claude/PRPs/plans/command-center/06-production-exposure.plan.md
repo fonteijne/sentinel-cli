@@ -381,6 +381,7 @@ poetry run pytest tests/test_config_loader.py -v
 - [ ] `SENTINEL_HOSTNAME` unset → compose refuses to start `sentinel-serve` with a clear error
 - [ ] `LETSENCRYPT_EMAIL` unset → compose refuses to start `traefik` with a clear error
 - [ ] `docs/deploy.md` covers both bundled-Traefik and BYO-Traefik paths end-to-end
+- [ ] `pyproject.toml` version bumped to `0.3.6`; `sentinel --version` reports `0.3.6`
 
 ## Risks & Mitigations
 

@@ -464,6 +464,7 @@ stat -c '%a' ~/.sentinel/service_token                                          
 - [ ] Env var overrides file
 - [ ] CORS defaults closed; configurable allowlist
 - [ ] Auth failures produce a log line with client IP + route
+- [ ] `pyproject.toml` version bumped to `0.3.5`; `sentinel --version` reports `0.3.5`
 
 ## Risks & Mitigations
 
