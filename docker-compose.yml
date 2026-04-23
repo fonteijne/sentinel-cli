@@ -189,6 +189,16 @@ services:
       - traefik
     restart: unless-stopped
     environment:
+      # Enable exactly what Traefik's Docker provider calls:
+      # - INFO: initial handshake (GET /info) — without this Traefik logs
+      #   "Failed to retrieve information of the docker client and server
+      #   host" and never loads routers.
+      # - CONTAINERS/NETWORKS: enumerate labelled services + edge network.
+      # - EVENTS: live container-state subscription for hot config reloads.
+      # - SERVICES/TASKS: only used in swarm mode; harmless here and kept
+      #   so the config works unchanged if someone points this at a swarm.
+      # PING and VERSION are enabled by default in the proxy image.
+      - INFO=1
       - CONTAINERS=1
       - NETWORKS=1
       - SERVICES=1
