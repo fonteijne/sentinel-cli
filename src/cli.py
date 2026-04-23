@@ -2682,5 +2682,34 @@ def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) 
         sys.exit(1)
 
 
+@cli.command()
+@click.option(
+    "--host",
+    default=None,
+    help="Bind address; defaults to service.bind_address config or 127.0.0.1",
+)
+@click.option(
+    "--port",
+    default=None,
+    type=int,
+    help="Port; defaults to service.port config or 8787",
+)
+def serve(host: Optional[str], port: Optional[int]) -> None:
+    """Start the Sentinel HTTP API."""
+    # Imports kept local so CLI startup isn't penalised by FastAPI/uvicorn.
+    import uvicorn
+
+    from src.service.app import create_app
+
+    cfg = get_config()
+    bind_host = host or cfg.get("service.bind_address", "127.0.0.1")
+    bind_port = port if port is not None else int(cfg.get("service.port", 8787))
+
+    # Intentionally pass the app INSTANCE, not a factory string — Supervisor
+    # state (plan 04) and SQLite connections are per-process; single-process
+    # is a design constraint, not an oversight.
+    uvicorn.run(create_app(), host=bind_host, port=bind_port, log_config=None)
+
+
 if __name__ == "__main__":
     cli()
