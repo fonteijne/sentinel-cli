@@ -146,6 +146,8 @@ services:
       - "traefik.http.routers.sentinel.entrypoints=websecure"
       - "traefik.http.routers.sentinel.tls=true"
       - "traefik.http.routers.sentinel.tls.certresolver=le"
+      - "traefik.http.routers.sentinel.middlewares=sentinel-ipallow@docker"
+      - "traefik.http.middlewares.sentinel-ipallow.ipallowlist.sourcerange=87.255.37.187/32"
       - "traefik.http.services.sentinel.loadbalancer.server.port=8787"
 
   # Bundled Traefik reverse proxy — profile-gated so operators with an
