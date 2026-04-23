@@ -54,11 +54,16 @@ class Orchestrator:
         bus: EventBus,
         session_tracker: Optional["SessionTracker"] = None,
         config: Optional["ConfigLoader"] = None,
+        cancel_flag: Any = None,
     ) -> None:
         self.repo = repo
         self.bus = bus
         self.session_tracker = session_tracker
         self.config = config
+        # Cooperative cancel signal set by the supervisor via SIGTERM/SIGINT
+        # handler in the worker. ``cancel_flag.is_set()`` is checked between
+        # agent turns once plan 05's orchestrator-extraction lands.
+        self.cancel_flag = cancel_flag
 
         # Mandatory subscriber: cost.accrued → executions.cost_cents
         self.bus.subscribe(self._cost_subscriber)
