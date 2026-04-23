@@ -139,7 +139,7 @@ services:
   # existing Traefik can opt out. They attach their Traefik to sentinel-edge
   # manually; the labels on sentinel-serve still apply.
   traefik:
-    image: traefik:v3.1
+    image: traefik:v3.3
     container_name: sentinel-traefik
     profiles:
       - traefik
