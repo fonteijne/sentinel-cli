@@ -12,15 +12,54 @@ from typing import Any, Dict
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 from claude_agent_sdk.types import AssistantMessage, SystemPromptPreset, TextBlock, ToolUseBlock
 
+from typing import TYPE_CHECKING
+
 from src.config_loader import ConfigLoader
 from src.guardrails import GuardrailEngine
 from src.session_tracker import SessionTracker
+
+if TYPE_CHECKING:
+    from src.core.events import EventBus
 
 
 class AgentTimeoutError(Exception):
     """Raised when an agent exceeds its configured execution timeout."""
 
 logger = logging.getLogger(__name__)
+
+
+def _usage_field(usage: Any, name: str) -> int:
+    """Pull a numeric field from an SDK usage object (attr or dict)."""
+    if usage is None:
+        return 0
+    val = getattr(usage, name, None)
+    if val is None and isinstance(usage, dict):
+        val = usage.get(name, 0)
+    try:
+        return int(val or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def entry_dict(
+    *,
+    agent: str,
+    event: str,
+    data: Dict[str, Any],
+    cwd: str | None = None,
+) -> Dict[str, Any]:
+    """Single shape used by both the JSONL diagnostic writer and the EventBus.
+
+    Having one function back both paths prevents the two telemetry sinks from
+    drifting; tests in ``tests/test_agent_sdk_wrapper.py`` assert parity.
+    """
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent": agent,
+        "event": event,
+        "cwd": cwd,
+        **data,
+    }
 
 
 class AgentSDKWrapper:
@@ -39,6 +78,12 @@ class AgentSDKWrapper:
         self.guardrails = GuardrailEngine(config)
         self.project: str | None = None  # Project key for session tracking
         self.llm_mode: str = "subscription"  # Default mode
+
+        # Command Center event plumbing — set by BaseAgent after construction
+        # when an execution context is active. Kept optional so non-orchestrated
+        # callers (legacy tests, ad-hoc scripts) keep working unchanged.
+        self.event_bus: "EventBus | None" = None
+        self.execution_id: str | None = None
 
         # Initialize model and tools with defaults (will be updated in set_project)
         agent_config = self.config.get_agent_config(self.agent_name)
@@ -144,24 +189,73 @@ class AgentSDKWrapper:
         Writes JSONL to /app/logs/agent_diagnostics.jsonl (sentinel-dev)
         which maps to /workspace/sentinel/logs/agent_diagnostics.jsonl (sandbox).
         """
+        entry = entry_dict(agent=self.agent_name, event=event, data=data, cwd=cwd)
         # Resolve log directory: /app/logs/ in sentinel-dev, fallback to local
         for base in ("/app/logs", "logs"):
             log_dir = Path(base)
             try:
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log_file = log_dir / "agent_diagnostics.jsonl"
-                entry = {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "agent": self.agent_name,
-                    "event": event,
-                    "cwd": cwd,
-                    **data,
-                }
                 with open(log_file, "a") as f:
                     f.write(_json.dumps(entry, default=str) + "\n")
                 return
             except OSError:
                 continue
+
+    # --------------------------------------------------- event publication
+
+    def _publish_tool_called(self, *, tool: str, args_summary: str) -> None:
+        if self.event_bus is None or self.execution_id is None:
+            return
+        from src.core.events import ToolCalled
+
+        try:
+            self.event_bus.publish(
+                ToolCalled(
+                    execution_id=self.execution_id,
+                    agent=self.agent_name,
+                    tool=tool,
+                    args_summary=args_summary,
+                )
+            )
+        except Exception:
+            logger.exception("failed to publish ToolCalled event")
+
+    def _publish_cost_accrued(
+        self, *, tokens_in: int, tokens_out: int, cents: int
+    ) -> None:
+        if self.event_bus is None or self.execution_id is None:
+            return
+        from src.core.events import CostAccrued
+
+        try:
+            self.event_bus.publish(
+                CostAccrued(
+                    execution_id=self.execution_id,
+                    agent=self.agent_name,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    cents=cents,
+                )
+            )
+        except Exception:
+            logger.exception("failed to publish CostAccrued event")
+
+    def _publish_rate_limited(self, *, retry_after_s: float | None = None) -> None:
+        if self.event_bus is None or self.execution_id is None:
+            return
+        from src.core.events import RateLimited
+
+        try:
+            self.event_bus.publish(
+                RateLimited(
+                    execution_id=self.execution_id,
+                    agent=self.agent_name,
+                    retry_after_s=retry_after_s,
+                )
+            )
+        except Exception:
+            logger.exception("failed to publish RateLimited event")
 
     async def execute_with_tools(
         self,
@@ -386,9 +480,25 @@ class AgentSDKWrapper:
                                 "tool_index": len(tool_uses),
                                 "elapsed_s": round(elapsed_in_stream, 1),
                             }, cwd=cwd)
+                            self._publish_tool_called(tool=block.name, args_summary=input_preview)
                 # Extract session ID from ResultMessage
                 if hasattr(message, 'session_id'):
                     final_session_id = message.session_id
+
+                # Best-effort cost accrual — not every ResultMessage carries usage,
+                # but when it does we forward tokens_in/out/cost to the bus so the
+                # orchestrator's subscriber can update executions.cost_cents.
+                usage = getattr(message, "usage", None)
+                total_cost_usd = getattr(message, "total_cost_usd", None)
+                if usage is not None or total_cost_usd is not None:
+                    tokens_in = _usage_field(usage, "input_tokens")
+                    tokens_out = _usage_field(usage, "output_tokens")
+                    cents = int(round((total_cost_usd or 0) * 100))
+                    self._publish_cost_accrued(
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        cents=cents,
+                    )
 
         total_elapsed = time.monotonic() - sdk_start
         logger.info(f"[{self.agent_name}] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {total_elapsed:.1f}s total")

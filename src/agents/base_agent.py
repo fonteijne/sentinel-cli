@@ -4,12 +4,15 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from src.config_loader import get_config
 from src.prompt_loader import load_agent_prompt
 from src.command_executor import execute_command
 from src.agent_sdk_wrapper import AgentSDKWrapper
+
+if TYPE_CHECKING:
+    from src.core.events import EventBus, SentinelEvent
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +33,8 @@ class BaseAgent(ABC):
         agent_name: str,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        event_bus: Optional["EventBus"] = None,
+        execution_id: Optional[str] = None,
     ) -> None:
         """Initialize base agent.
 
@@ -37,10 +42,23 @@ class BaseAgent(ABC):
             agent_name: Agent name for prompt loading (e.g., "plan_generator")
             model: LLM model to use (defaults to config)
             temperature: Sampling temperature (defaults to config)
+            event_bus: Optional Command Center EventBus. When provided,
+                agent activity is emitted as typed events in addition to
+                the existing ``logger.info`` calls.
+            execution_id: Optional execution id to stamp on emitted events.
+                Required when ``event_bus`` is provided.
         """
         self.agent_name = agent_name
         self.config = get_config()
         self.agent_sdk = AgentSDKWrapper(agent_name, self.config)
+
+        # Command Center event plumbing (opt-in; None keeps legacy behavior).
+        self.event_bus = event_bus
+        self.execution_id = execution_id
+        # Propagate to the SDK wrapper so it can emit tool/cost/rate-limit events.
+        if event_bus is not None and execution_id is not None:
+            self.agent_sdk.event_bus = event_bus
+            self.agent_sdk.execution_id = execution_id
 
         # Load agent configuration
         agent_config = self.config.get_agent_config(agent_name)
@@ -69,6 +87,20 @@ class BaseAgent(ABC):
         logger.info(
             f"Initialized {agent_name} agent (model={self.model}, temp={self.temperature})"
         )
+
+    def attach_events(
+        self, event_bus: "EventBus", execution_id: str
+    ) -> None:
+        """Wire (or re-wire) Command Center events on an already-constructed agent.
+
+        Subclasses that don't forward the ``event_bus``/``execution_id`` kwargs
+        through their own ``__init__`` can still participate by calling this
+        after construction.
+        """
+        self.event_bus = event_bus
+        self.execution_id = execution_id
+        self.agent_sdk.event_bus = event_bus
+        self.agent_sdk.execution_id = execution_id
 
     def set_project(self, project: str) -> None:
         """Set the project key for session tracking.
@@ -154,6 +186,7 @@ class BaseAgent(ABC):
             f"[LLM] {self.agent_name}: sending request "
             f"(prompt={len(content)} chars, cwd={cwd}, session={self.session_id}, max_turns={max_turns})"
         )
+        self._emit_message_sent(prompt_chars=len(content), cwd=cwd, max_turns=max_turns)
         response = await self.agent_sdk.execute_with_tools(
             prompt=user_prompt,
             session_id=self.session_id,
@@ -166,6 +199,11 @@ class BaseAgent(ABC):
         logger.info(
             f"[LLM] {self.agent_name}: response received "
             f"({len(str(response['content']))} chars, {len(response.get('tool_uses', []))} tools, {elapsed:.1f}s)"
+        )
+        self._emit_response_received(
+            response_chars=len(str(response["content"])),
+            tool_uses_count=len(response.get("tool_uses", []) or []),
+            elapsed_s=elapsed,
         )
 
         # Extract text content
@@ -229,6 +267,51 @@ class BaseAgent(ABC):
         """
         return self.messages.copy()
 
+    # ------------------------------------------------------------- events
+
+    def _emit(self, event: "SentinelEvent") -> None:
+        """Publish ``event`` if an :class:`EventBus` is wired; no-op otherwise."""
+        if self.event_bus is None:
+            return
+        try:
+            self.event_bus.publish(event)
+        except Exception:
+            logger.exception("failed to publish event %r", event)
+
+    def _emit_message_sent(
+        self, *, prompt_chars: int, cwd: Optional[str], max_turns: Optional[int]
+    ) -> None:
+        if self.event_bus is None or self.execution_id is None:
+            return
+        from src.core.events import AgentMessageSent  # local import: optional dep
+
+        self._emit(
+            AgentMessageSent(
+                execution_id=self.execution_id,
+                agent=self.agent_name,
+                prompt_chars=prompt_chars,
+                cwd=cwd,
+                max_turns=max_turns,
+            )
+        )
+
+    def _emit_response_received(
+        self, *, response_chars: int, tool_uses_count: int, elapsed_s: float
+    ) -> None:
+        if self.event_bus is None or self.execution_id is None:
+            return
+        from src.core.events import AgentResponseReceived
+
+        self._emit(
+            AgentResponseReceived(
+                execution_id=self.execution_id,
+                agent=self.agent_name,
+                response_chars=response_chars,
+                tool_uses_count=tool_uses_count,
+                elapsed_s=elapsed_s,
+            )
+        )
+
     def _append_operator_prompt(self, prompt: str, user_prompt: str | None) -> str:
         """Append operator instruction to a prompt if provided."""
         if not user_prompt:
@@ -259,9 +342,11 @@ class PlanningAgent(BaseAgent):
         agent_name: str,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        event_bus: Optional["EventBus"] = None,
+        execution_id: Optional[str] = None,
     ) -> None:
         """Initialize planning agent."""
-        super().__init__(agent_name, model, temperature)
+        super().__init__(agent_name, model, temperature, event_bus, execution_id)
 
 
 class ImplementationAgent(BaseAgent):
@@ -272,9 +357,11 @@ class ImplementationAgent(BaseAgent):
         agent_name: str,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        event_bus: Optional["EventBus"] = None,
+        execution_id: Optional[str] = None,
     ) -> None:
         """Initialize implementation agent."""
-        super().__init__(agent_name, model, temperature)
+        super().__init__(agent_name, model, temperature, event_bus, execution_id)
 
 
 class ReviewAgent(BaseAgent):
@@ -286,6 +373,8 @@ class ReviewAgent(BaseAgent):
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         veto_power: bool = False,
+        event_bus: Optional["EventBus"] = None,
+        execution_id: Optional[str] = None,
     ) -> None:
         """Initialize review agent.
 
@@ -294,6 +383,8 @@ class ReviewAgent(BaseAgent):
             model: LLM model to use
             temperature: Sampling temperature
             veto_power: Whether agent can block progress
+            event_bus: Optional Command Center EventBus.
+            execution_id: Optional execution id to stamp on emitted events.
         """
-        super().__init__(agent_name, model, temperature)
+        super().__init__(agent_name, model, temperature, event_bus, execution_id)
         self.veto_power = veto_power
