@@ -15,6 +15,7 @@ The dashboard/UI is **explicitly out of scope** for every plan in this directory
 | 03 | [`03-live-event-stream.plan.md`](03-live-event-stream.plan.md) | WebSocket DB-tail for cross-process event streaming | 01, 02 |
 | 04 | [`04-commands-and-workers.plan.md`](04-commands-and-workers.plan.md) | Start/cancel/retry endpoints, out-of-process worker supervisor, heartbeat-based crash recovery, container cleanup | 01, 02 |
 | 05 | [`05-auth-and-binding.plan.md`](05-auth-and-binding.plan.md) | Bearer-token auth + rate limits, network binding, CORS, audit logging. **Owns final `create_app()` composition.** | 02, 03, 04 |
+| 06 | [`06-production-exposure.plan.md`](06-production-exposure.plan.md) | Dev host-port publish, `sentinel-serve` service, bundled Traefik (profile `traefik`) with Let's Encrypt HTTP-01, `/docs` prod gate, deploy runbook | 02, 05 |
 
 ```
           ┌──────────────┐
@@ -29,10 +30,14 @@ The dashboard/UI is **explicitly out of scope** for every plan in this directory
                     ▼
              ┌──────────────┐
              │ 05 Auth/Bind │
+             └──────┬───────┘
+                    ▼
+             ┌──────────────┐
+             │ 06 Exposure  │
              └──────────────┘
 ```
 
-Tracks 02, 03, 04 can be worked in parallel worktrees once 01 is merged. 05 is the finishing seal — do not ship the service to anything but a trusted dev machine until 05 lands.
+Tracks 02, 03, 04 can be worked in parallel worktrees once 01 is merged. 05 is the finishing seal for the backend itself. 06 lands the compose-level exposure (dev port + Traefik) so the service is browser-reachable — do not ship to anything but a trusted dev machine until 05 lands, and do not expose to the internet until 06 lands.
 
 ---
 
@@ -108,6 +113,7 @@ Suggested branch names:
 - `experimental/command-center-03-event-stream`
 - `experimental/command-center-04-commands-workers`
 - `experimental/command-center-05-auth`
+- `experimental/command-center-06-production-exposure`
 
 ---
 
@@ -120,6 +126,9 @@ Single index of env vars read by the stack; each is documented in its owning pla
 | `SENTINEL_DB_PATH` | CLI, service, worker | 01 | Override default `~/.sentinel/sentinel.db`; validated non-regular rejected |
 | `SENTINEL_SERVICE_TOKEN` | service startup | 05 | Overrides the on-disk service token |
 | `SENTINEL_SERVICE_URL` | CLI `--remote` | 04 | Default base URL for `sentinel execute --remote` (fallback: `http://127.0.0.1:8787`) |
+| `SENTINEL_ENABLE_DOCS` | service startup | 06 | When `true`, exposes FastAPI `/docs`, `/redoc`, `/openapi.json`; default off (404) |
+| `SENTINEL_HOSTNAME` | compose (`sentinel-serve` labels) | 06 | Public hostname Traefik routes; compose hard-fails if unset |
+| `LETSENCRYPT_EMAIL` | compose (bundled `traefik`) | 06 | ACME account email for Let's Encrypt HTTP-01; compose hard-fails if unset |
 
 All YAML config keys live under `service.*` in `config/config.yaml`:
 `service.bind_address`, `service.port`, `service.cors_origins`, `service.rate_limits.max_concurrent`, `service.rate_limits.max_per_minute`.
@@ -132,6 +141,7 @@ Migrations live in `src/core/persistence/migrations/NNN_name.sql`, applied in as
 |---|---|---|
 | 01 | `001_init.sql` | `schema_migrations`, `executions`, `events`, `agent_results` |
 | 04 | `002_workers.sql` | `workers` (heartbeat/PID/compose_projects) |
+| 06 | — | (no DB migration; compose/deploy changes only) |
 | later | `003_*.sql` onward | future plans claim in PR-merge order |
 
 Forward-only. No rollback mechanism today — documented as debt.
@@ -156,7 +166,7 @@ A `cp sentinel.db backup.db` without any of the above produces a **corrupt** res
 - Beads ↔ execution linkage (maintainers correlate manually via `ticket_id`)
 - Replacing `~/.sentinel/sessions.json` as the Claude SDK session-id store — new DB supplements it
 - Changing how agents are defined or how they talk to claude-agent-sdk — only how they *emit progress*
-- Docker Compose integration (port expose, healthcheck, `SENTINEL_SERVICE_URL` to appserver) — follow-up plan 06
+- `SENTINEL_SERVICE_URL` wired into the per-ticket `appserver` stacks — still follow-up (plan 06 wires the service itself into the compose network, not the appserver children)
 - Worker-log endpoint (GET `logs/workers/<id>.log`) — follow-up
 - Retention / archival of `events` and `agent_results` — `idx_events_ts` is in place; sweep is follow-up
 - Schema migration rollback — forward-only today
