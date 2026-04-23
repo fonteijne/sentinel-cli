@@ -122,21 +122,35 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-    # NOTE: Traefik labels intentionally absent. The bundled Traefik uses
-    # a file provider (config/traefik/dynamic.yml) because Traefik 3.x
-    # hardcodes Docker API v1.24 and Docker Engine 29.x+ refuses it.
-    # BYO-Traefik operators can either:
-    #   (a) point their Traefik at config/traefik/dynamic.yml directly, or
-    #   (b) if their Docker Engine tolerates Traefik's old API version,
-    #       re-enable labels locally in a docker-compose.override.yml.
-    # Routing rules live in config/traefik/dynamic.yml; service-discovery
-    # is via Docker embedded DNS on sentinel-edge (no API calls required).
+    labels:
+      # Traefik starts with exposedByDefault=false, so only services that
+      # opt in via traefik.enable=true get routed. Matches the BYO-Traefik
+      # contract: operators point their own Traefik at sentinel-edge and
+      # these labels still apply.
+      #
+      # Requires Traefik >= 3.6.1 (the bundled image is pinned there) —
+      # older Traefik versions hardcode Docker API v1.24 which Docker
+      # Engine 29.x+ refuses. A BYO Traefik older than 3.6.1 will need
+      # either an upgrade, the DOCKER_API_VERSION env workaround, or a
+      # file-provider config pointing at http://sentinel-serve:8787.
+      - "traefik.enable=true"
+      - "traefik.docker.network=sentinel-edge"
+      - "traefik.http.routers.sentinel.rule=Host(`${SENTINEL_HOSTNAME:?SENTINEL_HOSTNAME required}`)"
+      - "traefik.http.routers.sentinel.entrypoints=websecure"
+      - "traefik.http.routers.sentinel.tls=true"
+      - "traefik.http.routers.sentinel.tls.certresolver=le"
+      - "traefik.http.services.sentinel.loadbalancer.server.port=8787"
 
   # Bundled Traefik reverse proxy — profile-gated so operators with an
   # existing Traefik can opt out. They attach their Traefik to sentinel-edge
   # manually; the labels on sentinel-serve still apply.
   traefik:
-    image: traefik:v3.3
+    # v3.6.1+ is REQUIRED: earlier Traefik hardcoded Docker API v1.24 which
+    # Docker Engine 29.x+ refuses (MinAPIVersion 1.44). PR
+    # https://github.com/traefik/traefik/pull/12256 unpinned the client and
+    # switched to moby's WithAPIVersionNegotiation(). Pinning the 3.6 minor
+    # tag picks up patch updates while staying on a known-compatible line.
+    image: traefik:v3.6
     container_name: sentinel-traefik
     profiles:
       - traefik
@@ -145,23 +159,14 @@ services:
       - "80:80"
       - "443:443"
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       - traefik-acme:/acme
-      # Static file provider config — deterministic routes, no Docker API
-      # required. Traefik reaches sentinel-serve by DNS on sentinel-edge.
-      # Why file-only: Traefik 3.x hardcodes Docker API v1.24 in its moby
-      # client; Docker Engine 29.x+ advertises MinAPIVersion 1.44 and
-      # refuses v1.24, so the Docker provider can't handshake. Direct
-      # DNS + a file route sidesteps the whole problem.
-      - ./config/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
     networks:
       - sentinel-edge
-    environment:
-      # Referenced from dynamic.yml via {{ env "SENTINEL_HOSTNAME" }} so
-      # the Host() rule updates without rebuilding the image.
-      - SENTINEL_HOSTNAME=${SENTINEL_HOSTNAME:?SENTINEL_HOSTNAME required}
     command:
-      - --providers.file.filename=/etc/traefik/dynamic.yml
-      - --providers.file.watch=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=sentinel-edge
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --entrypoints.web.http.redirections.entrypoint.to=websecure

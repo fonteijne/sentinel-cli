@@ -266,7 +266,7 @@ schema. The factory gates them as a group.
 | Browser `502 Bad Gateway` | `sentinel-serve` is unhealthy | `docker compose --profile serve logs sentinel-serve`; `docker inspect sentinel-serve --format '{{.State.Health.Status}}'` |
 | `docker compose up` silently did nothing for the backend | Profile not passed | `docker compose --profile serve up -d` (the profile is required) |
 | Two Traefiks fighting over 80/443 | Both bundled and BYO running | `docker ps \| grep traefik` — stop one |
-| Traefik logs `Error response from daemon: <empty>` and no routers load | Traefik's Docker provider is incompatible with your engine | Not applicable with the bundled stack — routing is file-based (`config/traefik/dynamic.yml`). If you see this, you've re-enabled the Docker provider locally. Revert, or point your own Traefik at the file instead. |
+| Traefik logs `Error response from daemon: <empty>` and no routers load | Traefik older than 3.6.1 + Docker Engine 29.x+ (API v1.24 refused) | Upgrade Traefik to ≥ 3.6.1 (bundled image is pinned to `traefik:v3.6`). For BYO Traefik on an older version, either upgrade, set `DOCKER_API_VERSION=1.45` on Traefik, or use a file-provider config pointing at `http://sentinel-serve:8787`. |
 | Let's Encrypt rate-limit hit | Too many failed issuances | Switch to staging CA (§2.1) until green |
 | `LETSENCRYPT_EMAIL required` on compose up | Forgot to set in `.env` | Set it; `docker compose ... up -d` again |
 | `SENTINEL_HOSTNAME required` on compose up | Forgot to set in `.env` | Same — it's intentional; prod without hostname is never correct |
