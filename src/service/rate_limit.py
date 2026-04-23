@@ -14,6 +14,12 @@ Two limits apply:
 
 Keys are ``token_prefix(token)`` (sha256-truncated), not the raw token —
 we never want a raw secret on a dict key that might show up in a heap dump.
+
+Opportunistic cold-key pruning happens inside ``check_and_reserve`` and
+``release``: whenever a key's in-flight count drops to zero AND its window
+deque is empty, the key is removed from both maps. This keeps the dicts
+bounded by the number of *recently active* tokens rather than every token
+that has ever been seen.
 """
 
 from __future__ import annotations
@@ -54,7 +60,9 @@ class TokenRateLimiter:
 
             # Prune stale entries from the 60-second window first — otherwise
             # a long-idle token could carry ancient entries that unfairly
-            # count against a fresh burst.
+            # count against a fresh burst. (``defaultdict`` materialises the
+            # key here; if the decision below is "deny", we don't delete it
+            # because another caller may be about to hit the same bucket.)
             w = self._window[token_key]
             while w and now - w[0] > 60.0:
                 w.popleft()
@@ -80,9 +88,20 @@ class TokenRateLimiter:
 
         ``max(0, …)`` guards against a defensive double-release leaking us
         into negative counts; such a leak would silently expand capacity.
+
+        Opportunistic prune: if both counters are now empty, drop the key
+        from both maps. Tokens that never return live in memory only as
+        long as they have in-flight work or recent requests.
         """
 
         with self._lock:
-            self._in_flight[token_key] = max(
-                0, self._in_flight[token_key] - 1
-            )
+            remaining = max(0, self._in_flight[token_key] - 1)
+            if remaining == 0:
+                self._in_flight.pop(token_key, None)
+                # Only drop the window if it has also aged out. Otherwise we
+                # need to keep it for the minute-rate check on the next call.
+                window = self._window.get(token_key)
+                if window is not None and not window:
+                    self._window.pop(token_key, None)
+            else:
+                self._in_flight[token_key] = remaining

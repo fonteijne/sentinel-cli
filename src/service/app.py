@@ -93,6 +93,14 @@ def create_app() -> FastAPI:
         )
 
     # Unauthenticated: container health probes only.
+    #
+    # This is a DEEP probe: it opens a SQLite connection and runs SELECT 1.
+    # If the DB is missing, locked, or otherwise unreachable, /health returns
+    # 500. That's intentional for docker-compose and Kubernetes readiness
+    # probes — the service isn't useful without the DB — but operators should
+    # not conflate /health with a process-liveness check. A process-liveness
+    # check should use a TCP port check or a future /live endpoint that
+    # doesn't touch the DB.
     @app.get("/health")
     def health(conn=Depends(get_db_conn)) -> dict:  # type: ignore[no-untyped-def]
         conn.execute("SELECT 1").fetchone()

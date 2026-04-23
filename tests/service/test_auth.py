@@ -395,6 +395,44 @@ def test_rate_limiter_unit_windowed():
     assert 1 <= retry <= 62
 
 
+def test_rate_limiter_prunes_cold_keys_on_release():
+    """Idle tokens must not permanently inhabit the limiter dicts.
+
+    Bounds the limiter's memory footprint by recently-active tokens rather
+    than every token ever observed. Two observable guarantees:
+
+    * After ``release`` drops in-flight to zero, the key is removed from
+      ``_in_flight`` (the window is kept while it still has recent entries
+      because the 60s rate check needs them).
+    * If the window happens to be empty at release time (e.g. we pre-aged
+      it), the key is also removed from ``_window`` on that same release.
+    """
+    from src.service.rate_limit import TokenRateLimiter
+
+    limiter = TokenRateLimiter(max_concurrent=5, max_per_minute=5)
+    key = "idle-tok"
+
+    ok, _ = limiter.check_and_reserve(key)
+    assert ok
+    assert key in limiter._in_flight
+    limiter.release(key)
+    assert key not in limiter._in_flight, "in_flight should drop on release"
+    assert limiter._window.get(key), (
+        "Window keeps the recent entry for the 60s rate check"
+    )
+
+    # Simulate the window having aged out, then release once more. Now both
+    # counters are empty → opportunistic prune should drop the key entirely.
+    ok2, _ = limiter.check_and_reserve(key)
+    assert ok2
+    limiter._window[key].clear()  # simulate age-out before release
+    limiter.release(key)
+    assert key not in limiter._in_flight
+    assert key not in limiter._window, (
+        "Idle key with empty window must be pruned from both maps"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rate limiter — integration test via HTTP POSTs
 # ---------------------------------------------------------------------------

@@ -241,12 +241,19 @@ def require_token_and_write_slot(request: Request) -> Iterator[str]:
 
 
 def audit_write(request: Request) -> None:
-    """Structured audit line for successful write requests.
+    """Structured audit line for every authenticated write request.
 
-    Applied as an additional dep on the write router. We intentionally do NOT
-    gate on status code — by the time the dep runs, auth + rate-limit have
-    both passed, which is the audit-relevant event. A handler failure is
-    separately logged.
+    Applied as an additional dep on the write router. It fires AFTER
+    ``require_token_and_write_slot`` (auth + rate limit), so the fact that
+    the line is emitted means auth succeeded and a rate-limit slot was
+    reserved. It does NOT guarantee the handler returned 2xx — a
+    pydantic-validation 4xx or a handler 5xx still produces an audit line
+    because the attempt itself is the audit-relevant event.
+
+    Operators reading the log: every audit line represents an AUTHORISED
+    ATTEMPT, not a confirmed state change. Correlate with the response
+    status (FastAPI access logs) or the `execution.started` event to
+    distinguish successful writes from rejected attempts.
     """
 
     key = getattr(request.state, "token_prefix", "?")
