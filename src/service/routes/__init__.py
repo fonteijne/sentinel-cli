@@ -1,5 +1,5 @@
 """Command Center HTTP routes package."""
 
-from src.service.routes import executions, stream
+from src.service.routes import commands, executions, stream
 
-__all__ = ["executions", "stream"]
+__all__ = ["commands", "executions", "stream"]

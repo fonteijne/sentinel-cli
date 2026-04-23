@@ -14,6 +14,16 @@ from src.core.execution.models import Execution, ExecutionKind, ExecutionStatus
 logger = logging.getLogger(__name__)
 
 
+class WorkerRow(TypedDict):
+    """Shape returned by :meth:`ExecutionRepository.get_worker`."""
+
+    execution_id: str
+    pid: int
+    started_at: datetime
+    last_heartbeat_at: datetime
+    compose_projects: List[str]
+
+
 class EventRow(TypedDict):
     """Shape returned by :meth:`ExecutionRepository.iter_events`.
 
@@ -354,3 +364,88 @@ class ExecutionRepository:
             (execution_id,),
         ).fetchone()
         return int(row[0]) if row else 0
+
+    # ------------------------------------------------------------- workers
+
+    def get_worker(self, execution_id: str) -> Optional[WorkerRow]:
+        row = self._conn.execute(
+            "SELECT execution_id, pid, started_at, last_heartbeat_at, compose_projects "
+            "FROM workers WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            projects = json.loads(row["compose_projects"] or "[]")
+        except json.JSONDecodeError:
+            projects = []
+        return WorkerRow(
+            execution_id=row["execution_id"],
+            pid=int(row["pid"]),
+            started_at=datetime.fromisoformat(row["started_at"]),
+            last_heartbeat_at=datetime.fromisoformat(row["last_heartbeat_at"]),
+            compose_projects=projects,
+        )
+
+    def set_worker_heartbeat(self, execution_id: str) -> None:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE workers SET last_heartbeat_at = ? WHERE execution_id = ?",
+                (_now_iso(), execution_id),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def list_post_mortem_incomplete(self) -> List[Execution]:
+        """Return terminal rows missing ``metadata_json.post_mortem_complete = 1``.
+
+        Used by startup reconciliation to catch the case where the supervisor
+        itself was killed mid-cleanup — such rows are terminal (``failed`` /
+        ``cancelled``) but never ran compose-down, so we re-sweep them.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM executions "
+            "WHERE status IN ('failed','cancelled') "
+            "AND (json_extract(metadata_json,'$.post_mortem_complete') IS NOT 1)"
+        ).fetchall()
+        return [_row_to_execution(r) for r in rows]
+
+    def register_compose_project(
+        self, execution_id: str, project_name: str
+    ) -> None:
+        """Record ``project_name`` in BOTH ``workers.compose_projects`` AND
+        ``executions.metadata_json.compose_projects[]`` in a single transaction.
+
+        ``workers`` is source of truth during the run; ``metadata_json`` is
+        the archival copy used by post-mortem/reconciliation after the worker
+        row is gone.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE workers SET compose_projects = "
+                "json_insert(compose_projects, '$[#]', ?) "
+                "WHERE execution_id = ?",
+                (project_name, execution_id),
+            )
+            # Initialize metadata_json.compose_projects to [] if absent
+            # (json_insert is a no-op when the path exists).
+            self._conn.execute(
+                "UPDATE executions SET metadata_json = "
+                "json_insert(metadata_json, '$.compose_projects', json('[]')) "
+                "WHERE id = ?",
+                (execution_id,),
+            )
+            self._conn.execute(
+                "UPDATE executions SET metadata_json = "
+                "json_insert(metadata_json, '$.compose_projects[#]', ?) "
+                "WHERE id = ?",
+                (project_name, execution_id),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
