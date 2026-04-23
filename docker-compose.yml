@@ -60,9 +60,11 @@ services:
     environment:
       - WORKSPACE_ROOT=/workspaces
       - DOCKER_HOST=unix:///var/run/docker.sock
-      # Dev default: expose /docs so `http://localhost:8787/docs` just works.
-      # Prod (sentinel-serve) defaults to false.
-      - SENTINEL_ENABLE_DOCS=${SENTINEL_ENABLE_DOCS:-true}
+      # Hardcoded true — dev always wants /docs reachable at
+      # `http://localhost:8787/docs`. Prod (sentinel-serve) is
+      # independently hardcoded to false so the two can't collide via a
+      # shared .env entry.
+      - SENTINEL_ENABLE_DOCS=true
     stdin_open: true
     tty: true
     entrypoint: []
@@ -109,7 +111,12 @@ services:
     environment:
       - WORKSPACE_ROOT=/workspaces
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - SENTINEL_ENABLE_DOCS=${SENTINEL_ENABLE_DOCS:-false}
+      # Hardcoded false — prod schema-leaking is a security issue, and a
+      # shared `SENTINEL_ENABLE_DOCS=true` in `.env` (intended for dev)
+      # would otherwise silently enable /docs here too. To *temporarily*
+      # expose /docs in prod, use a `docker-compose.override.yml` (see
+      # docs/deploy.md §7) rather than a global `.env` flag.
+      - SENTINEL_ENABLE_DOCS=false
       - SENTINEL_SERVICE_TOKEN=${SENTINEL_SERVICE_TOKEN:-}
     networks:
       - default

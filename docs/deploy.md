@@ -237,19 +237,36 @@ internal curl: `docker exec sentinel-serve curl -v http://127.0.0.1:8787/health`
 
 ## 7. `/docs` in prod
 
-Off by default — the FastAPI factory passes `docs_url=None, redoc_url=None,
-openapi_url=None` when `SENTINEL_ENABLE_DOCS` is falsy, which 404s all three
-endpoints (not 401 — the paths don't exist). Temporary enablement:
+Off by default and **hardcoded** in `docker-compose.yml` for `sentinel-serve`
+— not `.env`-controlled, so a dev-focused `SENTINEL_ENABLE_DOCS=true` in
+`.env` can't accidentally enable prod `/docs`. The FastAPI factory passes
+`docs_url=None, redoc_url=None, openapi_url=None` when the env is falsy,
+which 404s all three endpoints (the paths don't exist — not 401).
+
+Temporary enablement uses a local `docker-compose.override.yml`
+(gitignored), not a global env flag:
 
 ```bash
-echo "SENTINEL_ENABLE_DOCS=true" >> .env
-docker compose --profile serve up -d sentinel-serve            # recreates with new env
+cat > docker-compose.override.yml <<'YAML'
+services:
+  sentinel-serve:
+    environment:
+      - SENTINEL_ENABLE_DOCS=true
+YAML
+
+docker compose --profile serve up -d sentinel-serve            # recreates with override
 curl -fsI https://$SENTINEL_HOSTNAME/docs                      # 200
+
 # ...use Swagger UI, then turn it back off...
-sed -i '/^SENTINEL_ENABLE_DOCS=true$/d' .env
-docker compose --profile serve up -d sentinel-serve
+rm docker-compose.override.yml
+docker compose --profile serve up -d --force-recreate sentinel-serve
 curl -fsI https://$SENTINEL_HOSTNAME/docs                      # 404
 ```
+
+`docker-compose.override.yml` is loaded by compose automatically when
+present, and values there win over the base file. Keep the file deleted
+unless you're actively using `/docs` — its presence is what "prod docs
+are on" looks like.
 
 All three of `/docs`, `/redoc`, `/openapi.json` flip together — Swagger UI
 fetches `/openapi.json`, so gating only `docs_url` would still leak the

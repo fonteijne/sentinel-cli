@@ -5,6 +5,10 @@ config/.env
 .env.*.local
 config.local.yaml
 
+# Local compose overrides (e.g. temporary prod /docs exposure)
+docker-compose.override.yml
+docker-compose.override.yaml
+
 # Python
 __pycache__/
 *.py[cod]
