@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "sentinel"
-version = "0.2.0"
+version = "0.3.3"
 description = "Autonomous agent orchestration system for Jira ticket implementation"
 authors = ["Sentinel Team"]
 readme = "README.md"
