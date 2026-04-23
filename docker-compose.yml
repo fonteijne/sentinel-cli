@@ -122,18 +122,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
-    labels:
-      # Traefik starts with exposedByDefault=false, so only services that
-      # opt in via traefik.enable=true get routed. Matches the BYO-Traefik
-      # contract: operators point their own Traefik at sentinel-edge and
-      # these labels still apply.
-      - "traefik.enable=true"
-      - "traefik.docker.network=sentinel-edge"
-      - "traefik.http.routers.sentinel.rule=Host(`${SENTINEL_HOSTNAME:?SENTINEL_HOSTNAME required}`)"
-      - "traefik.http.routers.sentinel.entrypoints=websecure"
-      - "traefik.http.routers.sentinel.tls=true"
-      - "traefik.http.routers.sentinel.tls.certresolver=le"
-      - "traefik.http.services.sentinel.loadbalancer.server.port=8787"
+    # NOTE: Traefik labels intentionally absent. The bundled Traefik uses
+    # a file provider (config/traefik/dynamic.yml) because Traefik 3.x
+    # hardcodes Docker API v1.24 and Docker Engine 29.x+ refuses it.
+    # BYO-Traefik operators can either:
+    #   (a) point their Traefik at config/traefik/dynamic.yml directly, or
+    #   (b) if their Docker Engine tolerates Traefik's old API version,
+    #       re-enable labels locally in a docker-compose.override.yml.
+    # Routing rules live in config/traefik/dynamic.yml; service-discovery
+    # is via Docker embedded DNS on sentinel-edge (no API calls required).
 
   # Bundled Traefik reverse proxy — profile-gated so operators with an
   # existing Traefik can opt out. They attach their Traefik to sentinel-edge
@@ -143,35 +140,28 @@ services:
     container_name: sentinel-traefik
     profiles:
       - traefik
-    depends_on:
-      - dockerproxy
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      # NOTE: no docker.sock mount here — Traefik talks to the proxy over
-      # TCP on sentinel-edge instead. This isolates Traefik from direct
-      # Docker API access (defense-in-depth) AND sidesteps the Traefik ↔
-      # Docker Desktop socket compatibility issues observed on recent
-      # Docker Engine versions (28.x / 29.x).
       - traefik-acme:/acme
+      # Static file provider config — deterministic routes, no Docker API
+      # required. Traefik reaches sentinel-serve by DNS on sentinel-edge.
+      # Why file-only: Traefik 3.x hardcodes Docker API v1.24 in its moby
+      # client; Docker Engine 29.x+ advertises MinAPIVersion 1.44 and
+      # refuses v1.24, so the Docker provider can't handshake. Direct
+      # DNS + a file route sidesteps the whole problem.
+      - ./config/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
     networks:
       - sentinel-edge
     environment:
-      # Traefik v3 embeds a moby client that defaults to API version 1.24
-      # for its initial handshake. Docker Engine 29.x refuses 1.24 with
-      # HTTP 400 on GET /v1.24/version, which surfaces as the opaque
-      # `Error response from daemon: <empty>` in Traefik logs. Pinning a
-      # modern API version forces moby client to use it end-to-end.
-      # 1.45 is broadly supported (Docker Engine 25+); bump if your engine
-      # advertises a higher minimum in `GET /version`.
-      - DOCKER_API_VERSION=1.45
+      # Referenced from dynamic.yml via {{ env "SENTINEL_HOSTNAME" }} so
+      # the Host() rule updates without rebuilding the image.
+      - SENTINEL_HOSTNAME=${SENTINEL_HOSTNAME:?SENTINEL_HOSTNAME required}
     command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=sentinel-edge
-      - --providers.docker.endpoint=tcp://dockerproxy:2375
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
@@ -182,42 +172,6 @@ services:
       - --certificatesresolvers.le.acme.storage=/acme/acme.json
       - --accesslog=true
       - --log.level=INFO
-
-  # Docker socket proxy — Traefik's Docker provider talks to this instead
-  # of the raw /var/run/docker.sock. Two wins:
-  #   1) Traefik can only read the endpoints enabled below (CONTAINERS,
-  #      NETWORKS, SERVICES, TASKS, EVENTS); a compromised Traefik cannot
-  #      create/start/stop containers or access secrets via the socket.
-  #   2) Works around "Error response from daemon: <empty>" errors that
-  #      Traefik emits when talking directly to recent Docker Engine API
-  #      versions via the Unix socket on Docker Desktop.
-  dockerproxy:
-    image: tecnativa/docker-socket-proxy:0.3.0
-    container_name: sentinel-dockerproxy
-    profiles:
-      - traefik
-    restart: unless-stopped
-    environment:
-      # Enable exactly what Traefik's Docker provider calls:
-      # - INFO: initial handshake (GET /info) — without this Traefik logs
-      #   "Failed to retrieve information of the docker client and server
-      #   host" and never loads routers.
-      # - CONTAINERS/NETWORKS: enumerate labelled services + edge network.
-      # - EVENTS: live container-state subscription for hot config reloads.
-      # - SERVICES/TASKS: only used in swarm mode; harmless here and kept
-      #   so the config works unchanged if someone points this at a swarm.
-      # PING and VERSION are enabled by default in the proxy image.
-      - INFO=1
-      - CONTAINERS=1
-      - NETWORKS=1
-      - SERVICES=1
-      - TASKS=1
-      - EVENTS=1
-      - POST=0   # read-only; Traefik doesn't need to mutate
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - sentinel-edge
 
 volumes:
   sentinel-workspaces:
