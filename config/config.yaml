@@ -121,6 +121,17 @@ jira:
   comment_visibility_role: Employees
 confidence:
   default_threshold: 95
+service:
+  # Bind address for `sentinel serve`. 0.0.0.0 requires --i-know-what-im-doing.
+  bind_address: "127.0.0.1"
+  port: 8787
+  # CORS allowlist; e.g. ["http://localhost:3000"]. Must NOT contain "*" —
+  # browsers reject "*" + allow_credentials=true, and the factory refuses it.
+  cors_origins: []
+  rate_limits:
+    # Per-token caps applied to write endpoints only (POST /executions*).
+    max_concurrent: 3
+    max_per_minute: 30
 logging:
   level: INFO
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
