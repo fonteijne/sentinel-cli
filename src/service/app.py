@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI
 
 from src.core.persistence.db import ensure_initialized
 from src.service.deps import get_db_conn
-from src.service.routes import executions
+from src.service.routes import executions, stream
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Sentinel Command Center API", version="0.1")
     app.include_router(executions.router)
+    # Wired here for plan 03 tests; plan 05 replaces this factory with the
+    # auth-wrapped composed one.
+    app.include_router(stream.router)
 
     @app.get("/health")
     def health(conn=Depends(get_db_conn)) -> dict:  # type: ignore[no-untyped-def]
