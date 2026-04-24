@@ -38,9 +38,24 @@ from pathlib import Path
 from typing import Iterator
 
 from fastapi import HTTPException, Request, WebSocketException
+from fastapi.security import HTTPBearer
 from starlette.websockets import WebSocket
 
 logger = logging.getLogger(__name__)
+
+# OpenAPI-only security scheme. Attaching this as a router-level ``Security``
+# dep is what makes Swagger UI at ``/docs`` render the "Authorize" button.
+# ``auto_error=False`` so this dep itself never 401s — the real check runs
+# in ``require_token`` via ``_extract_bearer`` + ``secrets.compare_digest``.
+bearer_scheme = HTTPBearer(
+    bearerFormat="opaque",
+    auto_error=False,
+    description=(
+        "Plan-05 service token. Read it from ~/.sentinel/service_token "
+        "inside the sentinel-serve container. Paste just the token — "
+        'Swagger adds the "Bearer " prefix.'
+    ),
+)
 
 TOKEN_FILE = Path.home() / ".sentinel" / "service_token"
 

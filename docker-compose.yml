@@ -60,16 +60,152 @@ services:
     environment:
       - WORKSPACE_ROOT=/workspaces
       - DOCKER_HOST=unix:///var/run/docker.sock
+      # Hardcoded true — dev always wants /docs reachable at
+      # `http://localhost:8787/docs`. Prod (sentinel-serve) is
+      # independently hardcoded to false so the two can't collide via a
+      # shared .env entry.
+      - SENTINEL_ENABLE_DOCS=true
     stdin_open: true
     tty: true
     entrypoint: []
-    command: ["sleep", "infinity"]
+    # Start the backend so `http://localhost:8787/docs` is reachable from the
+    # host browser. Override in docker-compose.override.yml if you prefer
+    # `sleep infinity` + manual `docker exec ... sentinel serve`.
+    command: ["sentinel", "serve", "--host", "0.0.0.0", "--i-know-what-im-doing", "--port", "8787"]
+    # Host-loopback ONLY — NEVER 0.0.0.0:8787. The 127.0.0.1: prefix is
+    # load-bearing: publishing to 0.0.0.0 would expose the dev backend to
+    # anything on the machine's network. The 0.0.0.0 bind *inside* the
+    # container is fine because the host publish is scoped to loopback.
+    ports:
+      - "127.0.0.1:8787:8787"
+    # `network_mode: bridge` keeps dev isolated from sentinel-edge. If you
+    # want the dev container to reach a running Traefik (to test routing
+    # end-to-end from inside the dev shell), drop this line and add
+    # `networks: [default, sentinel-edge]` like sentinel-serve.
     network_mode: bridge
     profiles:
       - dev
+
+  # Production backend service — profile-gated so bare `docker compose up`
+  # retains today's CLI-idle `sentinel` behaviour. Host reachability is
+  # Traefik's job; this service never publishes a host port directly.
+  sentinel-serve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    container_name: sentinel-serve
+    profiles:
+      - serve
+    # The `app` image has ENTRYPOINT ["sentinel"]; command: is argv[1:], so
+    # do NOT repeat `sentinel` here (Click would interpret the duplicate as
+    # a subcommand and fail with `No such command 'sentinel'`).
+    command: ["serve", "--host", "0.0.0.0", "--i-know-what-im-doing", "--port", "8787"]
+    volumes:
+      - sentinel-workspaces:/workspaces
+      - sentinel-projects:/workspace/projects
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./config:/app/config:ro
+      - ./config/.env.local:/app/config/.env.local:rw
+      - ~/.ssh:/root/.ssh:ro
+    environment:
+      - WORKSPACE_ROOT=/workspaces
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      # `/docs` is the de-facto operator UI until plan 07 ships the dashboard,
+      # so prod honours `SENTINEL_ENABLE_DOCS` from `.env`. Default is still
+      # false — schema exposure only flips on when explicitly opted-in. Safe
+      # because Cloudflare Access + the plan-05 bearer token both gate /docs
+      # just like every other endpoint; a "leaked schema" only leaks to people
+      # already inside both gates.
+      - SENTINEL_ENABLE_DOCS=${SENTINEL_ENABLE_DOCS:-false}
+      - SENTINEL_SERVICE_TOKEN=${SENTINEL_SERVICE_TOKEN:-}
+    networks:
+      - default
+      - sentinel-edge
+    restart: unless-stopped
+    healthcheck:
+      # /health is unauthenticated by plan 05 design so no token needed here.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      # Traefik starts with exposedByDefault=false, so only services that
+      # opt in via traefik.enable=true get routed. Matches the BYO-Traefik
+      # contract: operators point their own Traefik at sentinel-edge and
+      # these labels still apply.
+      #
+      # Requires Traefik >= 3.6.1 (the bundled image is pinned there) —
+      # older Traefik versions hardcode Docker API v1.24 which Docker
+      # Engine 29.x+ refuses. A BYO Traefik older than 3.6.1 will need
+      # either an upgrade, the DOCKER_API_VERSION env workaround, or a
+      # file-provider config pointing at http://sentinel-serve:8787.
+      - "traefik.enable=true"
+      - "traefik.docker.network=sentinel-edge"
+      - "traefik.http.routers.sentinel.rule=Host(`${SENTINEL_HOSTNAME:?SENTINEL_HOSTNAME required}`)"
+      - "traefik.http.routers.sentinel.entrypoints=websecure"
+      - "traefik.http.routers.sentinel.tls=true"
+      - "traefik.http.routers.sentinel.tls.certresolver=le"
+      # Identity gating lives at Cloudflare Access (SSO + service tokens on the
+      # "Sentinel" self-hosted application). Traefik terminates TLS and hands
+      # authenticated requests through to the bearer-token gate in the service.
+      # No IP allowlist or forwarded-headers trust needed here anymore.
+      - "traefik.http.services.sentinel.loadbalancer.server.port=8787"
+
+  # Bundled Traefik reverse proxy — profile-gated so operators with an
+  # existing Traefik can opt out. They attach their Traefik to sentinel-edge
+  # manually; the labels on sentinel-serve still apply.
+  traefik:
+    # v3.6.1+ is REQUIRED: earlier Traefik hardcoded Docker API v1.24 which
+    # Docker Engine 29.x+ refuses (MinAPIVersion 1.44). PR
+    # https://github.com/traefik/traefik/pull/12256 unpinned the client and
+    # switched to moby's WithAPIVersionNegotiation(). Pinning the 3.6 minor
+    # tag picks up patch updates while staying on a known-compatible line.
+    image: traefik:v3.6
+    container_name: sentinel-traefik
+    profiles:
+      - traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-acme:/acme
+    networks:
+      - sentinel-edge
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=sentinel-edge
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL required}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+      - --accesslog=true
+      - --log.level=INFO
 
 volumes:
   sentinel-workspaces:
     driver: local
   sentinel-projects:
     driver: local
+  traefik-acme:
+    driver: local
+
+networks:
+  # Shared edge network. Compose creates and destroys it with the stack.
+  # BYO-Traefik operators attach their Traefik via
+  #   docker network connect sentinel-edge <their-traefik>
+  # AFTER compose has brought the stack up. IMPORTANT: those operators must
+  # use `docker compose stop` (not `down`) — `down` removes this network and
+  # disconnects any externally-attached container. Fresh `up` re-creates it.
+  # The explicit `name:` keeps the network name stable (no project prefix)
+  # so the Traefik labels' `docker.network=sentinel-edge` always matches.
+  sentinel-edge:
+    name: sentinel-edge
