@@ -146,11 +146,19 @@ services:
       - "traefik.http.routers.sentinel.entrypoints=websecure"
       - "traefik.http.routers.sentinel.tls=true"
       - "traefik.http.routers.sentinel.tls.certresolver=le"
-      - "traefik.http.routers.sentinel.middlewares=sentinel-ipallow@docker"
+      # Chain of two middlewares — order matters. sentinel-cfonly drops any
+      # request whose TCP source is not a Cloudflare edge (blocks direct-IP
+      # bypass of the orange cloud). sentinel-ipallow then drops any request
+      # whose real client IP (resolved from X-Forwarded-For, skipping CF edges)
+      # is not in the operator allowlist.
+      - "traefik.http.routers.sentinel.middlewares=sentinel-cfonly@docker,sentinel-ipallow@docker"
+      # Lock the origin to Cloudflare IPs only. No ipstrategy — this checks the
+      # raw TCP source, which is exactly what we want here (a direct connection
+      # to 188.89.253.220 bypassing Cloudflare would have a non-CF source).
+      - "traefik.http.middlewares.sentinel-cfonly.ipallowlist.sourcerange=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32"
       - "traefik.http.middlewares.sentinel-ipallow.ipallowlist.sourcerange=87.255.37.187/32"
-      # Cloudflare orange-cloud sits in front. Exclude CF edge IPs when reading
-      # X-Forwarded-For so the middleware resolves the real client IP instead
-      # of whichever Cloudflare PoP happened to handle the request. Ranges from
+      # Same CF CIDRs excluded from the XFF walk so the middleware resolves
+      # past the Cloudflare edge to find the real client IP. Ranges from
       # https://www.cloudflare.com/ips-v4 and /ips-v6 — refresh if Cloudflare
       # publishes a new CIDR (rare, but not never).
       - "traefik.http.middlewares.sentinel-ipallow.ipallowlist.ipstrategy.excludedips=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32"
