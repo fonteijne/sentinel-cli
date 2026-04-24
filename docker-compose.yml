@@ -111,12 +111,13 @@ services:
     environment:
       - WORKSPACE_ROOT=/workspaces
       - DOCKER_HOST=unix:///var/run/docker.sock
-      # Hardcoded false — prod schema-leaking is a security issue, and a
-      # shared `SENTINEL_ENABLE_DOCS=true` in `.env` (intended for dev)
-      # would otherwise silently enable /docs here too. To *temporarily*
-      # expose /docs in prod, use a `docker-compose.override.yml` (see
-      # docs/deploy.md §7) rather than a global `.env` flag.
-      - SENTINEL_ENABLE_DOCS=false
+      # `/docs` is the de-facto operator UI until plan 07 ships the dashboard,
+      # so prod honours `SENTINEL_ENABLE_DOCS` from `.env`. Default is still
+      # false — schema exposure only flips on when explicitly opted-in. Safe
+      # because Cloudflare Access + the plan-05 bearer token both gate /docs
+      # just like every other endpoint; a "leaked schema" only leaks to people
+      # already inside both gates.
+      - SENTINEL_ENABLE_DOCS=${SENTINEL_ENABLE_DOCS:-false}
       - SENTINEL_SERVICE_TOKEN=${SENTINEL_SERVICE_TOKEN:-}
     networks:
       - default

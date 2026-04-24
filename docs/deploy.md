@@ -54,7 +54,7 @@ Required keys before `docker compose --profile serve up`:
 |---|---|---|
 | `SENTINEL_HOSTNAME` | `sentinel-serve` | Compose **refuses to start** without it — `${SENTINEL_HOSTNAME:?}` in the label expansion hard-fails |
 | `LETSENCRYPT_EMAIL` | `traefik` profile only | Same hard-fail semantics |
-| `SENTINEL_ENABLE_DOCS` | optional | Default `false`; set `true` for temporary schema access in prod |
+| `SENTINEL_ENABLE_DOCS` | optional | Default `false`. Set `true` in `.env` to keep `/docs`, `/redoc`, `/openapi.json` reachable — used as the operator UI until plan 07 ships the dashboard. Gated behind Cloudflare Access + the bearer token like every other endpoint. |
 | `SENTINEL_SERVICE_TOKEN` | optional | Override auto-generated token; see §5 |
 
 ---
@@ -447,42 +447,59 @@ internal curl: `docker exec sentinel-serve curl -v http://127.0.0.1:8787/health`
 
 ---
 
-## 8. `/docs` in prod
+## 8. `/docs` in prod — operator UI until plan 07
 
-Off by default and **hardcoded** in `docker-compose.yml` for `sentinel-serve`
-— not `.env`-controlled, so a dev-focused `SENTINEL_ENABLE_DOCS=true` in
-`.env` can't accidentally enable prod `/docs`. The FastAPI factory passes
-`docs_url=None, redoc_url=None, openapi_url=None` when the env is falsy,
-which 404s all three endpoints (the paths don't exist — not 401).
+Until the dashboard ships in plan 07, FastAPI's built-in Swagger UI at
+`/docs` is the primary operator interface for exercising the API. It's
+reachable in prod when `SENTINEL_ENABLE_DOCS=true` is set in `.env`
+(default `false`). The compose definition honours the env flag directly:
 
-Temporary enablement uses a local `docker-compose.override.yml`
-(gitignored), not a global env flag:
+```yaml
+# sentinel-serve
+environment:
+  - SENTINEL_ENABLE_DOCS=${SENTINEL_ENABLE_DOCS:-false}
+```
+
+Standing-on configuration:
 
 ```bash
-cat > docker-compose.override.yml <<'YAML'
-services:
-  sentinel-serve:
-    environment:
-      - SENTINEL_ENABLE_DOCS=true
-YAML
+# .env
+SENTINEL_ENABLE_DOCS=true
+```
 
-docker compose --profile serve up -d sentinel-serve            # recreates with override
-curl -fsI https://$SENTINEL_HOSTNAME/docs                      # 200
+```bash
+docker compose --profile serve up -d sentinel-serve
+curl -fsI https://$SENTINEL_HOSTNAME/docs                      # 200 (after CF Access login)
+```
 
-# ...use Swagger UI, then turn it back off...
-rm docker-compose.override.yml
+Sign in via Cloudflare Access (§6.1) to reach the browser UI; from
+there, use Swagger's "Authorize" button with `Bearer <sentinel-token>`
+to exercise authenticated endpoints. Two gates are still enforced on
+every call — CF Access at the edge and the plan-05 bearer token inside
+the service — so enabling `/docs` does not bypass auth, only surfaces
+the schema to operators who have already passed both gates.
+
+To turn it off (e.g. before widening Access to a new viewer who should
+not see the schema):
+
+```bash
+# .env
+SENTINEL_ENABLE_DOCS=false
+
 docker compose --profile serve up -d --force-recreate sentinel-serve
 curl -fsI https://$SENTINEL_HOSTNAME/docs                      # 404
 ```
 
-`docker-compose.override.yml` is loaded by compose automatically when
-present, and values there win over the base file. Keep the file deleted
-unless you're actively using `/docs` — its presence is what "prod docs
-are on" looks like.
+All three of `/docs`, `/redoc`, `/openapi.json` flip together — Swagger
+UI fetches `/openapi.json`, so gating only `docs_url` would still leak
+the schema. The factory gates them as a group.
 
-All three of `/docs`, `/redoc`, `/openapi.json` flip together — Swagger UI
-fetches `/openapi.json`, so gating only `docs_url` would still leak the
-schema. The factory gates them as a group.
+**Why the default is still `false`:** unauthenticated probes of the
+public hostname should return 404 on schema endpoints, not a routable
+200 behind an auth wall. Operators explicitly opt in by setting the env
+flag; it's not the kind of thing that should flip on by accident. When
+plan 07 lands and provides a real UI, consider flipping the default
+back off for prod deployments that don't need Swagger.
 
 ---
 
