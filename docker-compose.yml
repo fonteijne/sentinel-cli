@@ -146,16 +146,12 @@ services:
       - "traefik.http.routers.sentinel.entrypoints=websecure"
       - "traefik.http.routers.sentinel.tls=true"
       - "traefik.http.routers.sentinel.tls.certresolver=le"
-      # Chain of two middlewares — order matters. sentinel-cfonly drops any
-      # request whose TCP source is not a Cloudflare edge (blocks direct-IP
-      # bypass of the orange cloud). sentinel-ipallow then drops any request
-      # whose real client IP (resolved from X-Forwarded-For, skipping CF edges)
-      # is not in the operator allowlist.
-      - "traefik.http.routers.sentinel.middlewares=sentinel-cfonly@docker,sentinel-ipallow@docker"
-      # Lock the origin to Cloudflare IPs only. No ipstrategy — this checks the
-      # raw TCP source, which is exactly what we want here (a direct connection
-      # to 188.89.253.220 bypassing Cloudflare would have a non-CF source).
-      - "traefik.http.middlewares.sentinel-cfonly.ipallowlist.sourcerange=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32"
+      # Docker Desktop on Mac runs containers behind vpnkit, which rewrites
+      # every TCP source IP to the Docker bridge gateway (172.19.0.1). That
+      # makes TCP-source-based "cfonly" filtering impossible at Traefik level
+      # on this topology — see docs/deploy.md for the mTLS follow-up that
+      # closes the origin-bypass hole properly.
+      - "traefik.http.routers.sentinel.middlewares=sentinel-ipallow@docker"
       - "traefik.http.middlewares.sentinel-ipallow.ipallowlist.sourcerange=87.255.37.187/32"
       # Same CF CIDRs excluded from the XFF walk so the middleware resolves
       # past the Cloudflare edge to find the real client IP. Ranges from
@@ -194,12 +190,18 @@ services:
       - --entrypoints.websecure.address=:443
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      # Trust Cloudflare edges as forwarded-headers sources so X-Forwarded-For
-      # and X-Forwarded-Proto survive into the middleware chain. Without this,
-      # Traefik would strip XFF from the CF connection and the ipallowlist
-      # middleware would only see a Cloudflare edge IP.
-      - --entrypoints.web.forwardedheaders.trustedips=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32
-      - --entrypoints.websecure.forwardedheaders.trustedips=173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32
+      # Trust X-Forwarded-For from the Docker bridge gateway. On Docker Desktop
+      # for Mac, vpnkit SNATs every inbound connection to the bridge gateway,
+      # so Traefik's TCP remote is ALWAYS 172.19.0.1 regardless of whether the
+      # request came via Cloudflare or direct. Trusting that gateway lets XFF
+      # (which Cloudflare populates correctly) reach the ipallowlist middleware.
+      # TRADEOFF: anyone who can reach :443 can now spoof XFF. The orange cloud
+      # and home-IP obscurity are the current perimeter; close the spoof hole
+      # with Cloudflare Authenticated Origin Pulls (mTLS) — see docs/deploy.md.
+      # On a Linux host (no vpnkit SNAT), swap this back to CF's published
+      # ranges so only actual Cloudflare edges are trusted.
+      - --entrypoints.web.forwardedheaders.trustedips=172.16.0.0/12
+      - --entrypoints.websecure.forwardedheaders.trustedips=172.16.0.0/12
       - --certificatesresolvers.le.acme.httpchallenge=true
       - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
       - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL required}
