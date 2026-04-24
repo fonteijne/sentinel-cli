@@ -220,7 +220,97 @@ Clients must update their `Authorization: Bearer …` header after rotation.
 
 ---
 
-## 6. Health check
+## 6. Cloudflare Access (identity gate in front of Traefik)
+
+Plan 06's orange-cloud variant relies on **Cloudflare Access** as the
+identity gate at the edge. Access enforces before any traffic reaches
+the origin, which is what makes the setup safe on a home-network Mac
+(Docker Desktop's vpnkit collapses source IPs to the bridge gateway,
+so IP-based allowlists in Traefik cannot distinguish a Cloudflare-routed
+request from a direct-origin dial — see the cleanup in commit `8f1025d`).
+
+Behind Access, plan 05's bearer token is still the service-level auth.
+Two layers, one on each side of Cloudflare.
+
+### 6.1 One-time application setup (humans via SSO)
+
+1. Cloudflare dashboard → **Zero Trust → Access → Applications → Add an
+   application → Self-hosted**.
+2. Application domain: `${SENTINEL_HOSTNAME}` (path blank).
+3. Session duration: `24 hours`.
+4. Identity providers: enable at least **One-time PIN** (email OTP) for
+   zero-dependency bootstrap. Add Google / GitHub / Microsoft later under
+   **Settings → Authentication** if you want SSO.
+5. Add a policy:
+   - Name: `Operators`
+   - Action: **Allow**
+   - Include → **Emails** → one row per operator email.
+6. Save.
+
+Sanity check from an incognito window:
+
+```bash
+# Should redirect to the CF Access login, not the API response.
+curl -v https://$SENTINEL_HOSTNAME/health
+```
+
+### 6.2 Service tokens (CLI / automation)
+
+For `sentinel execute --remote` or any script hitting the API from a
+non-browser context, issue an Access **service token** and whitelist it
+on the `Operators` policy. The service token is the CF-edge credential;
+plan 05's bearer token is the in-service credential. Both are required
+on every request.
+
+1. **Zero Trust → Access → Service Auth → Service Tokens → Create
+   Service Token** → name it `sentinel-cli` (or per-client if you want
+   to revoke granularly). **Save the Client ID and Client Secret
+   immediately — the secret is shown once.**
+2. Edit the **Operators** policy on the Sentinel application → add an
+   **Include** row: selector **Service Token** = `sentinel-cli`.
+3. Calls require three headers:
+   ```
+   CF-Access-Client-Id:     <client-id>
+   CF-Access-Client-Secret: <client-secret>
+   Authorization:           Bearer <sentinel-service-token>
+   ```
+
+Quick test:
+
+```bash
+curl -fsS https://$SENTINEL_HOSTNAME/executions \
+  -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+  -H "Authorization: Bearer $SENTINEL_SERVICE_TOKEN"
+```
+
+Expected: 200 with the executions list. `401` means the Sentinel bearer
+token is wrong; a CF Access **HTML login page** in the body means the
+`CF-Access-Client-*` headers are wrong or the service token isn't
+included in the policy.
+
+### 6.3 Rotation
+
+- **Sentinel bearer token**: §5 above.
+- **Service token**: Zero Trust → Access → Service Auth → Service Tokens
+  → rotate inline. The old secret is invalid immediately; update
+  automation before clicking.
+- **User additions / removals**: edit the `Operators` policy Include
+  list. Revocation takes effect at next session refresh (≤24h with the
+  session duration above; force-refresh via **My Team → Users → Revoke
+  session**).
+
+### 6.4 Wiring the CLI (follow-up, not today)
+
+`sentinel execute --remote` lands in plan 04. When it does, it must
+send all three headers on every HTTPS call. Likely shape: environment
+variables `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` alongside
+the existing `SENTINEL_SERVICE_TOKEN`, read once at client init and
+attached by the HTTP client.
+
+---
+
+## 7. Health check
 
 `/health` is **unauthenticated** by plan 05 design so container runtimes,
 compose healthchecks, and external uptime probes work without a token:
@@ -235,7 +325,7 @@ internal curl: `docker exec sentinel-serve curl -v http://127.0.0.1:8787/health`
 
 ---
 
-## 7. `/docs` in prod
+## 8. `/docs` in prod
 
 Off by default and **hardcoded** in `docker-compose.yml` for `sentinel-serve`
 — not `.env`-controlled, so a dev-focused `SENTINEL_ENABLE_DOCS=true` in
@@ -274,7 +364,7 @@ schema. The factory gates them as a group.
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Likely cause | Next check |
 |---|---|---|
@@ -289,10 +379,13 @@ schema. The factory gates them as a group.
 | `SENTINEL_HOSTNAME required` on compose up | Forgot to set in `.env` | Same — it's intentional; prod without hostname is never correct |
 | `/health` on `http://localhost:8787` refuses from host | Dev profile not up or port not published | `docker compose --profile dev ps`; `ss -tlnp \| grep 8787` |
 | Port 8787 bound to `0.0.0.0` on host | `docker-compose.yml` edited to drop the `127.0.0.1:` prefix | Restore the prefix; `ss -tlnp` should show `127.0.0.1:8787` only |
+| Curl returns a Cloudflare HTML login page instead of JSON | `CF-Access-Client-Id` / `CF-Access-Client-Secret` missing, wrong, or service token not in the `Operators` policy Include list | Re-check both headers; verify the service token appears under **Access → Applications → Sentinel → Policies → Operators → Include** |
+| `401 Unauthorized` from Sentinel after passing CF Access | Sentinel bearer token missing or stale | `Authorization: Bearer <token>`; rotate per §5 if the token on disk and the client disagree |
+| Browser succeeds, CLI fails with CF login HTML | Service-token path not wired up; browser has a CF session cookie but CLI does not | Issue a service token (§6.2) and send the two `CF-Access-Client-*` headers from the CLI |
 
 ---
 
-## 9. What is NOT in this runbook
+## 10. What is NOT in this runbook
 
 Deliberately out of scope (see plan 06 Notes → "Explicitly NOT in this plan"):
 
