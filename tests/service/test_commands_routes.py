@@ -122,6 +122,114 @@ def test_start_rejects_bad_ticket_and_project(authed_client_with_fake_supervisor
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "ticket_id",
+    ["KAN_KAN-1", "COE_JIRATESTAI-2352", "DHLPPXC_DHLEX-99", "PROJ-1"],
+)
+def test_start_accepts_underscored_ticket_ids(
+    authed_client_with_fake_supervisor, ticket_id
+):
+    """Jira keys at target deployments use underscores in the prefix — the
+    pattern must accept ``KAN_KAN-1`` etc. while still rejecting forms like
+    ``_FOO-1`` (leading underscore) or lowercase input.
+    """
+    client = authed_client_with_fake_supervisor
+    resp = client.post(
+        "/executions",
+        json={"ticket_id": ticket_id, "project": "proj", "kind": "execute"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["ticket_id"] == ticket_id
+
+
+@pytest.mark.parametrize(
+    "bad_ticket_id",
+    ["_FOO-1", "foo_bar-1", "A-1", "FOO-", "FOO_BAR", ""],
+)
+def test_start_still_rejects_malformed_underscored_ids(
+    authed_client_with_fake_supervisor, bad_ticket_id
+):
+    """Widening for underscores must not swallow genuinely malformed keys:
+    leading underscore, lowercase, single-char prefix, missing numeric suffix.
+    """
+    client = authed_client_with_fake_supervisor
+    resp = client.post(
+        "/executions",
+        json={"ticket_id": bad_ticket_id, "project": "proj", "kind": "execute"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "payload, expected_project",
+    [
+        # key omitted entirely
+        ({"ticket_id": "COE_JIRATESTAI-2352", "kind": "execute"}, "coe_jiratestai"),
+        # explicit null
+        (
+            {"ticket_id": "KAN_KAN-1", "project": None, "kind": "execute"},
+            "kan_kan",
+        ),
+        # empty string (Swagger's default for optional strings)
+        (
+            {"ticket_id": "PROJ-1", "project": "", "kind": "execute"},
+            "proj",
+        ),
+    ],
+)
+def test_start_derives_project_from_ticket_when_missing(
+    authed_client_with_fake_supervisor, payload, expected_project
+):
+    """Mirrors the CLI's ``-p`` default: if the request omits ``project``,
+    the API derives it from ``ticket_id.split("-")[0].lower()``. Empty
+    strings and nulls take the same path so Swagger "Try it out" forms
+    don't force operators to type a redundant project name.
+    """
+    client = authed_client_with_fake_supervisor
+    resp = client.post("/executions", json=payload)
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["project"] == expected_project
+
+
+def test_start_accepts_explicit_project_over_derivation(
+    authed_client_with_fake_supervisor,
+):
+    """Explicit ``project`` wins over the derived default — important for
+    cases where the Docker Compose project name intentionally differs from
+    the ticket prefix (e.g. shared infra reused across multiple tickets).
+    """
+    client = authed_client_with_fake_supervisor
+    resp = client.post(
+        "/executions",
+        json={
+            "ticket_id": "COE_JIRATESTAI-2352",
+            "project": "shared-infra",
+            "kind": "execute",
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["project"] == "shared-infra"
+
+
+def test_options_follow_up_ticket_empty_string_treated_as_absent(
+    authed_client_with_fake_supervisor,
+):
+    """Symmetric Swagger quirk for ``options.follow_up_ticket``: an empty
+    string must not trigger a pattern failure — it means "not set".
+    """
+    client = authed_client_with_fake_supervisor
+    resp = client.post(
+        "/executions",
+        json={
+            "ticket_id": "PROJ-1",
+            "project": "proj",
+            "kind": "execute",
+            "options": {"follow_up_ticket": ""},
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+
+
 def test_start_spawn_failure_marks_row_failed_and_500s(
     authed_client_with_fake_supervisor, fake_supervisor
 ):
