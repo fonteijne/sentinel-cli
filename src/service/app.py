@@ -22,12 +22,13 @@ from __future__ import annotations
 import logging
 import os
 
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Security
 from starlette.middleware.cors import CORSMiddleware
 
 from src.config_loader import get_config
 from src.service.auth import (
     audit_write,
+    bearer_scheme,
     load_or_create_token,
     require_token,
     require_token_and_write_slot,
@@ -132,7 +133,15 @@ def create_app() -> FastAPI:
         return {"status": "ok", "db": "ok"}
 
     # Read-only HTTP: bearer auth, no rate limit (polling is expected).
-    http_read_protected = APIRouter(dependencies=[Depends(require_token)])
+    # ``Security(bearer_scheme)`` is a no-op at runtime (auto_error=False) but
+    # surfaces the bearerAuth scheme in OpenAPI so Swagger UI shows the
+    # Authorize button. ``require_token`` remains the actual gate.
+    http_read_protected = APIRouter(
+        dependencies=[
+            Security(bearer_scheme),
+            Depends(require_token),
+        ]
+    )
     http_read_protected.include_router(executions.router)
     app.include_router(http_read_protected)
 
@@ -141,6 +150,7 @@ def create_app() -> FastAPI:
     # and releases it in a ``finally`` — success and failure both release.
     http_write_protected = APIRouter(
         dependencies=[
+            Security(bearer_scheme),
             Depends(require_token_and_write_slot),
             Depends(audit_write),
         ]

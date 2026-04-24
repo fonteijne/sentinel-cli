@@ -87,6 +87,17 @@ def test_docs_enabled_returns_200_for_all_three(env_value, monkeypatch, tmp_path
         body = openapi.json()
         assert body.get("openapi", "").startswith("3.")
         assert body["info"]["title"] == "Sentinel Command Center API"
+        # The bearerAuth security scheme must be present, otherwise Swagger
+        # UI renders no Authorize button and operators cannot use /docs as
+        # the interim interface (plan 07 follow-up). If a future refactor
+        # drops ``Security(bearer_scheme)`` from the router deps, this test
+        # fails before it reaches the user.
+        schemes = body.get("components", {}).get("securitySchemes", {})
+        assert "HTTPBearer" in schemes, (
+            f"expected bearerAuth scheme in OpenAPI, got {list(schemes)}"
+        )
+        assert schemes["HTTPBearer"]["type"] == "http"
+        assert schemes["HTTPBearer"]["scheme"] == "bearer"
 
 
 def test_env_overrides_config_default(monkeypatch, tmp_path):
