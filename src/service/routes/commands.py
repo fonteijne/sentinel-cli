@@ -20,7 +20,7 @@ from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.core.execution.models import ExecutionKind, ExecutionStatus
 from src.core.execution.repository import ExecutionRepository
@@ -36,6 +36,31 @@ router = APIRouter(prefix="/executions", tags=["commands"])
 # ---------------------------------------------------------------- schemas
 
 
+# Ticket-ID pattern. Prefix: uppercase letter, then letters/digits/underscores.
+# Suffix after the dash: numeric issue ID. Underscores in the prefix are
+# intentional — Jira instances like the ones this deploys against use keys
+# such as ``KAN_KAN-1``, ``COE_JIRATESTAI-2352``, ``DHLPPXC_DHLEX-99``.
+# Defined once so the Start body and the Options follow-up stay in lockstep.
+_TICKET_ID_PATTERN = r"^[A-Z][A-Z0-9_]+-\d+$"
+
+# Docker Compose project-name pattern: must start with a lowercase letter or
+# digit, then allow letters/digits/underscores/hyphens up to 64 chars total.
+_PROJECT_PATTERN = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+
+
+def _empty_string_to_none(value):  # type: ignore[no-untyped-def]
+    """Swagger UI fills optional string fields with ``""`` instead of omitting
+    them, which then fails pattern validation for no useful reason. Coerce
+    ``""`` → ``None`` *before* the field-level pattern runs so the field
+    behaves identically whether the client sends nothing, ``null``, or an
+    empty string. Applied as a ``mode="before"`` validator on every optional
+    patterned string in this module.
+    """
+    if value == "":
+        return None
+    return value
+
+
 class ExecutionOptions(BaseModel):
     """Explicit enumerated options — never a free-form dict.
 
@@ -48,19 +73,36 @@ class ExecutionOptions(BaseModel):
 
     revise: bool = False
     max_turns: Optional[int] = Field(default=None, ge=1, le=200)
-    follow_up_ticket: Optional[str] = Field(
-        default=None, pattern=r"^[A-Z][A-Z0-9]+-\d+$"
+    follow_up_ticket: Optional[str] = Field(default=None, pattern=_TICKET_ID_PATTERN)
+
+    _follow_up_empty_to_none = field_validator("follow_up_ticket", mode="before")(
+        _empty_string_to_none
     )
 
 
 class StartExecutionBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ticket_id: str = Field(pattern=r"^[A-Z][A-Z0-9]+-\d+$")
-    # docker compose project name rules: start with [a-z0-9], then [a-z0-9_-]
-    project: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    ticket_id: str = Field(pattern=_TICKET_ID_PATTERN)
+    # Docker Compose project name. Optional — if omitted, null, or empty we
+    # derive it from the ticket_id prefix (lowercased), matching the CLI's
+    # ``-p`` default in src/cli.py (``project or ticket_id.split("-")[0]``).
+    project: Optional[str] = Field(default=None, pattern=_PROJECT_PATTERN)
     kind: ExecutionKind
     options: ExecutionOptions = Field(default_factory=ExecutionOptions)
+
+    _project_empty_to_none = field_validator("project", mode="before")(
+        _empty_string_to_none
+    )
+
+    @model_validator(mode="after")
+    def _derive_project_from_ticket(self) -> "StartExecutionBody":
+        if self.project is None:
+            # ticket_id is already pattern-validated at this point, so the
+            # prefix is guaranteed [A-Z][A-Z0-9_]+ which lowercases into a
+            # valid Compose project name. No re-validation needed.
+            self.project = self.ticket_id.split("-", 1)[0].lower()
+        return self
 
 
 # ---------------------------------------------------------------- helpers
