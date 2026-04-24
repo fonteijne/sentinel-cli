@@ -220,54 +220,121 @@ Clients must update their `Authorization: Bearer …` header after rotation.
 
 ---
 
-## 6. Cloudflare Access (identity gate in front of Traefik)
+## 6. Cloudflare Access — multi-user identity gate
 
-Plan 06's orange-cloud variant relies on **Cloudflare Access** as the
-identity gate at the edge. Access enforces before any traffic reaches
-the origin, which is what makes the setup safe on a home-network Mac
-(Docker Desktop's vpnkit collapses source IPs to the bridge gateway,
-so IP-based allowlists in Traefik cannot distinguish a Cloudflare-routed
-request from a direct-origin dial — see the cleanup in commit `8f1025d`).
+This is the recommended production setup for **teams of two or more
+operators**. It replaces plan 05's single-shared-secret posture at the
+ingress layer: identity is enforced at Cloudflare's edge by SSO or email
+OTP, and every request is attributable to a named person (or a named
+service token). Plan 05's bearer token still runs inside Traefik as the
+second layer, so every request passes two gates.
 
-Behind Access, plan 05's bearer token is still the service-level auth.
-Two layers, one on each side of Cloudflare.
+Why this matters on a home-network Mac host: Docker Desktop's vpnkit
+collapses every source IP to the bridge gateway, so no IP-based
+allowlist in Traefik can distinguish a Cloudflare-routed request from
+a direct-origin dial — Access at the CF edge is the only place where
+identity can be checked reliably (see commit `8f1025d` for the cleanup).
 
-### 6.1 One-time application setup (humans via SSO)
+### Architecture
+
+```
+Browser / CLI  ──► Cloudflare ──► Traefik ──► sentinel-serve
+                     ▲                ▲           ▲
+                     │                │           │
+                     │                │           └── Plan 05 bearer token
+                     │                │                (shared secret today,
+                     │                │                 per-user in plan 08)
+                     │                └── TLS termination (Let's Encrypt)
+                     └── Cloudflare Access policy "Operators":
+                         SSO / email identity for humans,
+                         service tokens for automation.
+```
+
+Humans authenticate to Cloudflare with their email + IdP, get a 24-hour
+session cookie, then hit Traefik. Automation sends service-token
+headers instead of the cookie. Both paths still need the Sentinel
+bearer token.
+
+### Single-operator fallback
+
+If you are the only user, Cloudflare Access with one email in the
+policy is still the right setup — the "multi-user" framing just means
+you're set up to grow. For true single-user dev-box deployments
+without a public DNS record, an SSH tunnel to `127.0.0.1:8787` is
+simpler; §0 covers when to pick which.
+
+### 6.1 One-time application setup
 
 1. Cloudflare dashboard → **Zero Trust → Access → Applications → Add an
    application → Self-hosted**.
-2. Application domain: `${SENTINEL_HOSTNAME}` (path blank).
-3. Session duration: `24 hours`.
-4. Identity providers: enable at least **One-time PIN** (email OTP) for
-   zero-dependency bootstrap. Add Google / GitHub / Microsoft later under
-   **Settings → Authentication** if you want SSO.
-5. Add a policy:
+2. Application name: `Sentinel`.
+3. Application domain: `${SENTINEL_HOSTNAME}` (path blank — protects
+   the whole host).
+4. Session duration: `24 hours`.
+5. Identity providers: enable at least **One-time PIN** (email OTP) for
+   zero-dependency bootstrap. Add Google / GitHub / Microsoft / Okta
+   later under **Settings → Authentication** — once an IdP is wired up
+   there, flip it on per-application here.
+6. Add a policy:
    - Name: `Operators`
    - Action: **Allow**
-   - Include → **Emails** → one row per operator email.
-6. Save.
+   - Include → **Emails** → one row per operator email, *or* Include →
+     **Emails ending in** → `@yourcompany.com` if everyone on that
+     domain should have access.
+7. Save.
 
 Sanity check from an incognito window:
 
 ```bash
-# Should redirect to the CF Access login, not the API response.
+# Should redirect to the CF Access login, not to the API response.
 curl -v https://$SENTINEL_HOSTNAME/health
 ```
 
-### 6.2 Service tokens (CLI / automation)
+### 6.2 Onboarding a new operator
 
-For `sentinel execute --remote` or any script hitting the API from a
-non-browser context, issue an Access **service token** and whitelist it
-on the `Operators` policy. The service token is the CF-edge credential;
-plan 05's bearer token is the in-service credential. Both are required
-on every request.
+1. **Zero Trust → Access → Applications → Sentinel → Policies →
+   Operators → Edit**.
+2. Add a new **Include → Emails** row with their address. Save.
+3. Tell them the URL (`https://$SENTINEL_HOSTNAME`). On first visit
+   they'll be prompted for SSO / OTP — no onboarding steps on your
+   side beyond the policy row.
+4. Optional: if your plan uses **Groups** (Zero Trust → Settings →
+   Access → Groups), add them to the `operators` group and reference
+   the group in the policy instead of listing emails — scales better
+   past ~5 operators.
+
+Access logs (**Zero Trust → Logs → Access**) show each successful and
+denied sign-in with the email, IP, and user-agent. Use this as the
+audit trail for humans.
+
+### 6.3 Offboarding / revoking access
+
+1. Remove the email (or group membership) from the `Operators` policy.
+2. Force-expire their active session: **Zero Trust → My Team → Users →
+   find the user → Revoke session**. Otherwise the existing 24-hour
+   cookie stays valid until it expires.
+3. If they had a service token in their name, revoke it (§6.5).
+
+### 6.4 Service tokens (CLI / automation / CI)
+
+For `sentinel execute --remote`, CI pipelines, or any script hitting
+the API from a non-browser context, issue an Access **service token**
+and whitelist it on the `Operators` policy. The service token is the
+CF-edge credential; plan 05's bearer token is the in-service
+credential. Both are required on every request.
+
+**One token per actor.** Create per-operator and per-CI tokens rather
+than sharing one `sentinel-cli` token — revocation is per-token, so
+granular naming pays off the first time someone leaves or a laptop is
+lost.
 
 1. **Zero Trust → Access → Service Auth → Service Tokens → Create
-   Service Token** → name it `sentinel-cli` (or per-client if you want
-   to revoke granularly). **Save the Client ID and Client Secret
+   Service Token** → name it after the caller: `sentinel-cli-alice`,
+   `sentinel-ci-github`, etc. **Save the Client ID and Client Secret
    immediately — the secret is shown once.**
 2. Edit the **Operators** policy on the Sentinel application → add an
-   **Include** row: selector **Service Token** = `sentinel-cli`.
+   **Include → Service Token** row → select the token you just
+   created. (Multiple service-token rows allowed.)
 3. Calls require three headers:
    ```
    CF-Access-Client-Id:     <client-id>
@@ -284,29 +351,84 @@ curl -fsS https://$SENTINEL_HOSTNAME/executions \
   -H "Authorization: Bearer $SENTINEL_SERVICE_TOKEN"
 ```
 
-Expected: 200 with the executions list. `401` means the Sentinel bearer
-token is wrong; a CF Access **HTML login page** in the body means the
-`CF-Access-Client-*` headers are wrong or the service token isn't
-included in the policy.
+Expected: 200 with the executions list. `401` means the Sentinel
+bearer token is wrong; a CF Access **HTML login page** in the body
+means the `CF-Access-Client-*` headers are wrong or the service token
+isn't included in the policy.
 
-### 6.3 Rotation
+### 6.5 Rotation
 
-- **Sentinel bearer token**: §5 above.
-- **Service token**: Zero Trust → Access → Service Auth → Service Tokens
-  → rotate inline. The old secret is invalid immediately; update
-  automation before clicking.
-- **User additions / removals**: edit the `Operators` policy Include
-  list. Revocation takes effect at next session refresh (≤24h with the
-  session duration above; force-refresh via **My Team → Users → Revoke
-  session**).
+| What | Where | Effect |
+|---|---|---|
+| **Sentinel bearer token** | §5 above (shared across all operators today) | All clients need the new token |
+| **Service token** | Zero Trust → Access → Service Auth → Service Tokens → rotate | Old secret invalid immediately — update automation before clicking |
+| **User additions / removals** | `Operators` policy Include list | Effective at next session refresh (≤24h); force-now via §6.3 |
+| **Access session duration** | Application settings → Session duration | Shorter = tighter revocation, more logins |
 
-### 6.4 Wiring the CLI (follow-up, not today)
+### 6.6 Known limitation: shared bearer token
+
+Plan 05's in-service bearer token is a **single shared secret** today
+— every operator uses the same `~/.sentinel/service_token`. That means
+per-user attribution stops at the Cloudflare Access layer: Sentinel's
+own logs show every request as "the one bearer token", not Alice vs.
+Bob. Plan 08 (deferred) introduces per-user tokens + scopes inside
+Sentinel so the two layers report the same identity end-to-end. Until
+then, use Cloudflare **Access Logs** (step 6.2) as the authoritative
+audit source for who did what.
+
+### 6.7 Origin bypass — closing the remaining hole with AOP
+
+Cloudflare Access only runs on requests that *go through Cloudflare*.
+A direct TCP connection to your home IP (`${public-IP}:443`) bypasses
+Access entirely — the only gate the attacker hits is plan 05's bearer
+token. As long as that token stays on-disk with `0o600` inside the
+container, this is usually fine, but for a multi-user team the token
+becomes load-bearing across more hands.
+
+Close this with **Authenticated Origin Pulls (AOP)** — Cloudflare
+presents a client TLS certificate on every forwarded request, Traefik
+rejects anything without it. Attackers dialing the origin directly
+can't forge Cloudflare's cert, so the origin becomes unreachable
+except through Cloudflare.
+
+Setup (~30 min, not wired today):
+
+1. **Cloudflare** → SSL/TLS → Origin Server → **Authenticated Origin
+   Pulls** → toggle on for `${SENTINEL_HOSTNAME}`.
+2. **Traefik** — download Cloudflare's [Origin Pull CA bundle][cf-aop]
+   to the host, mount into the Traefik container, add a file-provider
+   TLS options block:
+   ```yaml
+   tls:
+     options:
+       cf-mtls:
+         clientAuth:
+           caFiles:
+             - /certs/cloudflare-origin-pull.crt
+           clientAuthType: RequireAndVerifyClientCert
+   ```
+   Reference on the sentinel router:
+   ```yaml
+   - "traefik.http.routers.sentinel.tls.options=cf-mtls@file"
+   ```
+3. Verify: `curl --resolve sentinel.vectorpeaklabs.com:443:<origin-ip> https://sentinel.vectorpeaklabs.com/health`
+   should fail the TLS handshake. The same URL via Cloudflare should
+   still succeed.
+
+[cf-aop]: https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem
+
+Track as a follow-up when the user list grows or when the bearer
+token is shared with a new machine.
+
+### 6.8 Wiring the CLI (plan 04 follow-up)
 
 `sentinel execute --remote` lands in plan 04. When it does, it must
 send all three headers on every HTTPS call. Likely shape: environment
 variables `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` alongside
 the existing `SENTINEL_SERVICE_TOKEN`, read once at client init and
-attached by the HTTP client.
+attached by the HTTP client. One service token per developer, stored
+in their personal `config/.env.local` (gitignored), not the shared
+`.env`.
 
 ---
 
