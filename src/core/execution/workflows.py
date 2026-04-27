@@ -5,22 +5,11 @@ debrief workflows. Both the CLI (``src.cli``) and the Command Center worker
 (``src.core.execution.worker``) call into the *same* ``run_*`` functions —
 they only differ in how they parse input and how they present output.
 
-The functions here intentionally do **not** print (Click ``echo`` is left to
-the CLI) and return a :class:`WorkflowResult` instead. The Result's
-``artifacts`` field is the no-op detector: a remote run that completes
-without producing at least one of the configured artifacts is rejected by
-:meth:`WorkflowResult.assert_real_work`. That is what makes Command Center
-unable to report "success" for a scaffold run.
-
-Side effects (Jira comments, git push, GitLab MR creation) live in the
-existing CLI helpers and the agent classes. Refactoring those further is
-out of scope for this pass — the goal is:
-
-1. Make the worker invoke the *real* CLI workflow, not a no-op.
-2. Make the option model honest (no silent drops).
-3. Catch no-op runs at the seam where it matters.
-
-Everything else is preserved.
+Side effects (git push, GitLab MR comments, Jira notifications) live in
+:mod:`src.core.execution.post_execute` and are invoked from here so the CLI
+and the worker share one implementation. The CLI keeps its own
+``click.echo`` presentation by subscribing to the event bus + reading the
+``WorkflowResult`` markers.
 """
 
 from __future__ import annotations
@@ -53,16 +42,10 @@ logger = logging.getLogger(__name__)
 class WorkflowResult:
     """What a workflow produced. Used to validate non-no-op completion.
 
-    ``artifacts`` is the canonical record of whether *real* work happened.
     A run that finishes with an empty artifacts list (no agent invocation,
-    no worktree, no MR, no Jira comment) is, by definition, a no-op — and
+    no worktree, no MR, no Jira comment) is a no-op — and
     :meth:`assert_real_work` raises ``NoOpExecutionError`` so the worker
     marks the run failed instead of succeeded.
-
-    The artifact strings are intentionally coarse-grained — the goal is to
-    fail loudly on "did nothing", not to be a structured dataset. The agent
-    results, plan path, MR URL etc. are already persisted via the agent
-    classes; this is a parallel marker for the worker's no-op gate.
     """
 
     artifacts: List[str] = field(default_factory=list)
@@ -73,14 +56,11 @@ class WorkflowResult:
         if marker and marker not in self.artifacts:
             self.artifacts.append(marker)
 
-    def assert_real_work(self) -> None:
-        """Raise if no real workflow artifact was produced.
+    def merge_artifacts(self, markers: List[str]) -> None:
+        for m in markers:
+            self.add_artifact(m)
 
-        The acceptance criteria forbid silent green runs. A workflow that
-        completes without invoking any agent, creating any worktree, or
-        producing any external artifact must surface as a failure so the
-        operator can see *something* is wrong.
-        """
+    def assert_real_work(self) -> None:
         if not self.artifacts:
             raise NoOpExecutionError(
                 "workflow completed without producing any real artifact "
@@ -89,11 +69,7 @@ class WorkflowResult:
 
 
 class NoOpExecutionError(RuntimeError):
-    """Raised when a workflow finished without doing real work.
-
-    Caught by the worker and translated into a ``failed`` row + an
-    ``execution.failed`` event so the dashboard surfaces the issue.
-    """
+    """Raised when a workflow finished without doing real work."""
 
 
 # --------------------------------------------------------------------------- #
@@ -107,12 +83,11 @@ def run_workflow_for_execution(
     *,
     cancel_flag: Any = None,
 ) -> WorkflowResult:
-    """Top-level dispatcher — used by the worker.
+    """Top-level dispatcher used by the worker.
 
-    Reads the persisted, versioned options off the execution row and
-    delegates to the kind-specific runner. Any unsupported / extra option
-    causes ``WorkflowOptions.model_validate`` to raise — the worker then
-    records the failure on the row.
+    The CLI passes through the same dispatcher when it goes via
+    ``Orchestrator.execute`` etc. This keeps the worker and CLI on the same
+    code path — the only difference is the presentation layer.
     """
     from src.core.execution.options import from_metadata_options
 
@@ -131,6 +106,15 @@ def run_workflow_for_execution(
         )
     if execution.kind == ExecutionKind.EXECUTE:
         assert isinstance(options, ExecuteOptions)
+        if options.revise:
+            return run_revise(
+                orchestrator,
+                ticket_id=execution.ticket_id,
+                project=execution.project,
+                options=options,
+                execution_id=execution.id,
+                cancel_flag=cancel_flag,
+            )
         return run_execute(
             orchestrator,
             ticket_id=execution.ticket_id,
@@ -166,26 +150,15 @@ def run_plan(
     options: PlanOptions,
     execution_id: Optional[str] = None,
     cancel_flag: Any = None,
-    # Hooks for tests — production callers pass nothing and the real impls
-    # are imported lazily inside the function so importing this module is
-    # cheap.
     worktree_factory: Optional[Callable[..., Any]] = None,
     jira_factory: Optional[Callable[[], Any]] = None,
     plan_agent_factory: Optional[Callable[[], Any]] = None,
 ) -> WorkflowResult:
-    """Execute the ``plan`` workflow against an existing execution row.
-
-    The orchestrator already wraps this call in a ``run()`` context (CLI) or
-    ``begin/complete`` cycle (worker) — this function only owns the body.
-    """
+    """Execute the ``plan`` workflow against an existing execution row."""
     result = WorkflowResult()
     bus: EventBus = orchestrator.bus
 
     if execution_id is None:
-        # CLI path passes the live execution_id implicitly via the with-block;
-        # the worker passes it explicitly. Surfacing this as a kwarg keeps
-        # the function callable from either side without dragging in the
-        # full Execution model where it is not needed.
         raise ValueError("run_plan requires execution_id")
 
     if cancel_flag is not None and cancel_flag.is_set():
@@ -198,13 +171,10 @@ def run_plan(
     worktree_mgr = (worktree_factory or WorktreeManager)()
     jira_client = (jira_factory or get_jira_client)()
 
-    # 1. Validate ticket exists before doing anything else (matches CLI order).
     ticket_data = jira_client.get_ticket(ticket_id)
     result.add_artifact("jira.ticket_fetched")
     result.extra["ticket_summary"] = ticket_data.get("summary")
 
-    # 2. Worktree. The CLI's plan flow always creates one — even on retry it
-    # short-circuits. We mirror that for parity.
     orchestrator.set_phase(execution_id, "worktree")
     worktree_path = worktree_mgr.create_worktree(ticket_id, project)
     result.add_artifact("git.worktree_created")
@@ -213,7 +183,6 @@ def run_plan(
     if cancel_flag is not None and cancel_flag.is_set():
         raise WorkflowCancelled("plan workflow cancelled after worktree")
 
-    # 3. Plan agent.
     orchestrator.set_phase(execution_id, "planning")
     plan_agent = (plan_agent_factory or PlanGeneratorAgent)()
     plan_agent.attach_events(bus, execution_id)
@@ -260,22 +229,23 @@ def run_execute(
     env_manager_factory: Optional[Callable[..., Any]] = None,
     developer_factory: Optional[Callable[..., Any]] = None,
     reviewer_factory: Optional[Callable[..., Any]] = None,
+    drupal_reviewer_factory: Optional[Callable[..., Any]] = None,
+    post_execute_runner: Optional[Callable[..., Any]] = None,
+    ticket_context_fetcher: Optional[Callable[[str], str]] = None,
 ) -> WorkflowResult:
     """Execute the ``execute`` workflow.
 
-    This is intentionally the *minimum* re-use to make remote runs real:
+    Steps:
 
-    1. Resolve the worktree (must already exist — same as CLI).
-    2. Set up container environment (unless ``--no-env``) — gives parity
-       with the CLI's pre-flight.
-    3. Run the developer agent (Drupal vs Python based on stack profile).
-    4. Run the reviewer agent.
-    5. Mark the metadata so :meth:`WorkflowResult.assert_real_work` passes.
-
-    Side effects beyond that (push, MR ready, Jira comment) currently live
-    in the CLI and the agent code itself; this function exposes its own
-    artifact markers so the worker can detect a no-op even if the further
-    side-effect pieces have not yet been moved here.
+    1. Resolve worktree (must exist).
+    2. Setup container env (unless ``no_env``).
+    3. Iterate developer + security reviewer until approved or budget exhausted.
+    4. For Drupal stacks, run the Drupal reviewer with its own self-fix loop;
+       if its budget runs out the unresolved findings are posted to the MR
+       for human review.
+    5. Push branch, mark MR ready, post decision log + drupal findings,
+       notify Jira — all via the shared ``run_post_execute_side_effects``
+       so the CLI and Command Center cannot drift.
     """
     result = WorkflowResult()
     bus: EventBus = orchestrator.bus
@@ -291,11 +261,11 @@ def run_execute(
     from src.agents.python_developer import PythonDeveloperAgent
     from src.agents.drupal_developer import DrupalDeveloperAgent
     from src.agents.security_reviewer import SecurityReviewerAgent
+    from src.agents.drupal_reviewer import DrupalReviewerAgent
+    from src.core.execution.post_execute import run_post_execute_side_effects
 
     worktree_mgr = (worktree_factory or WorktreeManager)()
 
-    # 1. Resolve worktree. CLI bails when not present; matching that here
-    # avoids running the full agent loop against the wrong tree.
     worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
     if worktree_path is None:
         raise WorkflowError(
@@ -311,7 +281,6 @@ def run_execute(
         )
     result.add_artifact("plan.present")
 
-    # 2. Environment.
     env_mgr = (env_manager_factory or EnvironmentManager)()
     env_info = None
     if not options.no_env:
@@ -320,14 +289,18 @@ def run_execute(
             if env_info and env_info.active:
                 result.add_artifact("env.container_active")
         except RuntimeError as exc:
-            # Mirror CLI behaviour: container failure is fatal in execute.
             raise WorkflowError(
                 f"container setup failed: {exc} — fix the issue or pass "
                 f"no_env=true to skip"
             ) from exc
 
+    iteration = 0
+    dev_result: Dict[str, Any] = {}
+    sec_result: Dict[str, Any] = {}
+    drupal_findings_to_post: Optional[Dict[str, Any]] = None
+    stack_type = ""
+
     try:
-        # 3. Stack-driven developer agent.
         config = get_config()
         project_config = config.get_project_config(project)
         stack_type = project_config.get("stack_type", "")
@@ -345,6 +318,7 @@ def run_execute(
         reviewer = (reviewer_factory or SecurityReviewerAgent)()
         reviewer.attach_events(bus, execution_id)
 
+        approved = False
         for iteration in range(1, options.max_iterations + 1):
             if cancel_flag is not None and cancel_flag.is_set():
                 raise WorkflowCancelled(
@@ -352,7 +326,6 @@ def run_execute(
                 )
             orchestrator.set_phase(execution_id, f"iteration_{iteration}")
 
-            # Developer
             dev_result = developer.run(
                 plan_file=plan_file,
                 worktree_path=worktree_path,
@@ -372,7 +345,19 @@ def run_execute(
                     f"tasks failed; nothing to review"
                 )
 
-            # Reviewer
+            # Config validation gate (e.g. Drupal config sync)
+            config_result = dev_result.get("config_validation") or {}
+            if config_result.get("output") and not config_result.get(
+                "success", True
+            ):
+                if iteration < options.max_iterations:
+                    # Developer will re-attempt next iteration.
+                    continue
+                raise WorkflowError(
+                    "config validation failed after max iterations; "
+                    "config dependencies are broken — manual fix required"
+                )
+
             sec_result = reviewer.run(
                 worktree_path=worktree_path, ticket_id=ticket_id
             )
@@ -385,9 +370,7 @@ def run_execute(
             result.add_artifact(f"agent.{reviewer.agent_name}")
 
             if sec_result.get("approved"):
-                result.extra["iterations"] = iteration
-                result.extra["dev_result"] = dev_result
-                result.extra["sec_result"] = sec_result
+                approved = True
                 break
 
             if iteration >= options.max_iterations:
@@ -395,9 +378,300 @@ def run_execute(
                     f"max iterations ({options.max_iterations}) reached "
                     f"without security approval"
                 )
-        else:  # pragma: no cover — for-loop falls through on zero iterations
+            # else: developer will address feedback on next iteration.
+
+        if not approved:
             raise WorkflowError(
-                "execute workflow ended without running any iteration"
+                "execute workflow ended without security approval"
+            )
+
+        # Drupal reviewer + self-fix loop (only for drupal stacks).
+        if stack_type and stack_type.startswith("drupal"):
+            ticket_description = (
+                ticket_context_fetcher(ticket_id)
+                if ticket_context_fetcher is not None
+                else _safe_fetch_ticket_description(ticket_id)
+            )
+            drupal_attempts = options.max_iterations
+            for drupal_attempt in range(1, drupal_attempts + 1):
+                if cancel_flag is not None and cancel_flag.is_set():
+                    raise WorkflowCancelled(
+                        "execute workflow cancelled during drupal review"
+                    )
+                orchestrator.set_phase(
+                    execution_id, f"drupal_review_{drupal_attempt}"
+                )
+                drupal_reviewer = (
+                    drupal_reviewer_factory or DrupalReviewerAgent
+                )()
+                drupal_reviewer.attach_events(bus, execution_id)
+                drupal_result = drupal_reviewer.run(
+                    worktree_path=worktree_path,
+                    ticket_id=ticket_id,
+                    ticket_description=ticket_description,
+                )
+                orchestrator.record_agent_result(
+                    execution_id, drupal_reviewer.agent_name, drupal_result
+                )
+                result.agent_results[
+                    f"{drupal_reviewer.agent_name}_attempt_{drupal_attempt}"
+                ] = drupal_result
+                result.add_artifact(f"agent.{drupal_reviewer.agent_name}")
+
+                if drupal_result.get("approved"):
+                    break
+
+                if drupal_attempt >= drupal_attempts:
+                    drupal_findings_to_post = drupal_result
+                    result.add_artifact("drupal.findings_unresolved")
+                    break
+
+                # Self-fix: ask developer to address findings.
+                fix_prompt = (
+                    "Fix the following Drupal review findings:\n"
+                    + "\n".join(drupal_result.get("feedback") or [])
+                )
+                orchestrator.set_phase(
+                    execution_id, f"drupal_fix_{drupal_attempt}"
+                )
+                fix_result = developer.run_revision(
+                    ticket_id=ticket_id,
+                    worktree_path=worktree_path,
+                    user_prompt=fix_prompt,
+                )
+                orchestrator.record_agent_result(
+                    execution_id, developer.agent_name, fix_result
+                )
+                result.agent_results[
+                    f"{developer.agent_name}_drupal_fix_{drupal_attempt}"
+                ] = fix_result
+                result.add_artifact("drupal.self_fix_attempted")
+
+        # Post-execute side effects (push, MR ready, comments, jira notify).
+        runner = post_execute_runner or run_post_execute_side_effects
+        post = runner(
+            ticket_id=ticket_id,
+            project=project,
+            worktree_path=Path(worktree_path),
+            iteration=iteration,
+            dev_result=dev_result,
+            sec_result=sec_result,
+            drupal_findings=drupal_findings_to_post,
+            drupal_attempts=options.max_iterations
+            if drupal_findings_to_post is not None
+            else None,
+            force_push=options.force,
+        )
+        result.merge_artifacts(post.artifacts)
+        result.extra["iterations"] = iteration
+        result.extra["dev_result"] = dev_result
+        result.extra["sec_result"] = sec_result
+        result.extra["mr_url"] = post.mr_web_url
+        result.extra["pushed"] = post.pushed
+        result.extra["push_error"] = post.push_error
+        result.extra["mr_marked_ready"] = post.mr_marked_ready
+        result.extra["decision_log_posted"] = post.decision_log_posted
+        result.extra["drupal_findings_posted"] = post.drupal_findings_posted
+        result.extra["jira_notified"] = post.jira_notified
+        if drupal_findings_to_post is not None:
+            result.extra["drupal_findings"] = drupal_findings_to_post
+
+        # If push failed we surface that as a workflow failure so the run is
+        # marked failed rather than green-with-a-warning.
+        if not post.pushed:
+            raise WorkflowError(
+                f"git push failed — the work is committed locally but not on "
+                f"origin: {post.push_error or 'unknown error'}"
+            )
+    finally:
+        if env_info is not None and env_info.active:
+            try:
+                env_mgr.teardown(ticket_id)
+            except Exception:
+                logger.exception("env teardown failed for %s", ticket_id)
+
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Revise workflow (CLI --revise)
+# --------------------------------------------------------------------------- #
+
+
+def run_revise(
+    orchestrator: "Orchestrator",
+    *,
+    ticket_id: str,
+    project: str,
+    options: ExecuteOptions,
+    execution_id: Optional[str] = None,
+    cancel_flag: Any = None,
+    worktree_factory: Optional[Callable[..., Any]] = None,
+    env_manager_factory: Optional[Callable[..., Any]] = None,
+    developer_factory: Optional[Callable[..., Any]] = None,
+    drupal_reviewer_factory: Optional[Callable[..., Any]] = None,
+    post_execute_runner: Optional[Callable[..., Any]] = None,
+    ticket_context_fetcher: Optional[Callable[[str], str]] = None,
+) -> WorkflowResult:
+    """Run the revise flow shared between CLI ``--revise`` and Command Center."""
+    result = WorkflowResult()
+    bus: EventBus = orchestrator.bus
+    if execution_id is None:
+        raise ValueError("run_revise requires execution_id")
+    if cancel_flag is not None and cancel_flag.is_set():
+        raise WorkflowCancelled("revise workflow cancelled before start")
+
+    from src.config_loader import get_config
+    from src.environment_manager import EnvironmentManager
+    from src.worktree_manager import WorktreeManager
+    from src.agents.python_developer import PythonDeveloperAgent
+    from src.agents.drupal_developer import DrupalDeveloperAgent
+    from src.agents.drupal_reviewer import DrupalReviewerAgent
+    from src.core.execution.post_execute import run_post_execute_side_effects
+
+    worktree_mgr = (worktree_factory or WorktreeManager)()
+    worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
+    if worktree_path is None:
+        raise WorkflowError(
+            f"worktree not found for {ticket_id} — run 'sentinel plan' first"
+        )
+    result.add_artifact("git.worktree_resolved")
+
+    config = get_config()
+    project_config = config.get_project_config(project)
+    stack_type = project_config.get("stack_type", "")
+
+    if developer_factory is not None:
+        developer = developer_factory(stack_type=stack_type)
+    elif stack_type and stack_type.startswith("drupal"):
+        developer = DrupalDeveloperAgent()
+    else:
+        developer = PythonDeveloperAgent()
+    developer.attach_events(bus, execution_id)
+
+    env_mgr = (env_manager_factory or EnvironmentManager)()
+    env_info = None
+    if not options.no_env:
+        try:
+            env_info = env_mgr.setup(worktree_path, ticket_id)
+            if env_info and env_info.active:
+                developer.set_environment(env_mgr, ticket_id)
+                result.add_artifact("env.container_active")
+        except RuntimeError as exc:
+            logger.warning(
+                "revise: container setup failed (%s); tests will run on host",
+                exc,
+            )
+
+    drupal_findings_to_post: Optional[Dict[str, Any]] = None
+    try:
+        orchestrator.set_phase(execution_id, "implementing_revision")
+        revision_result = developer.run_revision(
+            ticket_id=ticket_id,
+            worktree_path=worktree_path,
+            user_prompt=options.prompt,
+        )
+        orchestrator.record_agent_result(
+            execution_id, developer.agent_name, revision_result
+        )
+        result.agent_results[developer.agent_name] = revision_result
+        result.add_artifact(f"agent.{developer.agent_name}")
+
+        if revision_result.get("feedback_count", 0) == 0:
+            result.extra["nothing_to_revise"] = True
+            result.add_artifact("revise.no_feedback")
+            return result
+
+        config_result = revision_result.get("config_validation", {}) or {}
+        if config_result.get("output") and not config_result.get(
+            "success", True
+        ):
+            raise WorkflowError(
+                "config validation failed after revision; not pushing"
+            )
+
+        # Drupal reviewer + self-fix on revise.
+        if stack_type and stack_type.startswith("drupal"):
+            ticket_description = (
+                ticket_context_fetcher(ticket_id)
+                if ticket_context_fetcher is not None
+                else _safe_fetch_ticket_description(ticket_id)
+            )
+            for drupal_attempt in range(1, options.max_iterations + 1):
+                if cancel_flag is not None and cancel_flag.is_set():
+                    raise WorkflowCancelled(
+                        "revise workflow cancelled during drupal review"
+                    )
+                orchestrator.set_phase(
+                    execution_id, f"drupal_review_{drupal_attempt}"
+                )
+                drupal_reviewer = (
+                    drupal_reviewer_factory or DrupalReviewerAgent
+                )()
+                drupal_reviewer.attach_events(bus, execution_id)
+                drupal_result = drupal_reviewer.run(
+                    worktree_path=worktree_path,
+                    ticket_id=ticket_id,
+                    ticket_description=ticket_description,
+                )
+                orchestrator.record_agent_result(
+                    execution_id, drupal_reviewer.agent_name, drupal_result
+                )
+                result.agent_results[
+                    f"{drupal_reviewer.agent_name}_attempt_{drupal_attempt}"
+                ] = drupal_result
+                result.add_artifact(f"agent.{drupal_reviewer.agent_name}")
+
+                if drupal_result.get("approved"):
+                    break
+
+                if drupal_attempt >= options.max_iterations:
+                    drupal_findings_to_post = drupal_result
+                    result.add_artifact("drupal.findings_unresolved")
+                    break
+
+                fix_prompt = (
+                    "Fix the following Drupal review findings:\n"
+                    + "\n".join(drupal_result.get("feedback") or [])
+                )
+                orchestrator.set_phase(
+                    execution_id, f"drupal_fix_{drupal_attempt}"
+                )
+                developer.run_revision(
+                    ticket_id=ticket_id,
+                    worktree_path=worktree_path,
+                    user_prompt=fix_prompt,
+                )
+
+        # Post side effects — push + revision log comment.
+        runner = post_execute_runner or run_post_execute_side_effects
+        post = runner(
+            ticket_id=ticket_id,
+            project=project,
+            worktree_path=Path(worktree_path),
+            iteration=1,
+            dev_result=revision_result,
+            sec_result={},
+            drupal_findings=drupal_findings_to_post,
+            drupal_attempts=options.max_iterations
+            if drupal_findings_to_post is not None
+            else None,
+            force_push=options.force,
+            revision_result=revision_result,
+        )
+        result.merge_artifacts(post.artifacts)
+        result.extra["mr_url"] = (
+            post.mr_web_url or revision_result.get("mr_url")
+        )
+        result.extra["pushed"] = post.pushed
+        result.extra["push_error"] = post.push_error
+        result.extra["decision_log_posted"] = post.decision_log_posted
+        result.extra["drupal_findings_posted"] = post.drupal_findings_posted
+
+        if not post.pushed:
+            raise WorkflowError(
+                f"git push failed during revise — work is local only: "
+                f"{post.push_error or 'unknown error'}"
             )
     finally:
         if env_info is not None and env_info.active:
@@ -424,22 +698,13 @@ def run_debrief(
     cancel_flag: Any = None,
     worktree_factory: Optional[Callable[..., Any]] = None,
     debrief_agent_factory: Optional[Callable[[], Any]] = None,
+    jira_factory: Optional[Callable[[], Any]] = None,
 ) -> WorkflowResult:
     """Execute the ``debrief`` workflow."""
     result = WorkflowResult()
     bus: EventBus = orchestrator.bus
     if execution_id is None:
         raise ValueError("run_debrief requires execution_id")
-
-    if options.follow_up_ticket is not None:
-        # Wiring for follow-up tickets is not implemented — we choose to
-        # reject the option rather than silently drop it. This matches the
-        # acceptance criteria: unsupported options must fail validation, not
-        # be honoured-as-no-op.
-        raise WorkflowError(
-            "debrief.follow_up_ticket is not yet supported by the workflow "
-            "engine; remove it or use a CLI-only run for now"
-        )
 
     if cancel_flag is not None and cancel_flag.is_set():
         raise WorkflowCancelled("debrief workflow cancelled before start")
@@ -456,10 +721,9 @@ def run_debrief(
         result.add_artifact("git.worktree_created")
         result.extra["worktree_path"] = str(worktree_path)
     except Exception as exc:
-        # Matches the CLI: debrief degrades to text-only when no codebase
-        # access. Note as an artifact so the run isn't classified as a
-        # no-op even when the worktree step is skipped.
-        logger.warning("debrief: worktree unavailable, continuing text-only: %s", exc)
+        logger.warning(
+            "debrief: worktree unavailable, continuing text-only: %s", exc
+        )
         result.extra["worktree_skipped_reason"] = str(exc)
         result.add_artifact("git.worktree_skipped")
 
@@ -478,7 +742,92 @@ def run_debrief(
     if agent_result.get("action"):
         result.extra["action"] = agent_result["action"]
 
+    # Follow-up ticket creation. The debrief agent surfaces follow-up needs
+    # via ``agent_result["follow_up"]`` (description text) and/or the
+    # caller can specify ``options.follow_up_ticket`` to link to an existing
+    # ticket. We support both.
+    follow_up_payload = agent_result.get("follow_up") or {}
+    if options.follow_up_ticket or follow_up_payload.get("description"):
+        try:
+            jira = (jira_factory or _default_jira_factory)()
+            link_to_existing = options.follow_up_ticket
+            if link_to_existing:
+                # Link the parent ticket to the supplied follow-up via a comment.
+                jira.add_comment(
+                    ticket_id,
+                    (
+                        f"Sentinel debrief: linking follow-up ticket "
+                        f"{link_to_existing}."
+                    ),
+                )
+                result.extra["follow_up_linked_ticket"] = link_to_existing
+                result.add_artifact("debrief.follow_up_linked")
+            else:
+                # Create a new follow-up ticket using the agent's payload.
+                summary = follow_up_payload.get(
+                    "summary", f"Follow-up from debrief on {ticket_id}"
+                )
+                description = follow_up_payload.get("description", "")
+                created = jira.create_ticket(
+                    project_key=project,
+                    summary=summary,
+                    description=description,
+                    issue_type=follow_up_payload.get("issue_type", "Task"),
+                    priority=follow_up_payload.get("priority", "Medium"),
+                )
+                created_key = created.get("key") or created.get("id") or ""
+                result.extra["follow_up_created_ticket"] = created_key
+                result.add_artifact("debrief.follow_up_created")
+                # Link by commenting on the original ticket.
+                if created_key:
+                    try:
+                        jira.add_comment(
+                            ticket_id,
+                            (
+                                f"Sentinel debrief: created follow-up ticket "
+                                f"{created_key}."
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "debrief: failed to comment with follow-up link: %s",
+                            exc,
+                        )
+        except Exception as exc:
+            logger.warning("debrief: follow-up handling failed: %s", exc)
+            result.extra["follow_up_error"] = str(exc)
+            # Don't fail the whole workflow — debrief content is the primary
+            # deliverable. We *do* record a marker so the run isn't classified
+            # as a no-op even when worktree was skipped.
+            result.add_artifact("debrief.follow_up_failed")
+
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _default_jira_factory() -> Any:
+    from src.jira_factory import get_jira_client
+
+    return get_jira_client()
+
+
+def _safe_fetch_ticket_description(ticket_id: str) -> str:
+    """Return ticket summary+description+comments; empty string on failure."""
+    try:
+        from src.jira_factory import get_jira_client
+        from src.ticket_context import TicketContextBuilder
+
+        jira_client = get_jira_client()
+        return TicketContextBuilder(jira_client, ticket_id).format_ticket_context()
+    except Exception as exc:
+        logger.warning(
+            "failed to fetch ticket context for reviewer: %s", exc
+        )
+        return ""
 
 
 # --------------------------------------------------------------------------- #
