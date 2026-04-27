@@ -27,14 +27,15 @@ The dashboard is **read-mostly** today: only `POST /executions`, `cancel`, and `
 
 | CLI feature | Backend surface today | Dashboard surface | Status |
 | --- | --- | --- | --- |
-| `sentinel plan TICKET` | `POST /executions kind=plan` | **Worktree → Plan** action | wired |
-| `sentinel execute TICKET` | `POST /executions kind=execute` | **Worktree → Execute** action | wired |
-| `sentinel debrief TICKET` | `POST /executions kind=debrief` | **Worktree → Debrief** action | wired |
+| `sentinel plan TICKET` | `POST /executions kind=plan` | **Worktree → Plan** action (card-scoped, calls API directly with the card's ticket+kind; `data-testid="worktree-<slug>-start-plan"`) | wired |
+| `sentinel execute TICKET` | `POST /executions kind=execute` | **Worktree → Execute** action (card-scoped) | wired |
+| `sentinel debrief TICKET` | `POST /executions kind=debrief` | **Worktree → Debrief** action (card-scoped) | wired |
 | Cancel a running run | `POST /executions/{id}/cancel` | **Run drawer → Cancel** | wired |
 | Retry a finished run | `POST /executions/{id}/retry` | **Run drawer → Retry** | wired |
 | Live event tail | `WS /executions/{id}/stream` | **Run drawer → Live tail** | wired |
 | Cost & duration | `cost_cents`, `started_at`, `ended_at` on `ExecutionOut` | **KPIs, run rows** | wired |
-| Worktree create / cleanup | CLI-only (`WorktreeManager`) | "coming soon" disabled actions, list view shows worktrees inferred from `executions.project + ticket_id` | partial |
+| Worktree create / cleanup | CLI-only (`WorktreeManager`) | Per-card `Reset…` / `Delete…` buttons open an explanatory `UnavailableActionDialog` with the planned route + CLI fallback. List view still derives worktrees from `(project, ticket_id)` rows. | partial — affordances visible, action not wired |
+| GitLab MR posting on plan/debrief | CLI flow only (`src/cli.py` + `plan_generator.py`); the service orchestrator skips it | Run drawer renders a "Plan artifact" / "Debrief" card with a `gitlab-not-posted-notice` explaining the constraint and pointing at the CLI fallback | not wired (intentionally) |
 | Jira / GitLab tickets | CLI-only | "coming soon" inbox panel | not wired |
 | Reset / cleanup all | CLI-only | "coming soon" admin action | not wired |
 | Config view | YAML on disk | "coming soon" read-only panel | not wired |
@@ -218,7 +219,7 @@ Errors:
 
 Each is rendered as a clearly-labelled placeholder that does **not** call any nonexistent endpoint. They are the product roadmap for the next dashboard waves. Priority annotations come from the PPLX cross-reference (§16 of the report — "Sentinel CLI Feature Checklist Cross-Reference").
 
-1. **Worktree CRUD** — create / delete / reset worktrees from the UI (today: CLI only). *PPLX §16.2: must back with type-to-confirm on destroy.*
+1. **Worktree CRUD** — create / delete / reset worktrees from the UI (today: CLI only). *PPLX §16.2: must back with type-to-confirm on destroy.* The UI now ships per-card `Reset…` / `Delete…` buttons that open an `UnavailableActionDialog` describing the planned route (`POST /worktrees/{slug}/reset`, `DELETE /worktrees/{slug}`) and the CLI fallback. When the backend lands those routes, swap the dialog for a `ConfirmDialog` with `typeToConfirm` per PPLX §16.2.
 2. **Ticket inbox** — Jira / GitLab proxy showing assigned tickets and quick "Plan it". *PPLX §16.1: maps to the "list jobs / queue" surface.*
 3. **Compose container view** — show child appserver containers per execution (read from supervisor metadata once exposed). *PPLX §16.4: resource utilization gauges.*
 4. **Cost analytics** — daily/weekly cost-by-project chart with top-N tickets. *PPLX §3.4: line/bar selection per question type.*
@@ -267,6 +268,16 @@ Seven iteration passes were run against this spec and the implementation. Full c
 - Confirmed no backend file under `src/` was modified (`git status -s -- src/` clean — only new files under `dashboard/` and `docs/dashboard/`).
 - Confirmed Python tests still pass shape-wise (no Python files touched).
 - **Result:** Branch `v2/command-center-ui` is buildable, types check, no backend drift. See VALIDATION.md for command logs.
+
+### Pass 8 — User-feedback fix-up (2026-04-27)
+
+User feedback after the close-the-gap landed flagged three real issues. None of them were backend bugs; all three were dashboard-side miswirings or missing affordances that left the user wondering whether they were calling broken endpoints.
+
+1. **Card action buttons were opening a generic "New run" modal regardless of the kind clicked.** Root cause: `StartRunDialog` initialised its `kind` state from `useState<ExecutionKind>("plan")` and ignored any preset, and `Worktrees.tsx` opened the dialog instead of calling `POST /executions` directly. Fix: `StartRunDialog` now accepts `presetKind` (and resets state on every open), and `Worktrees.tsx` calls `api.startExecution` directly when the user clicks `Plan` / `Execute` / `Debrief` on a card — using the card's already-known ticket+project+kind. The dialog is reserved for the toolbar **New run** button (where the user actually needs to type a ticket). Falls back to opening the dialog if the backend rejects the preset with HTTP 422.
+2. **Missing worktree reset/delete affordances.** Root cause: backend has no `WorktreeManager` HTTP CRUD; previous UI hid the affordance entirely. Fix: each card now ships a `Manage worktree` row with `Reset…` and `Delete…` buttons (testids `worktree-<slug>-reset` / `worktree-<slug>-delete`). They open a dedicated `UnavailableActionDialog` that names the target slug, the planned route, and the CLI fallback — instead of pretending to call an endpoint that doesn't exist.
+3. **No GitLab plan/debrief output anywhere.** Root cause: the service orchestrator deliberately omits the CLI's GitLab MR side-effects (see `src/core/execution/orchestrator.py` module docstring). The dashboard previously didn't surface this, so users assumed the run had silently failed to post. Fix: the run drawer now renders a **Plan artifact** / **Debrief** card (only for `kind=plan|debrief`) with a `gitlab-not-posted-notice` block explaining the constraint and pointing at the CLI fallback. Debrief turns are summarised inline from the existing `debrief.turn` event payloads.
+
+Reverified zero backend changes (`src/`, `tests/`, `docker-compose.yml`, `pyproject.toml`, `poetry.lock`, `Dockerfile`). Only `dashboard/src/**` and `docs/dashboard/*` were touched.
 
 ### Pass 7 — Close-the-gap reconciliation
 

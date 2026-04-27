@@ -189,8 +189,9 @@ The previous "not yet emitted (G-04)" caveat is RESOLVED for these six types. Th
 
 These features are required by an admin dashboard but are not in the current API. The dashboard must surface them as disabled, empty, mocked-static, or "coming soon":
 
-- **Worktree directory** (`/worktrees`) — `WorktreeManager` is CLI-side only. No HTTP CRUD for worktrees, branches, or compose projects.
+- **Worktree directory** (`/worktrees`) — `WorktreeManager` is CLI-side only. No HTTP CRUD for worktrees, branches, or compose projects. **Specifically, there is no `POST /worktrees/{slug}/reset` and no `DELETE /worktrees/{slug}`**; the dashboard renders per-card `Reset…` and `Delete…` affordances that open an explanatory dialog (`worktree-reset-unavailable` / `worktree-delete-unavailable` testids) and surface the CLI fallback (`sentinel reset <ticket>`, `git worktree remove`).
 - **Tickets** (`/tickets`) — Jira/GitLab integrations are CLI-side; no proxied list endpoint.
+- **GitLab merge-request side-effects on `POST /executions`** — the orchestrator (`src/core/execution/orchestrator.py`) deliberately omits the CLI's GitLab MR creation / comment posting. Plan and debrief runs started from the dashboard **do not create or update merge requests, and do not comment on existing ones.** The drawer renders a "Plan artifact" / "Debrief" card with an explicit `gitlab-not-posted-notice` block that surfaces this and points users to the CLI (`sentinel plan TICKET`, `sentinel debrief TICKET`) when they need GitLab posting.
 - **Compose / container introspection** — supervisor cleans up containers via `docker compose down`, but does not expose container state.
 - **Service-level metrics** — no `/metrics`, no aggregated cost/cost-by-day, no token-usage counters.
 - **Auth / users** — single shared bearer token; no users, roles, or sessions endpoint.
@@ -210,4 +211,4 @@ These features are required by an admin dashboard but are not in the current API
 
 ---
 
-*End of contract — v0.3 (close-the-gap reconciled, HEAD `4b742cc`), 2026-04-27.*
+*End of contract — v0.3.1 (close-the-gap reconciled, HEAD `4b742cc`; UI-fixes pass clarifying GitLab-posting absence and per-card reset/delete affordances), 2026-04-27.*

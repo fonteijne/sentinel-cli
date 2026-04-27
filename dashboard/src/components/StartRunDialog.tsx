@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, makeIdempotencyKey } from "../api";
 import type { ExecutionKind } from "../types";
 
@@ -8,6 +8,7 @@ interface Props {
   token: string;
   presetTicket?: string;
   presetProject?: string;
+  presetKind?: ExecutionKind;
   onClose: () => void;
   onCreated: (executionId: string) => void;
 }
@@ -20,17 +21,33 @@ export function StartRunDialog({
   token,
   presetTicket,
   presetProject,
+  presetKind,
   onClose,
   onCreated,
 }: Props) {
   const [ticket, setTicket] = useState(presetTicket ?? "");
   const [project, setProject] = useState(presetProject ?? "");
-  const [kind, setKind] = useState<ExecutionKind>("plan");
+  const [kind, setKind] = useState<ExecutionKind>(presetKind ?? "plan");
   const [revise, setRevise] = useState(false);
   const [maxTurns, setMaxTurns] = useState<string>("");
   const [followUp, setFollowUp] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Reset form fields whenever the dialog (re)opens with new presets so a
+  // second click on a different card / kind doesn't carry stale state from a
+  // previous open. Without this, switching between Plan and Execute on the
+  // same card was a no-op because `useState`'s initialiser only runs once.
+  useEffect(() => {
+    if (!open) return;
+    setTicket(presetTicket ?? "");
+    setProject(presetProject ?? "");
+    setKind(presetKind ?? "plan");
+    setRevise(false);
+    setMaxTurns("");
+    setFollowUp("");
+    setError(null);
+    setBusy(false);
+  }, [open, presetTicket, presetProject, presetKind]);
 
   if (!open) return null;
   const ticketOk = TICKET_RE.test(ticket);
@@ -125,6 +142,7 @@ export function StartRunDialog({
               {(["plan", "execute", "debrief"] as ExecutionKind[]).map((k) => (
                 <button
                   key={k}
+                  data-testid={`start-run-kind-${k}`}
                   className={`seg ${kind === k ? "active" : ""}`}
                   onClick={() => setKind(k)}
                   type="button"

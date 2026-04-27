@@ -1,6 +1,6 @@
 # Dashboard validation log
 
-Eight passes have been run against the spec and the implementation on branch `v2/command-center-ui`. The reference branch was re-pinned in Pass 7 from `v2/command-center` (HEAD `37a30b0`) to `v2/command-center-close-the-gap` (HEAD `4b742cc`). Pass 8 ships the dashboard as a profile-gated service in the existing `docker-compose.yml`. This log is the authoritative record referenced by `SETUP_AND_SPEC.md` §12.
+Nine passes have been run against the spec and the implementation on branch `v2/command-center-ui`. The reference branch was re-pinned in Pass 7 from `v2/command-center` (HEAD `37a30b0`) to `v2/command-center-close-the-gap` (HEAD `4b742cc`). Pass 8 ships the dashboard as a profile-gated service in the existing `docker-compose.yml`. Pass 9 fixes three user-feedback issues: card action buttons not honoring kind, missing worktree reset/delete affordances, and the "no GitLab plan/debrief" silence. This log is the authoritative record referenced by `SETUP_AND_SPEC.md` §12.
 
 ---
 
@@ -258,6 +258,73 @@ The Docker CLI was not available in the agent sandbox, so YAML structure was ver
 - The Traefik label set assumes the bundled `traefik` profile (or a BYO Traefik on `sentinel-edge`). Without one, the dashboard is reachable only on `127.0.0.1:5174`, which is the intended default.
 
 **Result:** dashboard is a first-class compose service. ✅
+
+---
+
+## Pass 9 — User-feedback fix-up (2026-04-27)
+
+**Goal:** address three concrete issues a user hit on the close-the-gap UI:
+1. Card action buttons (`Plan` / `Execute` / `Debrief` on a worktree card) opened the generic "New run" modal with `kind` always defaulting to `plan` — i.e. the buttons did not action the card's ticket.
+2. No way to reset or delete a worktree from the dashboard, with no UI hint that this was a backend gap.
+3. "No GitLab plan or debrief output anywhere" — runs from the dashboard never produced an MR or comment, and the UI didn't say so.
+
+**Backend audit:**
+- Re-read `src/service/routes/{executions,commands,stream}.py` — confirmed only `POST /executions`, `cancel`, `retry` exist as write verbs (no `/worktrees/*`, no GitLab proxy).
+- Read `src/core/execution/orchestrator.py` — its docstring explicitly says the orchestrator skips the CLI's GitLab MR side-effects ("the existing CLI flows … keep their incidental side-effects (git push, GitLab MR updates, Jira comments, container setup/teardown) inline in `src.cli`"). The dashboard observes this orchestrator only; the GitLab side-effects in `src/agents/plan_generator.py` and `src/agents/base_developer.py` are reachable from the CLI, not from the service.
+- Re-read `src/core/events/types.py` — no event payload carries an MR URL or GitLab artifact, so there is nothing for the UI to "render" beyond stating the absence.
+
+**Conclusion:** the three issues are dashboard-side miswirings or missing affordances. No backend endpoint can be invented, and per the task brief, no Python/FastAPI/orchestrator code is touched in this pass.
+
+**Files changed (UI + docs only):**
+
+```
+$ git diff --stat origin/v2/command-center-ui... -- src/ tests/ pyproject.toml poetry.lock Dockerfile docker-compose.yml
+(empty — zero backend drift)
+
+$ git diff --stat origin/v2/command-center-ui...
+ dashboard/src/components/StartRunDialog.tsx |  ~ presetKind + reset effect + testids
+ dashboard/src/components/WorktreeCard.tsx   |  ~ pendingKind + Reset/Delete row + testids
+ dashboard/src/components/RunDrawer.tsx      |  + Plan-artifact / Debrief card + GitLab notice
+ dashboard/src/pages/Worktrees.tsx           |  ~ direct API call from card + UnavailableActionDialog
+ docs/dashboard/API_CONTRACT.md              |  ~ §4 worktree CRUD + GitLab posting clarifications
+ docs/dashboard/SETUP_AND_SPEC.md            |  ~ §2 wiring table + §11 worktree CRUD note + §12 Pass 8 entry
+ docs/dashboard/VALIDATION.md                |  ~ Pass 9 entry
+```
+
+**Fix details:**
+
+- **Issue 1 (card buttons trigger generic modal).** Root cause: `StartRunDialog` initialised `kind` once via `useState<ExecutionKind>("plan")` and never re-read presets, so the `presetKind` plumbing alone was insufficient. Plus, opening a modal at all is wrong when the card already has the ticket+project+kind. Fix: `StartRunDialog` now accepts `presetKind`, and a `useEffect` resets all form state on each `open` transition. `Worktrees.tsx` was changed to call `api.startExecution` directly when a card button is clicked (with `Idempotency-Key`) and only fall back to the dialog on HTTP 422. The dialog is reserved for the toolbar **New run** button.
+- **Issue 2 (worktree reset/delete missing).** Root cause: backend has no `WorktreeManager` HTTP CRUD; UI hid the action entirely. Fix: each card now renders a `Manage worktree` row with `Reset…` / `Delete…` buttons (testids `worktree-<slug>-reset` / `worktree-<slug>-delete`). They open `UnavailableActionDialog` with the planned route and the CLI fallback. The component is named so a future PR can swap it for a real `ConfirmDialog` with `typeToConfirm` once `POST /worktrees/{slug}/reset` and `DELETE /worktrees/{slug}` exist server-side.
+- **Issue 3 (no GitLab plan/debrief output).** Fix: run drawer renders a **Plan artifact** / **Debrief** card for `kind=plan|debrief` runs with a `gitlab-not-posted-notice` block (testid `gitlab-not-posted-notice`) explaining the orchestrator does not post to GitLab and pointing at the CLI fallback (`sentinel plan TICKET` / `sentinel debrief TICKET`). Debrief turns are summarised inline from existing `debrief.turn` events.
+
+**Verification:**
+
+```bash
+$ cd dashboard && npm install --no-audit --no-fund
+added 68 packages
+$ npm run typecheck
+> tsc --noEmit
+(no output — clean)
+$ npm run build
+> tsc -b && vite build
+✓ built in 1.36s — dashboard/dist/ produced (212.78 kB JS, 18.32 kB CSS)
+```
+
+**No-backend-drift check:**
+
+```bash
+$ git diff --stat origin/v2/command-center-ui... -- src/ tests/ pyproject.toml poetry.lock Dockerfile docker-compose.yml
+(empty)
+```
+
+**Storage check:** no new `localStorage` / `sessionStorage` paths introduced; the splash screen's existing `sessionStorage` (token) and `localStorage` (API base URL) usage is unchanged.
+
+**Limitations:**
+- The Reset / Delete buttons remain non-functional by design — they tell the user *why* and how to do the action via CLI, but they cannot reset or delete a worktree until a backend endpoint exists. That backend work is explicitly out of scope for this pass.
+- The "Plan artifact" card surfaces the *absence* of GitLab posting; it does not back-fill posting via a separate code path. Wiring GitLab posting into the service orchestrator is a backend project, not a dashboard one.
+- No live browser walkthrough was performed (no display in the agent sandbox); the build + typecheck are the validation gates this pass.
+
+**Result:** the three reported issues are addressed without backend changes, and the docs no longer overclaim what the dashboard does. ✅
 
 ---
 

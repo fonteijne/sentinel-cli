@@ -79,6 +79,15 @@ export function RunDrawer({
     });
   }, [events]);
 
+  const debriefTurns = useMemo(
+    () => events.filter((e) => e.type === "debrief.turn"),
+    [events]
+  );
+  const revisionRequests = useMemo(
+    () => events.filter((e) => e.type === "revision.requested"),
+    [events]
+  );
+
   useEffect(() => {
     refresh();
     const onKey = (e: KeyboardEvent) => {
@@ -341,6 +350,134 @@ export function RunDrawer({
                   )}
                 </div>
               </div>
+
+              {(exec.kind === "plan" || exec.kind === "debrief") && (
+                <div className="card" data-testid="plan-debrief-artifact-card">
+                  <div className="card-head">
+                    <div className="card-title">
+                      {exec.kind === "plan" ? "Plan artifact" : "Debrief"}
+                    </div>
+                    <span
+                      className="muted"
+                      style={{ fontSize: "var(--fs-xs)" }}
+                    >
+                      {exec.kind === "debrief"
+                        ? `${debriefTurns.length} turns · ${revisionRequests.length} revision requests`
+                        : `${agentResults.length} agent result(s)`}
+                    </span>
+                  </div>
+                  <div className="card-body stack-3">
+                    <div
+                      className="alert"
+                      data-testid="gitlab-not-posted-notice"
+                      role="status"
+                      style={{
+                        background: "var(--surface-2)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text-muted)",
+                        padding: "var(--space-3)",
+                        borderRadius: "var(--radius-md)",
+                        fontSize: "var(--fs-sm)",
+                      }}
+                    >
+                      <div className="inline-2">
+                        <Icon name="alert" size={14} />
+                        <strong style={{ color: "var(--text)" }}>
+                          Not posted to GitLab from this surface
+                        </strong>
+                      </div>
+                      <div style={{ marginTop: 4, fontSize: "var(--fs-xs)" }}>
+                        The Command Center service runs the orchestrator
+                        without the CLI's GitLab side-effects. No merge
+                        request is created, updated, or commented on by{" "}
+                        <code className="font-mono">POST /executions</code>.
+                        To post the {exec.kind} to GitLab, run{" "}
+                        <code className="font-mono">
+                          sentinel {exec.kind} {exec.ticket_id}
+                        </code>{" "}
+                        from a host with VPN + GitLab credentials.
+                      </div>
+                    </div>
+                    {exec.kind === "debrief" && debriefTurns.length === 0 && (
+                      <EmptyState
+                        icon="msg"
+                        title="No debrief turns yet"
+                        description="Debrief turns surface here once the orchestrator emits `debrief.turn`. Older runs may not have produced any."
+                      />
+                    )}
+                    {exec.kind === "debrief" && debriefTurns.length > 0 && (
+                      <div className="stack-2" data-testid="debrief-turns-list">
+                        {debriefTurns.map((ev) => {
+                          const p = (ev.payload ?? {}) as Record<
+                            string,
+                            unknown
+                          >;
+                          const turnIndex =
+                            typeof p.turn_index === "number"
+                              ? p.turn_index
+                              : "?";
+                          const promptChars =
+                            typeof p.prompt_chars === "number"
+                              ? p.prompt_chars
+                              : null;
+                          const responseChars =
+                            typeof p.response_chars === "number"
+                              ? p.response_chars
+                              : null;
+                          return (
+                            <div
+                              key={ev.seq}
+                              className="inline-3"
+                              style={{
+                                padding: "var(--space-2) var(--space-3)",
+                                background: "var(--surface-2)",
+                                borderRadius: "var(--radius-sm)",
+                                border: "1px solid var(--border)",
+                                fontSize: "var(--fs-sm)",
+                              }}
+                            >
+                              <Badge tone="primary">
+                                turn {String(turnIndex)}
+                              </Badge>
+                              <span
+                                className="muted"
+                                style={{
+                                  flex: 1,
+                                  fontSize: "var(--fs-xs)",
+                                }}
+                              >
+                                {promptChars !== null
+                                  ? `${promptChars} prompt chars`
+                                  : "(no prompt size)"}
+                                {" · "}
+                                {responseChars !== null
+                                  ? `${responseChars} response chars`
+                                  : "(no response size)"}
+                              </span>
+                              <span
+                                className="font-mono subtle"
+                                style={{
+                                  fontSize: "var(--fs-xs)",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {fmtRelative(ev.ts)}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {exec.kind === "plan" && agentResults.length === 0 && (
+                      <EmptyState
+                        icon="rocket"
+                        title="Plan output not yet recorded"
+                        description="Once the plan agent finishes, its structured result lands in `agent_results` and renders below. Live progress is in the event stream."
+                      />
+                    )}
+                  </div>
+                </div>
+              )}
 
               <div className="card">
                 <div className="card-head">

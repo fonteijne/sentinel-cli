@@ -8,7 +8,7 @@ import { Icon } from "../icons";
 import { navigate } from "../routes";
 import type { ExecutionKind, ExecutionOut, Worktree } from "../types";
 import { bucketDot, bucketLabel, deriveWorktrees } from "../utils";
-import { api, ApiError } from "../api";
+import { api, ApiError, makeIdempotencyKey } from "../api";
 
 interface Props {
   baseUrl: string;
@@ -32,6 +32,16 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
     id: string;
     ticket: string;
   } | null>(null);
+  // "coming soon" reset / delete affordances. Backend has no HTTP CRUD for
+  // worktrees yet (`WorktreeManager` is CLI-only — see API_CONTRACT §4),
+  // so we surface the intent with an explanatory disabled-state modal
+  // instead of pretending to call an endpoint that doesn't exist.
+  const [resetRequest, setResetRequest] = useState<{ slug: string } | null>(
+    null
+  );
+  const [deleteRequest, setDeleteRequest] = useState<{ slug: string } | null>(
+    null
+  );
   const [error, setError] = useState<string | null>(null);
 
   const filtered = filter
@@ -51,8 +61,59 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
   };
   for (const w of filtered) grouped[w.bucket].push(w);
 
-  const startKind = async (kind: ExecutionKind, ticket?: string, project?: string) => {
-    setStartWith({ ticket, project, kind });
+  // Track which card+kind action is currently submitting so we can disable
+  // its button and keep clicks idempotent. Keyed by `${slug}::${kind}`.
+  const [pendingCardAction, setPendingCardAction] = useState<string | null>(
+    null
+  );
+
+  // Card action → operates on the selected ticket directly via the same
+  // `POST /executions` the dialog would call, with the card's kind preset.
+  // No second modal: the user already chose ticket+kind by clicking the
+  // button on the card. If the ticket somehow fails the backend pattern
+  // we fall back to the dialog so the user can fix it.
+  const startKindFromCard = async (
+    wt: Worktree,
+    kind: ExecutionKind
+  ): Promise<void> => {
+    const key = `${wt.slug}::${kind}`;
+    if (pendingCardAction === key) return;
+    setPendingCardAction(key);
+    setError(null);
+    try {
+      const created = await api.startExecution(
+        { baseUrl, token },
+        {
+          ticket_id: wt.ticket_id,
+          project: wt.project || undefined,
+          kind,
+        },
+        makeIdempotencyKey()
+      );
+      onChanged();
+      navigate("executions", created.id);
+    } catch (e) {
+      if (e instanceof ApiError) {
+        // 422 from the backend means our preset failed validation — fall
+        // back to the manual dialog so the user can correct it instead of
+        // burying the error in a toast.
+        if (e.status === 422) {
+          setStartWith({
+            ticket: wt.ticket_id,
+            project: wt.project,
+            kind,
+          });
+        } else {
+          setError(
+            `Start ${kind} failed: HTTP ${e.status} ${e.detail ?? ""}`.trim()
+          );
+        }
+      } else if (e instanceof Error) {
+        setError(`Start ${kind} failed: ${e.message}`);
+      }
+    } finally {
+      setPendingCardAction(null);
+    }
   };
 
   const cancel = async (id: string) => {
@@ -109,16 +170,20 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
 
       <div
         className="card"
+        data-testid="worktree-crud-banner"
         style={{ background: "var(--surface-2)", padding: "var(--space-3) var(--space-4)" }}
       >
         <div className="inline-3 muted" style={{ fontSize: "var(--fs-sm)" }}>
           <Icon name="alert" size={14} />
           <span>
-            Worktree CRUD (create / delete / reset) is{" "}
+            Worktree <strong>create / reset / delete</strong> is{" "}
             <Badge tone="warning" dot>
               coming soon
             </Badge>{" "}
-            — today, worktrees are derived from executed tickets.
+            — today, worktrees are derived from executed tickets and
+            <code className="font-mono"> WorktreeManager </code>
+            is CLI-only. Each card has reset / delete affordances that
+            explain the constraint.
           </span>
         </div>
       </div>
@@ -171,14 +236,21 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
                 <WorktreeCard
                   key={w.slug}
                   wt={w}
+                  pendingKind={
+                    pendingCardAction?.startsWith(`${w.slug}::`)
+                      ? (pendingCardAction.split("::")[1] as ExecutionKind)
+                      : null
+                  }
                   onOpen={() => w.latest && navigate("executions", w.latest.id)}
-                  onStart={(k) => startKind(k, w.ticket_id, w.project)}
+                  onStart={(k) => startKindFromCard(w, k)}
                   onCancel={() => {
                     if (w.latest) {
                       setConfirmCancel({ id: w.latest.id, ticket: w.ticket_id });
                     }
                   }}
                   onRetry={() => w.latest && retry(w.latest.id)}
+                  onResetRequest={() => setResetRequest({ slug: w.slug })}
+                  onDeleteRequest={() => setDeleteRequest({ slug: w.slug })}
                 />
               ))}
             </div>
@@ -192,6 +264,7 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
         token={token}
         presetTicket={startWith?.ticket}
         presetProject={startWith?.project}
+        presetKind={startWith?.kind}
         onClose={() => setStartWith(null)}
         onCreated={(id) => {
           setStartWith(null);
@@ -210,6 +283,134 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
         onConfirm={() => confirmCancel && cancel(confirmCancel.id)}
         onCancel={() => setConfirmCancel(null)}
       />
+
+      <UnavailableActionDialog
+        open={!!resetRequest}
+        title="Reset worktree — backend support required"
+        slug={resetRequest?.slug ?? null}
+        action="reset"
+        plannedRoute="POST /worktrees/{slug}/reset"
+        cliFallback="sentinel reset <ticket>"
+        onClose={() => setResetRequest(null)}
+      />
+      <UnavailableActionDialog
+        open={!!deleteRequest}
+        title="Delete worktree — backend support required"
+        slug={deleteRequest?.slug ?? null}
+        action="delete"
+        plannedRoute="DELETE /worktrees/{slug}"
+        cliFallback="git worktree remove <path> && rm -rf <worktree-dir>"
+        onClose={() => setDeleteRequest(null)}
+      />
+    </div>
+  );
+}
+
+/**
+ * Dialog explaining why a destructive worktree action is not yet available.
+ * The dashboard intentionally refuses to invent endpoints: the only mutating
+ * routes today are `POST /executions`, `cancel`, and `retry`. When/if a
+ * `WorktreeManager` HTTP surface lands, we'll replace this with a real
+ * type-to-confirm `ConfirmDialog` wired to the new endpoint.
+ */
+function UnavailableActionDialog({
+  open,
+  title,
+  slug,
+  action,
+  plannedRoute,
+  cliFallback,
+  onClose,
+}: {
+  open: boolean;
+  title: string;
+  slug: string | null;
+  action: "reset" | "delete";
+  plannedRoute: string;
+  cliFallback: string;
+  onClose: () => void;
+}) {
+  if (!open) return null;
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="worktree-unavailable-title"
+      data-testid={`worktree-${action}-unavailable`}
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(20,23,38,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 60,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card"
+        style={{ width: 460, maxWidth: "94vw", boxShadow: "var(--shadow-xl)" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="card-head">
+          <div id="worktree-unavailable-title" className="card-title">
+            {title}
+          </div>
+        </div>
+        <div className="card-body stack-3">
+          <div className="muted" style={{ fontSize: "var(--fs-sm)" }}>
+            The Sentinel service does not expose any worktree CRUD endpoint
+            yet. <code className="font-mono">WorktreeManager</code> lives in
+            the CLI process, so the dashboard cannot {action} a worktree from
+            the browser without a backend change.
+          </div>
+          {slug && (
+            <div
+              style={{
+                fontSize: "var(--fs-xs)",
+                background: "var(--surface-2)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-sm)",
+                padding: "var(--space-2) var(--space-3)",
+              }}
+            >
+              <div className="eyebrow">Target worktree</div>
+              <code className="font-mono">{slug}</code>
+            </div>
+          )}
+          <div className="stack-2">
+            <div className="eyebrow">When wired up</div>
+            <code
+              className="font-mono"
+              style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}
+            >
+              {plannedRoute}
+            </code>
+          </div>
+          <div className="stack-2">
+            <div className="eyebrow">Out-of-band today</div>
+            <code
+              className="font-mono"
+              style={{ fontSize: "var(--fs-xs)", color: "var(--text-muted)" }}
+            >
+              {cliFallback}
+            </code>
+          </div>
+        </div>
+        <div
+          className="card-foot"
+          style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}
+        >
+          <button
+            className="btn btn-secondary btn-sm"
+            onClick={onClose}
+            data-testid={`worktree-${action}-unavailable-dismiss`}
+          >
+            Got it
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
