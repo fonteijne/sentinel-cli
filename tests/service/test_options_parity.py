@@ -176,3 +176,101 @@ def test_debrief_rejects_revise(client):
         },
     )
     assert resp.status_code == 422
+
+
+# -------------------------------------------------- explanatory error shape
+
+
+def test_plan_with_ui_default_options_returns_explanatory_422(client):
+    """The exact payload the dashboard used to send for a plan run before
+    the dialog was made kind-aware. The response must:
+
+    1. Be a structured object — not a raw multi-line pydantic dump as
+       ``detail``-as-string.
+    2. Name the rejected fields and the selected kind.
+    3. List the allowed options for that kind so the operator (and the
+       dashboard's error UI) can fix the call without reading source.
+    """
+    resp = client.post(
+        "/executions",
+        json={
+            "ticket_id": "COE_JIRATESTAI-2352",
+            "kind": "plan",
+            "options": {
+                "revise": False,
+                "max_turns": 5,
+                "follow_up_ticket": None,
+            },
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    body = resp.json()
+    detail = body["detail"]
+    # Must be the structured shape, not the legacy raw-string blob.
+    assert isinstance(detail, dict), detail
+    assert detail["kind"] == "plan"
+    assert set(detail["rejected_options"]) == {
+        "revise",
+        "max_turns",
+        "follow_up_ticket",
+    }
+    # ``allowed_options`` reflects the actual PlanOptions field surface.
+    assert set(detail["allowed_options"]) == {"force", "prompt"}
+    # Single-sentence summary mentions the kind and at least one offender.
+    assert "kind='plan'" in detail["message"]
+    assert "revise" in detail["message"]
+
+
+def test_invalid_option_value_keeps_helpful_error(client):
+    """Direct value error (out-of-range int) must still produce a clean
+    detail object — not a multi-line pydantic dump."""
+    resp = client.post(
+        "/executions",
+        json={
+            "ticket_id": "PROJ-1",
+            "project": "proj",
+            "kind": "execute",
+            "options": {"max_iterations": 9999},
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert isinstance(detail, dict), detail
+    assert detail["kind"] == "execute"
+    # The bad value isn't an "extra" field — it just fails range validation.
+    # We surface it via the ``errors`` list and the message.
+    assert "max_iterations" in detail["message"]
+    assert detail["allowed_options"]  # always populated
+
+
+def test_execute_full_remote_parity_still_persists(client):
+    """Regression guard: the explanatory-error refactor must not change the
+    happy-path persisted shape for a fully-loaded execute payload (the
+    surface the CLI's ``--remote`` path forwards).
+    """
+    resp = client.post(
+        "/executions",
+        json={
+            "ticket_id": "PROJ-1",
+            "project": "proj",
+            "kind": "execute",
+            "options": {
+                "revise": True,
+                "force": True,
+                "no_env": True,
+                "max_iterations": 4,
+                "max_turns": 25,
+                "prompt": "p",
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    values = resp.json()["metadata"]["options"]["values"]
+    assert values == {
+        "revise": True,
+        "force": True,
+        "no_env": True,
+        "max_iterations": 4,
+        "max_turns": 25,
+        "prompt": "p",
+    }

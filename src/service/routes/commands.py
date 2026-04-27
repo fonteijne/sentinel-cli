@@ -20,7 +20,7 @@ from typing import Annotated, Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from src.core.execution.models import ExecutionKind, ExecutionStatus
 from src.core.execution.options import (
@@ -82,6 +82,68 @@ _OPTIONS_BY_KIND = {
 }
 
 
+def _allowed_options_for(cls) -> list[str]:  # type: ignore[no-untyped-def]
+    """Field names declared on a :class:`WorkflowOptions` subclass — used in
+    422 messages so the operator can see which flags the selected ``kind``
+    actually accepts. Sorted for deterministic output.
+    """
+    return sorted(cls.model_fields.keys())
+
+
+def _build_options_error_detail(
+    kind: ExecutionKind, cls, exc: ValidationError  # type: ignore[no-untyped-def]
+) -> Dict[str, Any]:
+    """Turn a pydantic ``ValidationError`` against a kind-specific options
+    model into an explanatory 422 detail.
+
+    The historical message was the raw ``str(exc)`` — a multi-line dump of
+    pydantic internals which surfaced verbatim in the dashboard. Operators
+    couldn't tell at a glance *which* fields were wrong or what was allowed
+    instead, so they ended up reading the source. This helper keeps the
+    machine-readable ``errors`` list (so future tooling can drill in) while
+    leading with a single human sentence that names the offending fields,
+    the selected kind, and the allowed-for-this-kind options.
+    """
+    pyd_errors = exc.errors()
+    bad_fields: list[str] = []
+    other_messages: list[str] = []
+    for err in pyd_errors:
+        loc = err.get("loc") or ()
+        # ``loc`` for an ``extra_forbidden`` error is the field name; for a
+        # type/value error on a known field it's also the field name.
+        field = str(loc[0]) if loc else ""
+        if err.get("type") == "extra_forbidden":
+            if field:
+                bad_fields.append(field)
+        else:
+            msg = err.get("msg", "validation error")
+            other_messages.append(f"{field}: {msg}" if field else msg)
+
+    allowed = _allowed_options_for(cls)
+    parts: list[str] = []
+    if bad_fields:
+        parts.append(
+            f"options {sorted(set(bad_fields))} are not valid for "
+            f"kind={kind.value!r}"
+        )
+    if other_messages:
+        parts.append("; ".join(other_messages))
+    if not parts:
+        # Fallback — pydantic surfaced something we didn't categorise.
+        parts.append("invalid options")
+
+    message = ". ".join(parts)
+    return {
+        "message": (
+            f"{message}. Allowed options for kind={kind.value!r}: {allowed}."
+        ),
+        "kind": kind.value,
+        "allowed_options": allowed,
+        "rejected_options": sorted(set(bad_fields)),
+        "errors": pyd_errors,
+    }
+
+
 class StartExecutionBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -119,10 +181,16 @@ class StartExecutionBody(BaseModel):
             self.options = cls.model_validate(self.options or {}).model_dump(
                 mode="json"
             )
-        except Exception as exc:
-            # Re-raise as ValueError so pydantic translates it into a 422 with
-            # the original location info from the inner model.
-            raise ValueError(f"invalid options for kind={self.kind.value}: {exc}")
+        except ValidationError as exc:
+            # Translate pydantic's multi-line internal report into a single
+            # actionable message: which options were rejected, what kind was
+            # selected, and which options the kind actually accepts. The raw
+            # pydantic ``errors()`` list is preserved under ``errors`` so a
+            # tooling client can still drill in.
+            raise HTTPException(
+                status_code=422,
+                detail=_build_options_error_detail(self.kind, cls, exc),
+            )
         return self
 
     def workflow_options(self):
