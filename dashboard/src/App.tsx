@@ -253,6 +253,11 @@ function TokenSplash({
               value={baseUrl}
               onChange={(e) => onChangeBaseUrl(e.target.value)}
             />
+            <p className="muted" style={{ fontSize: "var(--fs-xs)", margin: 0 }}>
+              Leave as <code>/api</code> when running via docker compose — the
+              dashboard nginx proxies it to the backend over the compose
+              network. For local Vite dev, use <code>http://localhost:8787</code>.
+            </p>
           </div>
           <div className="stack-2">
             <label className="label">Bearer token</label>

@@ -144,8 +144,15 @@ export const api = {
   ): { close: () => void } {
     // Backend reads bearer via WS subprotocol; pass token via querystring as a
     // reverse-proxy-friendly fallback. Both work with the current require_token_ws.
+    // baseUrl is either absolute (`http://host:8787`, used by Vite dev) or
+    // relative (`/api`, used when the production bundle is proxied by the
+    // dashboard nginx image). The WebSocket constructor needs an absolute
+    // URL, so resolve a relative base against window.location.
+    const wsBase = /^https?:/i.test(opts.baseUrl)
+      ? opts.baseUrl.replace(/^http/i, "ws")
+      : `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}${opts.baseUrl}`;
     const wsUrl =
-      opts.baseUrl.replace(/^http/, "ws") +
+      wsBase +
       `/executions/${encodeURIComponent(id)}/stream?since_seq=${sinceSeq}`;
     const ws = new WebSocket(wsUrl, ["bearer", opts.token]);
     ws.addEventListener("message", (e) => {

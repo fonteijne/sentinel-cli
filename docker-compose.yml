@@ -155,11 +155,20 @@ services:
 
   # Command Center dashboard — static SPA built from dashboard/ and served by
   # nginx. Profile-gated (`dashboard`) so bare `docker compose up` still
-  # behaves like today. The SPA talks directly to the FastAPI backend from
-  # the operator's browser; no in-container proxying. The host port defaults
-  # to 5174 (chosen so it doesn't collide with Vite's local-dev 5173) and is
-  # bound to 127.0.0.1 — exactly like sentinel-dev — so the dashboard is
-  # never exposed on the host's wider network without an explicit override.
+  # behaves like today. The host port defaults to 5174 (chosen so it
+  # doesn't collide with Vite's local-dev 5173) and is bound to 127.0.0.1 —
+  # exactly like sentinel-dev — so the dashboard is never exposed on the
+  # host's wider network without an explicit override.
+  #
+  # The dashboard nginx ALSO reverse-proxies the FastAPI backend at /api/
+  # (HTTP + WebSocket) so the browser only ever talks to one same-origin
+  # host. This is what makes `docker compose --profile dashboard --profile
+  # serve up` work without the operator publishing the backend's 8787 port
+  # or wrestling with CORS. The upstream is `${SENTINEL_API_UPSTREAM}` —
+  # defaults to `sentinel-serve:8787`, which is reachable on the compose
+  # default network. Pair the dashboard profile with `serve`; sentinel-dev
+  # uses `network_mode: bridge` and is NOT reachable by service name from
+  # this container.
   dashboard:
     build:
       context: ./dashboard
@@ -170,6 +179,12 @@ services:
       - dashboard
     ports:
       - "127.0.0.1:${SENTINEL_DASHBOARD_PORT:-5174}:80"
+    environment:
+      # Backend host:port the nginx /api/ block forwards to. The image
+      # default (`sentinel-serve:8787`) matches the compose service below;
+      # operators can point at any reachable backend (e.g. their own
+      # internal hostname) by setting SENTINEL_API_UPSTREAM in .env.
+      - SENTINEL_API_UPSTREAM=${SENTINEL_API_UPSTREAM:-sentinel-serve:8787}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
@@ -178,9 +193,8 @@ services:
       retries: 3
       start_period: 5s
     # Attach to the edge network so a BYO/bundled Traefik can route to it
-    # alongside sentinel-serve. Default network is kept so it can also
-    # resolve the backend by service name if a future build wants to
-    # proxy/SSR — today the SPA runs entirely client-side.
+    # alongside sentinel-serve. The default network is also required so
+    # nginx's /api/ block can resolve the backend service by name.
     networks:
       - default
       - sentinel-edge

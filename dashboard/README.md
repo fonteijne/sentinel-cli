@@ -4,13 +4,33 @@ React + TypeScript single-page app that drives the FastAPI service in `src/servi
 
 ## Quick start
 
+### Local Vite dev (talks straight to the backend)
+
 ```bash
 cd dashboard
 npm install
 npm run dev          # http://localhost:5173
 ```
 
-The first load asks for the bearer token (and the API base URL — defaults to `http://localhost:8787`). Tokens live in `sessionStorage` only.
+The first load asks for the bearer token and the API base URL. In Vite dev the URL field defaults to `http://localhost:8787`, which assumes the backend is reachable on that host port (e.g. `sentinel-dev` in compose, or `sentinel serve` running locally). Tokens live in `sessionStorage`.
+
+### Docker compose (the supported way to demo the SPA)
+
+From the repo root, bring up the prod backend and the dashboard together:
+
+```bash
+docker compose --profile serve --profile dashboard up -d --build
+```
+
+Then open <http://localhost:5174>. The API base URL field on the splash defaults to `/api` — leave it as is. The dashboard's nginx reverse-proxies both HTTP and the `/executions/{id}/stream` WebSocket on `/api/` to the backend over the compose network, so the browser only ever talks to one same-origin host (no CORS, no extra port to publish).
+
+If you need to point at a different backend (for example the dev container, or an externally-hosted service), set `SENTINEL_API_UPSTREAM` in `.env` before `up`:
+
+```bash
+SENTINEL_API_UPSTREAM=my-backend.internal:8787 docker compose --profile dashboard up -d
+```
+
+> **Note:** `sentinel-dev` uses `network_mode: bridge`, so the compose dashboard service can't resolve it by name. Pair `--profile dashboard` with `--profile serve`, or run a host-published backend (e.g. `--profile dev`) and override `SENTINEL_API_UPSTREAM=host.docker.internal:8787` (Linux: pass `--add-host=host.docker.internal:host-gateway`).
 
 ## Build
 
@@ -19,7 +39,7 @@ npm run build        # tsc + vite build → dashboard/dist/
 npm run preview      # serve the built bundle
 ```
 
-The compiled output is a static SPA. Serve it from any HTTP server (or behind the same Cloudflare Access tunnel as the API).
+The compiled output is a static SPA. The bundled `Dockerfile` + `nginx.conf.template` add the same-origin `/api/` proxy described above; if you serve `dist/` from another HTTP server, you must either reproduce that proxy or set the API base URL to the absolute backend origin and configure CORS accordingly.
 
 ## Design system
 
