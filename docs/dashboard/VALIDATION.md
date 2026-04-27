@@ -1,6 +1,6 @@
 # Dashboard validation log
 
-Six passes were run against the spec and the implementation on branch `v2/command-center-ui` (based on `v2/command-center` HEAD `37a30b0`). This log is the authoritative record referenced by `SETUP_AND_SPEC.md` §12.
+Seven passes have been run against the spec and the implementation on branch `v2/command-center-ui`. The reference branch was re-pinned in Pass 7 from `v2/command-center` (HEAD `37a30b0`) to `v2/command-center-close-the-gap` (HEAD `4b742cc`). This log is the authoritative record referenced by `SETUP_AND_SPEC.md` §12.
 
 ---
 
@@ -41,7 +41,7 @@ Mapped `WorktreeManager`, `JiraClient`, `GitLabClient`, `compose_runner`, `comma
 | Jira / GitLab inbox | **no** | "coming soon" |
 | Settings mutation | **no** | "coming soon" |
 | Cost & duration analytics | partial (raw fields only) | KPIs + sparklines today; full Insights page coming soon |
-| Findings & test results | declared events not yet emitted (gap G-04) | render gracefully when present, otherwise empty state |
+| Findings & test results | now emitted on `v2/command-center-close-the-gap` HEAD `4b742cc` | first-class **Test results** + **Findings** cards in run drawer; severity-sorted with `<details>` JSON fallback for unknown payload shapes |
 
 **Result:** every "coming soon" item maps to a real backend gap and does NOT call a missing endpoint. ✅
 
@@ -151,6 +151,61 @@ M docs/dashboard/VALIDATION.md
 - Files modified by Pass 6: `docs/dashboard/SETUP_AND_SPEC.md`, `docs/dashboard/VALIDATION.md`.
 
 **Result:** spec and validation log are fully reconciled with the PPLX research source; no further `[NEEDS PPLX]` placeholders remain in the dashboard documentation tree, and no backend code was touched. ✅
+
+---
+
+## Pass 7 — Close-the-gap reconciliation
+
+**Goal:** align the dashboard UI and docs with the now-shipped backend changes on `v2/command-center-close-the-gap` HEAD `4b742cc` — without touching backend code.
+
+**Inputs read:**
+- `git show origin/v2/command-center-close-the-gap:src/core/events/types.py` — payload schemas for `AgentStarted`, `AgentFinished`, `TestResultRecorded`, `FindingPosted`, `DebriefTurn`, `RevisionRequested`, `RateLimited`.
+- `git show origin/v2/command-center-close-the-gap:src/service/routes/stream.py` — confirms `1008` close + reason `ws_connections_per_token_exhausted` is emitted **before** `ws.accept()`, paired with `ws.app.state.ws_limiter.acquire/release`.
+- `git show origin/v2/command-center-close-the-gap:src/service/app.py` — confirms config key `service.rate_limits.ws_concurrent_per_token` (default 10).
+- `.claude/PRPs/reports/command-center-07-gap-closure-report.md` — closure scope (G-00..G-09; G-04 is the orphan-event-types gap covered by this UI pass).
+
+**Changes applied:**
+
+UI:
+- `dashboard/src/utils.ts` — added `fmtElapsed`, `severityRank`, `severityTone`; extended `bucketFor` so a `queued` run older than 2 min flips to **at_risk** (running keeps 5 min grace).
+- `dashboard/src/components/EventStream.tsx` — added tone + icon mappings for the six newly-emitted event types; rewrote the close handler to detect `1008 ws_connections_per_token_exhausted` and surface a dedicated banner; replaced the small dot with a tone-coloured icon glyph; extended `summarizePayload` to format `agent.started`, `agent.finished`, `test.result`, `finding.posted`, `debrief.turn`, `revision.requested` payloads, falling back to JSON-slice for unknown shapes.
+- `dashboard/src/api.ts` — `openStream`'s `onClose` now forwards both the `code` and the verbatim `reason`, so the UI can pattern-match the cap close.
+- `dashboard/src/components/RunDrawer.tsx` — added **Test results** and **Findings** cards (findings sorted by severity rank; raw JSON kept inside a collapsed `<details>`); added a queued lozenge in the header showing `fmtElapsed(started_at)`; added an in-drawer queued banner; threaded the `onWsCapExhausted` callback up to the App.
+- `dashboard/src/components/WorktreeCard.tsx` — added a queued-duration row visible whenever the latest run is queued.
+- `dashboard/src/components/Badge.tsx` — accepts an optional `data-testid` prop for surface-level test hooks.
+- `dashboard/src/App.tsx` — global ws-cap toast (auto-dismiss 12 s) wired into the run drawer's `onWsCapExhausted` callback. No new `localStorage`/`sessionStorage` writes were introduced (existing `auth.ts` storage is untouched).
+
+Docs:
+- `docs/dashboard/API_CONTRACT.md` — bumped to v0.3, re-pinned to HEAD `4b742cc`, added a WS close-code table including the `ws_connections_per_token_exhausted` reason and the cap config key, and replaced the "not yet emitted" language with a now-emitted payload-shape table.
+- `docs/dashboard/SETUP_AND_SPEC.md` — bumped to v0.3, re-pinned reference, reclassified §11 #5 ("Findings & test results") from "coming soon" to "shipped", documented queued/at-risk/WS-cap surfaces, updated kanban predicate table.
+- `docs/dashboard/VALIDATION.md` — this entry plus the corrected Pass 2 row.
+
+**Verification:**
+
+```bash
+$ cd dashboard && npm run typecheck
+> tsc --noEmit
+(no output — clean)
+
+$ npm run build
+> tsc -b && vite build
+✓ 51 modules transformed.
+dist/index.html                   0.80 kB │ gzip:  0.44 kB
+dist/assets/index-am4WtPSG.css   18.32 kB │ gzip:  4.09 kB
+dist/assets/index-2n0mAAZw.js   204.85 kB │ gzip: 62.02 kB
+✓ built in 1.27s
+
+$ git status -s -- src/ tests/ docker-compose.yml pyproject.toml poetry.lock Dockerfile
+(empty — no backend modifications)
+```
+
+- Type errors: **0**.
+- Build errors: **0**.
+- Backend file changes: **0** (scope: `src/`, `tests/`, `docker-compose.yml`, `pyproject.toml`, `poetry.lock`, `Dockerfile`).
+- Bundle size after gzip: ~62 kB JS (was ~60 kB) + 4 kB CSS — acceptable growth for the new surfaces.
+- Visual / interactive QA: **not run** — environment is headless. The new sections are guarded by `data-testid` hooks (`queued-lozenge`, `queued-banner`, `queued-duration`, `test-results-list`, `test-result-row`, `findings-list`, `finding-row`, `ws-cap-banner`, `ws-cap-toast`, `event-row-<type>`) so a downstream test pass can target them without coupling to layout.
+
+**Result:** dashboard now closes the orchestrator-emit gap on the UI side: every event type the backend now publishes has a first-class surface, queued runs are visible (and at-risk after 2 min), and the WS per-token cap is surfaced as a real UX state instead of a silent polling fallback. ✅
 
 ---
 

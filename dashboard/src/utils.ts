@@ -52,7 +52,48 @@ export function statusTone(
 }
 
 const FIVE_MIN_MS = 5 * 60 * 1000;
+const TWO_MIN_MS = 2 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
+
+export function fmtElapsed(start: string | null | undefined): string {
+  if (!start) return "—";
+  const s = new Date(start).getTime();
+  if (Number.isNaN(s)) return "—";
+  const diff = Math.max(0, Date.now() - s);
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+// Severity ordering for `finding.posted` payloads. Unknown severities sort
+// last but are still rendered so we don't silently drop new tiers.
+const SEVERITY_RANK: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  medium: 2,
+  moderate: 2,
+  low: 3,
+  info: 4,
+  informational: 4,
+};
+
+export function severityRank(value: unknown): number {
+  if (typeof value !== "string") return 99;
+  return SEVERITY_RANK[value.toLowerCase()] ?? 50;
+}
+
+export function severityTone(
+  value: unknown
+): "danger" | "warning" | "info" | "default" {
+  const r = severityRank(value);
+  if (r <= 1) return "danger";
+  if (r <= 2) return "warning";
+  if (r <= 4) return "info";
+  return "default";
+}
 
 export function deriveWorktrees(executions: ExecutionOut[]): Worktree[] {
   const groups = new Map<string, ExecutionOut[]>();
@@ -93,7 +134,13 @@ function bucketFor(latest: ExecutionOut | null): Worktree["bucket"] {
   const startedAt = new Date(latest.started_at).getTime();
   const live = latest.status === "running" || latest.status === "queued";
   if (live) {
-    const stale = Date.now() - startedAt > FIVE_MIN_MS && !latest.ended_at;
+    // Queued runs are flagged at-risk earlier (2m) — sitting in the queue
+    // longer than that usually means the worker pool is exhausted, not that
+    // the run is healthy. Running gets the original 5m grace.
+    const ageMs = Date.now() - startedAt;
+    const threshold =
+      latest.status === "queued" ? TWO_MIN_MS : FIVE_MIN_MS;
+    const stale = ageMs > threshold && !latest.ended_at;
     return stale ? "at_risk" : "running";
   }
   if (latest.status === "failed") return "failed";

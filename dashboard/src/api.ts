@@ -140,7 +140,7 @@ export const api = {
     id: string,
     sinceSeq: number,
     onFrame: (frame: StreamFrame) => void,
-    onClose: (reason?: string) => void
+    onClose: (reason?: string, code?: number) => void
   ): { close: () => void } {
     // Backend reads bearer via WS subprotocol; pass token via querystring as a
     // reverse-proxy-friendly fallback. Both work with the current require_token_ws.
@@ -156,7 +156,12 @@ export const api = {
         /* swallow parse errors */
       }
     });
-    ws.addEventListener("close", (e) => onClose(`code ${e.code}`));
+    // Forward the close reason verbatim so the UI can detect the
+    // `ws_connections_per_token_exhausted` per-token cap (1008) signal
+    // emitted by `src/service/routes/stream.py`.
+    ws.addEventListener("close", (e) =>
+      onClose(e.reason || `code ${e.code}`, e.code)
+    );
     ws.addEventListener("error", () => onClose("error"));
     return {
       close: () => {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import { Icon } from "../icons";
+import { Icon, type IconName } from "../icons";
 import type { EventOut, ExecutionStatus, StreamFrame } from "../types";
 import { fmtRelative } from "../utils";
 
@@ -10,6 +10,7 @@ interface Props {
   executionId: string;
   initialStatus: ExecutionStatus;
   onTerminal: (status: ExecutionStatus) => void;
+  onWsCapExhausted?: () => void;
 }
 
 const TYPE_TONE: Record<string, string> = {
@@ -20,10 +21,36 @@ const TYPE_TONE: Record<string, string> = {
   "execution.cancelled": "var(--text-muted)",
   "phase.changed": "var(--primary)",
   "tool.called": "var(--primary)",
+  "agent.started": "var(--info)",
+  "agent.finished": "var(--info)",
   "agent.message_sent": "var(--info)",
   "agent.response_received": "var(--info)",
   "cost.accrued": "var(--success)",
+  "test.result": "var(--success)",
+  "finding.posted": "var(--warning)",
+  "debrief.turn": "var(--primary)",
+  "revision.requested": "var(--warning)",
   "rate_limited": "var(--warning)",
+};
+
+const TYPE_ICON: Record<string, IconName> = {
+  "execution.started": "play",
+  "execution.completed": "check",
+  "execution.failed": "alert",
+  "execution.cancelling": "stop",
+  "execution.cancelled": "stop",
+  "phase.changed": "layers",
+  "tool.called": "box",
+  "agent.started": "users",
+  "agent.finished": "users",
+  "agent.message_sent": "msg",
+  "agent.response_received": "msg",
+  "cost.accrued": "chart",
+  "test.result": "check",
+  "finding.posted": "flag",
+  "debrief.turn": "msg",
+  "revision.requested": "edit",
+  "rate_limited": "clock",
 };
 
 export function EventStream({
@@ -32,11 +59,13 @@ export function EventStream({
   executionId,
   initialStatus,
   onTerminal,
+  onWsCapExhausted,
 }: Props) {
   const [events, setEvents] = useState<EventOut[]>([]);
   const [status, setStatus] = useState<ExecutionStatus>(initialStatus);
   const [error, setError] = useState<string | null>(null);
   const [mode, setMode] = useState<"ws" | "polling" | "stopped">("ws");
+  const [wsCapHit, setWsCapHit] = useState(false);
   const seqRef = useRef(0);
   const wsRef = useRef<{ close: () => void } | null>(null);
 
@@ -106,10 +135,25 @@ export function EventStream({
       }
     };
 
-    const onClose = (reason?: string) => {
+    const onClose = (reason?: string, code?: number) => {
       if (cancelled || mode === "stopped") return;
-      // Fall back to polling if WS dies for any reason.
-      setError(`Stream closed (${reason ?? "unknown"}); polling instead.`);
+      // 1008 with reason `ws_connections_per_token_exhausted` means the
+      // service-side per-token WS cap is full. Surface a dedicated banner
+      // and let the parent broadcast a toast — silent polling fallback hid
+      // a real saturation signal in earlier passes.
+      const capExhausted =
+        code === 1008 &&
+        typeof reason === "string" &&
+        reason.includes("ws_connections_per_token_exhausted");
+      if (capExhausted) {
+        setWsCapHit(true);
+        onWsCapExhausted?.();
+      }
+      setError(
+        capExhausted
+          ? "Live stream limit reached for this token; polling for updates instead."
+          : `Stream closed (${reason ?? "unknown"}); polling instead.`
+      );
       startPolling();
     };
 
@@ -143,9 +187,38 @@ export function EventStream({
         </span>
       </div>
 
-      {error && (
+      {wsCapHit && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="ws-cap-banner"
+          className="alert"
+          style={{
+            background: "var(--warning-soft)",
+            color: "var(--warning)",
+            padding: "var(--space-3) var(--space-4)",
+            borderRadius: "var(--radius-md)",
+            fontSize: "var(--fs-sm)",
+            border: "1px solid var(--warning)",
+          }}
+        >
+          <div className="inline-2">
+            <Icon name="alert" size={16} />
+            <strong>Live stream limit reached for this token.</strong>
+          </div>
+          <div className="muted" style={{ marginTop: 4, fontSize: "var(--fs-xs)" }}>
+            The service caps concurrent WebSocket streams per token
+            (config: <code>service.rate_limits.ws_concurrent_per_token</code>).
+            Falling back to HTTP polling — events still update, just with a
+            short delay. Close another live tab to free a slot.
+          </div>
+        </div>
+      )}
+
+      {error && !wsCapHit && (
         <div
           className="alert"
+          data-testid="ws-error"
           style={{
             background: "var(--warning-soft)",
             color: "var(--warning)",
@@ -181,6 +254,7 @@ export function EventStream({
             <div
               key={ev.seq}
               className="inline-3"
+              data-testid={`event-row-${ev.type}`}
               style={{
                 fontSize: "var(--fs-sm)",
                 padding: "6px 10px",
@@ -190,14 +264,20 @@ export function EventStream({
               }}
             >
               <span
+                aria-hidden="true"
                 style={{
-                  width: 8,
-                  height: 8,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  width: 18,
+                  height: 18,
                   borderRadius: 50,
-                  background: TYPE_TONE[ev.type] ?? "var(--text-subtle)",
+                  color: TYPE_TONE[ev.type] ?? "var(--text-subtle)",
                   flexShrink: 0,
                 }}
-              />
+              >
+                <Icon name={TYPE_ICON[ev.type] ?? "target"} size={12} />
+              </span>
               <span
                 className="font-mono subtle"
                 style={{ fontSize: "var(--fs-xs)", width: 56, flexShrink: 0 }}
@@ -237,5 +317,28 @@ function summarizePayload(ev: EventOut): string {
   if (ev.type === "execution.failed") return String(p.error ?? "");
   if (ev.type === "agent.response_received")
     return `${p.response_chars ?? 0} chars, ${p.tool_uses_count ?? 0} tools, ${p.elapsed_s ?? 0}s`;
+  if (ev.type === "agent.started" || ev.type === "agent.finished") {
+    const sid = p.session_id;
+    return sid ? `session ${String(sid).slice(0, 8)}` : "";
+  }
+  if (ev.type === "test.result") {
+    const ok = p.success === true ? "PASS" : p.success === false ? "FAIL" : "?";
+    const rc = p.return_code;
+    return rc !== undefined ? `${ok} (rc=${rc})` : ok;
+  }
+  if (ev.type === "finding.posted") {
+    const sev = p.severity ? `[${String(p.severity).toUpperCase()}] ` : "";
+    return `${sev}${p.summary ?? ""}`;
+  }
+  if (ev.type === "debrief.turn") {
+    return `turn ${p.turn_index ?? "?"} · ${p.prompt_chars ?? 0}→${p.response_chars ?? 0} chars`;
+  }
+  if (ev.type === "revision.requested") {
+    const target = p.revise_of_execution_id
+      ? String(p.revise_of_execution_id).slice(0, 8)
+      : "";
+    const why = p.reason ? ` — ${p.reason}` : "";
+    return `revise ${target}${why}`;
+  }
   return Object.keys(p).length ? JSON.stringify(p).slice(0, 120) : "";
 }

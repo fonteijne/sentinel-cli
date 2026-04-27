@@ -1,8 +1,8 @@
 # Sentinel Command Center Dashboard — Setup & Spec
 
-**Status:** Reconciled (v0.2) — 2026-04-27
+**Status:** Reconciled (v0.3 — close-the-gap aligned) — 2026-04-27
 **Author:** automated subagent on `v2/command-center-ui`
-**Branches:** based on `v2/command-center` (HEAD `37a30b0`)
+**Branches:** read-only against `v2/command-center-close-the-gap` (HEAD `4b742cc`); v0.2 was pinned to `v2/command-center` (HEAD `37a30b0`).
 **Scope:** Single-page admin dashboard for the Sentinel Command Center FastAPI service. **No backend changes.**
 
 > Best-practices source: `/home/user/workspace/admin-dashboard-best-practices.pplx.md` (the "PPLX research report"). All `[NEEDS PPLX]` placeholders from v0.1 have been resolved against that report in this revision; see §3, §6, §11, and §14 for the reconciled guidance. The Pass 6 validation entry in `VALIDATION.md` records the diff.
@@ -99,8 +99,8 @@ Kanban columns:
 | Column | Predicate |
 | --- | --- |
 | **Idle** | no live execution in the last hour |
-| **Running** | latest execution is `running` or `queued` |
-| **At risk** | latest is `running` AND last event > 5 min old |
+| **Running** | latest execution is `running` or `queued` (and within the at-risk thresholds) |
+| **At risk** | latest is `running` and `started_at` > 5 min ago, **or** `queued` and `started_at` > 2 min ago |
 | **Failed** | latest is `failed` |
 | **Done** | latest is `succeeded` or `cancelled` |
 
@@ -120,7 +120,9 @@ Sections:
 4. **Agent results** — collapsed cards from `GET /executions/{id}/agent-results`; expand discloses logs and tool I/O (progressive disclosure, two-level max per PPLX §7).
 5. **Actions** — Cancel (medium-risk: modal with explicit action label `Cancel run #<id>`, Cancel button red, default focus on safer "Keep running"), Retry (modal explaining a *new* execution is linked and the original is preserved), Copy command (`sentinel <kind> <ticket_id>`). Buttons are visually separated from the read sections per the Danger Zone principle (PPLX §5.3).
 6. **Empty / loading / error states** — every async block (live tail, agent results, phases) has its own skeleton/empty/error state per PPLX §6; "no events yet" differs visibly from "events failed to load".
-7. **Future-compatible event types** — `agent.started`, `test.result`, `finding.posted`, `debrief.turn` render when emitted, otherwise show an explicit empty state explaining "not produced by this run kind yet" (PPLX §6.2).
+7. **First-class result surfaces** — as of close-the-gap HEAD `4b742cc` the orchestrator emits `agent.started`, `agent.finished`, `test.result`, `finding.posted`, `debrief.turn`, and `revision.requested`. The drawer renders dedicated **Test results** (PASS/FAIL + return code) and **Findings** cards (severity-ranked, critical→info; unknown severities sort last but still render); the live timeline gives each new type its own tone + icon. Empty states still distinguish "not produced by this run yet" from "failed to load" per PPLX §6.2; the raw JSON fallback is kept as a `<details>` for any payload key the UI doesn't recognise (PPLX §6.3 — graceful unknown-shape handling).
+8. **Queued state visibility** — `queued` runs render an explicit warning lozenge with the current queued duration (`fmtElapsed`), a dedicated banner inside the run drawer, and a queued-duration line on the worktree card. The kanban "At risk" predicate now also fires for `queued` runs older than 2 minutes (running runs keep the original 5-minute grace) — a long-stuck queue is a real saturation signal, not a healthy waiting state.
+9. **WebSocket per-token cap** — when the service closes the live stream with `1008 ws_connections_per_token_exhausted` (cap config: `service.rate_limits.ws_concurrent_per_token`, default 10), the run drawer surfaces a dedicated banner explaining the cap and pointing at the polling fallback, and a global toast appears so the operator knows the live tail is degraded rather than failed.
 
 Safety prompts (PPLX §5.2 risk matrix):
 - **Cancel** is medium-risk → modal with explicit "Cancel run" label, color-distinguished destructive button, explanation that the run will stop at the next safe boundary, and a non-default focus (Cancel is never the focused button on open).
@@ -220,7 +222,7 @@ Each is rendered as a clearly-labelled placeholder that does **not** call any no
 2. **Ticket inbox** — Jira / GitLab proxy showing assigned tickets and quick "Plan it". *PPLX §16.1: maps to the "list jobs / queue" surface.*
 3. **Compose container view** — show child appserver containers per execution (read from supervisor metadata once exposed). *PPLX §16.4: resource utilization gauges.*
 4. **Cost analytics** — daily/weekly cost-by-project chart with top-N tickets. *PPLX §3.4: line/bar selection per question type.*
-5. **Findings & test results** — render `finding.posted` and `test.result` events as a per-run review surface. *PPLX §6.2: empty state must distinguish "not yet emitted" from "no findings".*
+5. **~~Findings & test results~~** — ✅ shipped in v0.3 against close-the-gap HEAD `4b742cc`. The run drawer now renders first-class **Test results** and **Findings** cards (severity-ranked) plus dedicated tone/icon entries for `test.result` and `finding.posted` in the live timeline. Future enhancement: cross-run findings index (filter findings by severity across executions) — kept as roadmap, not as a placeholder, to avoid duplicating the per-run surface.
 6. **Multi-user & RBAC** — replace the shared bearer with per-user tokens, roles, and audit history. *PPLX §14: enforce server-side, hide controls the role cannot exercise, tooltip on disabled.*
 7. **Saved searches & filters** — full-text execution search by phase, error message, ticket. *PPLX §1.1: filters must be persistent and shareable via URL.*
 8. **Notifications & webhooks** — Slack/email when an execution finishes or rate-limits. *PPLX §6.3: toast pattern for background-completion.*
@@ -237,7 +239,7 @@ These are surfaced as disabled cards or `ComingSoon.tsx` pages so the user *sees
 
 ## 12. Validation log
 
-Six iteration passes were run against this spec and the implementation. Full command logs and per-pass detail live in `VALIDATION.md`; brief recaps follow.
+Seven iteration passes were run against this spec and the implementation. Full command logs and per-pass detail live in `VALIDATION.md`; brief recaps follow.
 
 ### Pass 1 — Backend reverse-engineering
 - Read `src/service/app.py`, `routes/{executions,commands,stream}.py`, `schemas.py`, `core/events/types.py`, `core/execution/{models,repository}.py`.
@@ -265,6 +267,17 @@ Six iteration passes were run against this spec and the implementation. Full com
 - Confirmed no backend file under `src/` was modified (`git status -s -- src/` clean — only new files under `dashboard/` and `docs/dashboard/`).
 - Confirmed Python tests still pass shape-wise (no Python files touched).
 - **Result:** Branch `v2/command-center-ui` is buildable, types check, no backend drift. See VALIDATION.md for command logs.
+
+### Pass 7 — Close-the-gap reconciliation
+
+- Re-pinned to `v2/command-center-close-the-gap` HEAD `4b742cc`. The orchestrator now emits `agent.started`, `agent.finished`, `test.result`, `finding.posted`, `debrief.turn`, and `revision.requested`; the WebSocket route enforces a per-token connection cap (`service.rate_limits.ws_concurrent_per_token`, default 10) closing with code `1008` and reason `ws_connections_per_token_exhausted`.
+- Added first-class **Test results** and **Findings** cards to the run drawer; findings sort by severity rank (`critical → high → medium → low → info`, unknown last) with a `<details>` JSON fallback for any unrecognised payload shape.
+- Extended the live event timeline with dedicated tone + icon mappings for the six newly-emitted event types.
+- Improved queued state UX: dedicated lozenge with elapsed time in the run drawer header, an explanatory banner inside the drawer, and a queued-duration line on the worktree card. The kanban "At risk" predicate now also fires for `queued` runs older than 2 minutes (running keeps the 5 min grace).
+- Added a per-drawer warning banner and a global dismissable toast that fire when the WebSocket closes with `1008 ws_connections_per_token_exhausted`, so the silent polling fallback is no longer invisible.
+- Reclassified the "Findings & test results" item in §11 from "coming soon" to "shipped"; replaced future-compat empty-state language for the affected event types.
+- Reverified zero backend changes (`src/`, `tests/`, `docker-compose.yml`, `pyproject.toml`, `poetry.lock`, `Dockerfile`).
+- **Result:** dashboard surfaces the now-emitted event types and the WS cap UX, docs re-pinned to the close-the-gap reference, and no backend file is touched. ✅
 
 ### Pass 6 — PPLX research-report reconciliation
 - Read `/home/user/workspace/admin-dashboard-best-practices.pplx.md` (742 lines, 17 sections).
@@ -297,4 +310,4 @@ The PPLX research report has been reconciled into §3, §6, and §11 (see Pass 6
 
 ---
 
-*End of spec — v0.2 (PPLX-reconciled), 2026-04-27.*
+*End of spec — v0.3 (close-the-gap reconciled, HEAD `4b742cc`), 2026-04-27.*

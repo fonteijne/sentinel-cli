@@ -21,6 +21,13 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [serviceHealth, setServiceHealth] = useState<"ok" | "down" | "unknown">("unknown");
   const [error, setError] = useState<string | null>(null);
+  const [wsCapToast, setWsCapToast] = useState(false);
+
+  useEffect(() => {
+    if (!wsCapToast) return;
+    const t = window.setTimeout(() => setWsCapToast(false), 12000);
+    return () => window.clearTimeout(t);
+  }, [wsCapToast]);
 
   const refresh = useCallback(async () => {
     if (!token) return;
@@ -141,7 +148,49 @@ export default function App() {
           executionId={drawerExec}
           onClose={() => navigate("executions")}
           onChanged={refresh}
+          onWsCapExhausted={() => setWsCapToast(true)}
         />
+      )}
+
+      {wsCapToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="ws-cap-toast"
+          style={{
+            position: "fixed",
+            bottom: "var(--space-6)",
+            right: "var(--space-6)",
+            zIndex: 60,
+            maxWidth: 420,
+            padding: "var(--space-4)",
+            borderRadius: "var(--radius-md)",
+            background: "var(--warning-soft)",
+            color: "var(--warning)",
+            border: "1px solid var(--warning)",
+            boxShadow: "var(--shadow-lg)",
+            display: "flex",
+            gap: "var(--space-3)",
+            alignItems: "flex-start",
+          }}
+        >
+          <Icon name="alert" size={16} />
+          <div style={{ flex: 1, fontSize: "var(--fs-sm)" }}>
+            <strong>Live stream limit reached.</strong>
+            <div className="muted" style={{ marginTop: 4, fontSize: "var(--fs-xs)" }}>
+              The service caps concurrent WebSocket streams per token. The
+              run drawer is now polling for updates instead. Close another
+              live tab to free a slot.
+            </div>
+          </div>
+          <button
+            className="icon-btn"
+            aria-label="Dismiss"
+            onClick={() => setWsCapToast(false)}
+          >
+            <Icon name="x" size={14} />
+          </button>
+        </div>
       )}
     </>
   );

@@ -1,7 +1,7 @@
 import { Badge } from "./Badge";
 import { Icon } from "../icons";
 import type { ExecutionKind, Worktree } from "../types";
-import { fmtCost, fmtRelative, statusTone } from "../utils";
+import { fmtCost, fmtElapsed, fmtRelative, statusTone } from "../utils";
 
 interface Props {
   wt: Worktree;
@@ -36,6 +36,17 @@ export function WorktreeCard({ wt, onOpen, onStart, onCancel, onRetry }: Props) 
           </Badge>
         )}
       </div>
+
+      {wt.latest?.status === "queued" && (
+        <div
+          className="inline-2 muted"
+          data-testid="queued-duration"
+          style={{ fontSize: "var(--fs-xs)" }}
+        >
+          <Icon name="clock" size={12} />
+          queued for <strong>{fmtElapsed(wt.latest.started_at)}</strong>
+        </div>
+      )}
 
       <button
         className="task-title"

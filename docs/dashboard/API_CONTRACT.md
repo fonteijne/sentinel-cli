@@ -1,8 +1,8 @@
-# Sentinel Command Center — API Contract (v0.1)
+# Sentinel Command Center — API Contract (v0.3)
 
 **Source of truth:** the FastAPI service at `src/service/app.py` and routers in `src/service/routes/`. This document is reverse-engineered from the *current* shipped backend and is **read-only** input for the dashboard UI. The dashboard MUST NOT assume any endpoint not listed here.
 
-Branch: `v2/command-center` (HEAD `37a30b0`).
+Branch reference: `v2/command-center-close-the-gap` (HEAD `4b742cc`). The earlier pin to `v2/command-center` (HEAD `37a30b0`) is superseded — gap-closure work landed the orchestrator emit sites for `agent.started`, `agent.finished`, `test.result`, `finding.posted`, `debrief.turn`, and `revision.requested`, and added a per-token WebSocket connection cap.
 
 > Backend changes are out of scope for this work. Anything missing on the backend is represented in the dashboard as a disabled control, an empty state, or a "coming soon" placeholder.
 
@@ -90,7 +90,19 @@ Cancel/retry are guarded by status:
 
 ### 2.4 WebSocket stream
 
-`WS /executions/{id}/stream?since_seq=<int>` — bearer auth via the WebSocket dep (closes with code `1008` on auth failure, `4404` if execution not found).
+`WS /executions/{id}/stream?since_seq=<int>` — bearer auth via the WebSocket dep.
+
+Close codes the dashboard MUST distinguish:
+
+| Code | Reason string | Meaning |
+| --- | --- | --- |
+| `1008` | `ws_connections_per_token_exhausted` | Per-token WS cap hit; reject **before** `accept()`. The dashboard must show a "live stream limit" banner/toast and fall back to HTTP polling. |
+| `1008` | (other) | Bearer auth failure. The dashboard treats as a token error — kick to the splash. |
+| `1011` | (any) | Server-side timeout sending a frame to a slow client (`SEND_TIMEOUT_S`). Reconnect with `since_seq`. |
+| `4404` | (any) | Execution id not found — drawer should close. |
+| `1000` / clean | `—` | Normal end after the terminal `end` frame. |
+
+Per-token cap is configured by `service.rate_limits.ws_concurrent_per_token` (default **10**). It is enforced **before** `ws.accept()` in `src/service/routes/stream.py`, so a denied handshake never opens a socket. See `WsConnectionLimiter` in `src/service/rate_limit.py`.
 
 Frame shapes:
 
@@ -156,7 +168,20 @@ Error-class (observational only — does NOT transition status): `rate_limited`.
 
 Terminal types (used for the WS `end` frame): `execution.completed`, `execution.failed`, `execution.cancelled`.
 
-> **Known gap (from `GAP_ANALYSIS.md`):** `agent.started`, `agent.finished`, `test.result`, `finding.posted`, `debrief.turn`, `revision.requested` are declared but **not yet emitted** (G-04). The dashboard treats them as future-compatible — surfaces are built, but render gracefully when no rows exist.
+#### Now-emitted event payload shapes (close-the-gap reconciliation)
+
+As of `v2/command-center-close-the-gap` (HEAD `4b742cc`) the orchestrator and SDK wrapper now emit all six previously-orphaned event types. The dashboard renders them as first-class surfaces (Test Results section, Findings list with severity sort, dedicated tone/icon in the live timeline). Payloads — keys are best-effort; the dashboard MUST handle additional or missing fields gracefully:
+
+| Event type | Emitter | Payload keys | Dashboard surface |
+| --- | --- | --- | --- |
+| `agent.started` | `Orchestrator._agent_run` (contextmanager bookend) | `session_id?` | Live timeline tone (info) + icon (`users`) |
+| `agent.finished` | `Orchestrator._agent_run` | `session_id?` | Live timeline tone (info) + icon (`users`) |
+| `test.result` | `Orchestrator.execute` | `success: bool`, `return_code: int` | **Test results** card in run drawer (PASS/FAIL badge, return code) |
+| `finding.posted` | `Orchestrator.execute` | `severity: str`, `summary: str` | **Findings** card in run drawer, sorted by severity rank (critical→info, unknown last) |
+| `debrief.turn` | `Orchestrator.debrief` | `turn_index: int`, `prompt_chars: int`, `response_chars: int` | Live timeline tone (primary) + icon (`msg`); summarised inline |
+| `revision.requested` | `Orchestrator.debrief` | `revise_of_execution_id: str`, `reason?: str` | Live timeline tone (warning) + icon (`edit`); summarised inline |
+
+The previous "not yet emitted (G-04)" caveat is RESOLVED for these six types. The dashboard still tolerates absent fields and unknown payload shapes — when a key is missing it falls back to a JSON dump in a `<details>` block.
 
 ---
 
@@ -185,4 +210,4 @@ These features are required by an admin dashboard but are not in the current API
 
 ---
 
-*End of contract — v0.1, 2026-04-27.*
+*End of contract — v0.3 (close-the-gap reconciled, HEAD `4b742cc`), 2026-04-27.*
