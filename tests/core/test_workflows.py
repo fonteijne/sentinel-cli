@@ -118,6 +118,28 @@ def test_orchestrator_execute_marks_failed_on_no_op(monkeypatch, orchestrator, d
     assert "no_op_detected" in refreshed.error
 
 
+def test_orchestrator_no_op_publishes_execution_failed_event(
+    monkeypatch, orchestrator, db
+):
+    """The no-op gate must emit ``execution.failed`` on the bus, not just
+    flip the row's status. UI/CLI subscribers rely on the event to update
+    their timeline — a silent status flip would leave them stale."""
+    repo = ExecutionRepository(db)
+    options_blob = to_metadata_options(ExecuteOptions())
+    execution = repo.create(
+        "PROJ-EVT", "proj", ExecutionKind.EXECUTE, options=options_blob
+    )
+
+    monkeypatch.setattr(
+        "src.core.execution.workflows.run_workflow_for_execution",
+        lambda orc, ex, *, cancel_flag=None: WorkflowResult(),
+    )
+    orchestrator.execute(execution.id)
+
+    types_seen = [e["type"] for e in repo.iter_events(execution.id)]
+    assert "execution.failed" in types_seen, types_seen
+
+
 def test_orchestrator_execute_succeeds_when_workflow_produces_artifact(
     monkeypatch, orchestrator, db
 ):

@@ -427,3 +427,68 @@ def test_run_revise_calls_post_runner_with_revision_result(
     # in revise mode by ``_post_runner`` here.
     assert "gitlab.mr_ready" not in result.artifacts
     assert "gitlab.decision_log_posted" in result.artifacts
+
+
+def test_run_revise_drupal_self_fix_records_developer_result(
+    orchestrator, db, planned_worktree, monkeypatch
+):
+    """Parity with run_execute: the drupal self-fix developer call inside
+    run_revise must record its result on the execution row and add the
+    ``drupal.self_fix_attempted`` artifact, so a remote viewer can see the
+    extra developer turn took place."""
+    monkeypatch.setattr(
+        "src.config_loader.get_config",
+        _config_factory(stack_type="drupal-10")(),
+    )
+    repo = ExecutionRepository(db)
+    options = ExecuteOptions(revise=True, max_iterations=2)
+    options_blob = to_metadata_options(options)
+    execution = repo.create(
+        "PROJ-7", "PROJ", ExecutionKind.EXECUTE, options=options_blob
+    )
+
+    # Initial revision has feedback (so we don't short-circuit), then the
+    # drupal-fix revision is the second call.
+    initial_revision = {
+        "feedback_count": 2, "tasks_completed": 1, "tasks_failed": 0,
+    }
+    drupal_fix = {
+        "feedback_count": 0, "tasks_completed": 1, "tasks_failed": 0,
+    }
+    dev_factory, dev = _developer_factory(
+        revision_results=[initial_revision, drupal_fix],
+    )
+    drupal_factory, _ = _drupal_factory(
+        results=[
+            {"approved": False, "findings": [
+                {"id": "x", "severity": "MAJOR", "title": "fix me",
+                 "file": "a.php"}
+            ], "feedback": ["fix me"], "review_data": {}},
+            {"approved": True, "findings": [], "feedback": [],
+             "review_data": {}},
+        ]
+    )
+
+    captured: List[Any] = []
+    result = run_revise(
+        orchestrator,
+        ticket_id="PROJ-7",
+        project="PROJ",
+        options=options,
+        execution_id=execution.id,
+        worktree_factory=_worktree_factory(planned_worktree),
+        env_manager_factory=_env_factory(active=False),
+        developer_factory=dev_factory,
+        drupal_reviewer_factory=drupal_factory,
+        post_execute_runner=_post_runner(captured),
+        ticket_context_fetcher=lambda t: "ctx",
+    )
+
+    # Self-fix marker present.
+    assert "drupal.self_fix_attempted" in result.artifacts
+    # Two run_revision calls: initial + the drupal self-fix.
+    assert dev.run_revision.call_count == 2
+    # The drupal-fix developer result is stored on the row.
+    persisted = repo.list_agent_results(execution.id)
+    fix_records = [r for r in persisted if r["agent"] == dev.agent_name]
+    assert len(fix_records) >= 2  # initial revision + at least one fix
