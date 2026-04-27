@@ -74,12 +74,20 @@ def main() -> int:
 
     def _heartbeat_loop() -> None:
         hb_conn = connect()
-        hb_repo = ExecutionRepository(hb_conn)
         try:
             while not shutdown.wait(HEARTBEAT_INTERVAL_S):
                 try:
-                    hb_repo.set_worker_heartbeat(execution_id)
+                    hb_conn.execute("BEGIN IMMEDIATE")
+                    hb_conn.execute(
+                        "UPDATE workers SET last_heartbeat_at=? WHERE execution_id=?",
+                        (_now_iso(), execution_id),
+                    )
+                    hb_conn.execute("COMMIT")
                 except Exception:
+                    try:
+                        hb_conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
                     logger.exception("heartbeat write failed")
         finally:
             try:
@@ -116,41 +124,38 @@ def main() -> int:
 
         orchestrator = _build_orchestrator(repo, bus, cancel)
         method = _resolve_method(orchestrator, execution.kind)
-        options = (execution.metadata or {}).get("options", {}) or {}
 
         if method is None:
-            # This is a bug: the orchestrator must expose plan/execute/debrief
-            # for every ExecutionKind. Fail loudly and mark the row failed so
-            # ops can spot the missing wiring.
-            logger.error(
-                "orchestrator method not found for kind=%s (execution=%s)",
-                execution.kind.value, execution_id,
+            # Should never happen now that Orchestrator exposes
+            # plan/execute/debrief. Failing loudly is better than silently
+            # returning to a scaffold path: the contract is "real workflow
+            # or fail".
+            from src.core.execution.repository import ExecutionRepository
+
+            assert isinstance(repo, ExecutionRepository)
+            repo.record_ended(
+                execution_id,
+                ExecutionStatus.FAILED,
+                error=f"unsupported_execution_kind:{execution.kind.value}",
             )
-            try:
-                orchestrator.fail(execution, error="orchestrator method not found")
-            except Exception:
-                logger.exception(
-                    "worker: orchestrator.fail raised while handling missing method"
-                )
+            logger.error(
+                "worker: no orchestrator method for kind=%s",
+                execution.kind.value,
+            )
             return 1
 
-        try:
-            result = method(execution_id=execution_id, **options)
-        except TypeError:
-            # method may not accept execution_id kwarg — retry positionally.
-            result = method(execution_id, **options)
+        # Workflow methods are responsible for translating no-op /
+        # WorkflowError into ``failed`` rows themselves; we just observe
+        # the resulting status here.
+        method(execution_id)
 
-        status = getattr(result, "status", None)
-        if isinstance(status, ExecutionStatus):
-            exit_code = 0 if status == ExecutionStatus.SUCCEEDED else 1
-        else:
-            refreshed = repo.get(execution_id)
-            exit_code = (
-                0
-                if refreshed is not None
-                and refreshed.status == ExecutionStatus.SUCCEEDED
-                else 1
-            )
+        refreshed = repo.get(execution_id)
+        exit_code = (
+            0
+            if refreshed is not None
+            and refreshed.status == ExecutionStatus.SUCCEEDED
+            else 1
+        )
         return exit_code
     except Exception as exc:
         logger.exception("worker failed for execution %s", execution_id)
@@ -188,6 +193,37 @@ def _resolve_method(orchestrator, kind):  # type: ignore[no-untyped-def]
     if attr is None:
         return None
     return getattr(orchestrator, attr, None)
+
+
+def _scaffold_run(orchestrator, execution, cancel_flag) -> int:
+    """DEPRECATED — historical scaffold lifecycle, kept only for legacy tests.
+
+    The production worker no longer calls this. ``main()`` dispatches to
+    :meth:`Orchestrator.plan` / ``execute`` / ``debrief`` which delegate to
+    :func:`src.core.execution.workflows.run_workflow_for_execution` and fail
+    loudly on a no-op via :class:`WorkflowResult.assert_real_work`. Removing
+    this helper outright would break tests that pin the historical
+    transition behaviour, so we keep the entry point but mark it as not
+    safe for real runs.
+    """
+    from src.core.execution.models import ExecutionStatus
+
+    logger = logging.getLogger("src.core.execution.worker")
+    if cancel_flag.is_set():
+        orchestrator.repo.set_status(
+            execution.id, ExecutionStatus.CANCELLING
+        )
+        orchestrator.repo.record_ended(
+            execution.id, ExecutionStatus.CANCELLED
+        )
+        return 1
+    try:
+        orchestrator.complete(execution)
+        return 0
+    except Exception:
+        logger.exception("scaffold_run: complete() failed")
+        orchestrator.fail(execution, error="scaffold_complete_failed")
+        return 1
 
 
 if __name__ == "__main__":
