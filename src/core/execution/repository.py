@@ -96,7 +96,10 @@ class ExecutionRepository:
         idempotency_key: Optional[str] = None,
         idempotency_token_prefix: Optional[str] = None,
     ) -> Execution:
-        """Insert a new ``running``-state execution and return the model."""
+        """Insert a new ``queued``-state execution and return the model.
+
+        The worker transitions the row to ``running`` on startup (plan 04).
+        """
         execution_id = uuid.uuid4().hex
         started_at = datetime.now(timezone.utc)
         metadata: Dict[str, Any] = {}
@@ -115,7 +118,7 @@ class ExecutionRepository:
                     ticket_id,
                     project,
                     kind.value,
-                    ExecutionStatus.RUNNING.value,
+                    ExecutionStatus.QUEUED.value,
                     started_at.isoformat(),
                     idempotency_token_prefix,
                     idempotency_key,
@@ -132,7 +135,7 @@ class ExecutionRepository:
             ticket_id=ticket_id,
             project=project,
             kind=kind,
-            status=ExecutionStatus.RUNNING,
+            status=ExecutionStatus.QUEUED,
             started_at=started_at,
             idempotency_token_prefix=idempotency_token_prefix,
             idempotency_key=idempotency_key,

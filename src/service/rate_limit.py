@@ -24,6 +24,7 @@ that has ever been seen.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from collections import defaultdict, deque
@@ -105,3 +106,59 @@ class TokenRateLimiter:
                     self._window.pop(token_key, None)
             else:
                 self._in_flight[token_key] = remaining
+
+
+class WsConnectionLimiter:
+    """Per-token concurrent WebSocket connection cap.
+
+    WS connections are long-lived, so a sliding-window rate limit would do
+    the wrong thing: a legitimate dashboard that holds 10 streams open for
+    an hour would burn through the minute budget on connect and get locked
+    out for the rest of the hour. Instead we count currently-open sockets
+    per token and refuse the handshake when the count is at cap.
+
+    Non-blocking admission: ``acquire`` returns ``False`` immediately when
+    at cap rather than waiting — the caller's job is to close the handshake
+    with 1008 and let the client back off. (Semaphore is overkill for a
+    non-blocking decision.)
+
+    Event-loop only: uses ``asyncio.Lock`` because FastAPI runs WS handlers
+    on the loop. A ``threading.Lock`` would either deadlock or need awkward
+    ``run_in_executor`` handling.
+    """
+
+    def __init__(self, max_per_token: int) -> None:
+        self._cap = int(max_per_token)
+        self._counts: Dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, token_prefix: str) -> bool:
+        """Return True if a slot was reserved, False if already at cap.
+
+        Non-blocking: callers treat False as "reject this handshake now"
+        rather than "wait for a slot".
+        """
+
+        async with self._lock:
+            current = self._counts.get(token_prefix, 0)
+            if current >= self._cap:
+                return False
+            self._counts[token_prefix] = current + 1
+            return True
+
+    async def release(self, token_prefix: str) -> None:
+        """Release a previously acquired slot.
+
+        ``max(0, …)`` defends against a double-release leaking us into
+        negative counts (which would silently expand capacity). When the
+        count reaches zero we drop the key so the map stays bounded by the
+        number of *currently-connected* tokens.
+        """
+
+        async with self._lock:
+            current = self._counts.get(token_prefix, 0)
+            remaining = max(0, current - 1)
+            if remaining == 0:
+                self._counts.pop(token_prefix, None)
+            else:
+                self._counts[token_prefix] = remaining

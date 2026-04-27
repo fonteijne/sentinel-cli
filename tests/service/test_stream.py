@@ -358,3 +358,65 @@ def test_slow_client_backpressure(authed_client, monkeypatch):
         ) as ws:
             ws.receive_json()
     assert excinfo.value.code == 1011
+
+
+# ---------------------------------------------------------------------------
+# Per-token WS connection cap (plan 05 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def test_ws_connection_cap_per_token(authed_client):
+    """Open cap+1 connections with the same token; the last one is refused.
+
+    Closing one of the accepted connections must free a slot so a new
+    connection succeeds. The cap is monkeypatched down to 2 via the app
+    state so the test doesn't need to open the default-10 sockets.
+
+    Implementation note: starlette's ``TestClient`` runs each websocket on
+    a thread and routes frames via a queue. If we leave WS in mid-stream
+    with the server looping, the threadpool can saturate; so we publish a
+    terminal event which makes the server close() and exit its loop before
+    we try the rejected connection.
+    """
+
+    authed_client.app.state.ws_limiter._cap = 2  # type: ignore[attr-defined]
+
+    # Two executions + a replay that finishes immediately. The server sends
+    # event+end then closes — but the client side of the ``with`` block
+    # keeps the socket open on the TestClient side until __exit__. That's
+    # enough to hold the ws_limiter slot.
+    exec_a = _seed_execution("T-A")
+    _publish(
+        exec_a,
+        ExecutionStarted(
+            execution_id=exec_a, kind="plan", ticket_id="T-A", project="ACME"
+        ),
+    )
+
+    with authed_client.websocket_connect(
+        f"/executions/{exec_a}/stream"
+    ) as ws1:
+        assert ws1.receive_json()["type"] == "execution.started"
+
+        with authed_client.websocket_connect(
+            f"/executions/{exec_a}/stream"
+        ) as ws2:
+            assert ws2.receive_json()["type"] == "execution.started"
+
+            # Third connection must be refused with 1008.
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                with authed_client.websocket_connect(
+                    f"/executions/{exec_a}/stream"
+                ) as ws3:
+                    ws3.receive_json()
+            assert excinfo.value.code == 1008
+
+        # ws2 closed by __exit__ — give the route's outer finally a tick
+        # to run ws_limiter.release() before we try again.
+        time.sleep(0.5)
+
+        # A new connection now succeeds because ws2's slot was released.
+        with authed_client.websocket_connect(
+            f"/executions/{exec_a}/stream"
+        ) as ws4:
+            assert ws4.receive_json()["type"] == "execution.started"
