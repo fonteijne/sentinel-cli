@@ -1,11 +1,11 @@
 # Sentinel Command Center Dashboard — Setup & Spec
 
-**Status:** Draft (v0.1) — 2026-04-27
+**Status:** Reconciled (v0.2) — 2026-04-27
 **Author:** automated subagent on `v2/command-center-ui`
 **Branches:** based on `v2/command-center` (HEAD `37a30b0`)
 **Scope:** Single-page admin dashboard for the Sentinel Command Center FastAPI service. **No backend changes.**
 
-> Best-practices source: the file `/home/user/workspace/admin-dashboard-best-practices.pplx.md` was *not present* during this iteration. The spec uses general admin-dashboard best practices documented inline (see §3) and is structured so that, once the file is provided by the parent agent, a follow-up pass can cross-reference and finalize it without rewrites. Decisions that depend on that file are tagged **`[NEEDS PPLX]`** below.
+> Best-practices source: `/home/user/workspace/admin-dashboard-best-practices.pplx.md` (the "PPLX research report"). All `[NEEDS PPLX]` placeholders from v0.1 have been resolved against that report in this revision; see §3, §6, §11, and §14 for the reconciled guidance. The Pass 6 validation entry in `VALIDATION.md` records the diff.
 
 ---
 
@@ -44,22 +44,26 @@ Worktree-centric grouping in the UI is built by **deriving worktree identity fro
 
 ---
 
-## 3. Admin-dashboard best practices applied  **`[NEEDS PPLX]`**
+## 3. Admin-dashboard best practices applied
 
-Until `admin-dashboard-best-practices.pplx.md` is delivered, the spec adheres to:
+Reconciled against the PPLX research report (`/home/user/workspace/admin-dashboard-best-practices.pplx.md`). Each principle below cites the section of that report it derives from; specific external sources cited by the report are linked inline.
 
-1. **Information density first** — KPI strip, sortable lists, drawers (not modals) for detail. No tab-heavy nesting.
-2. **One primary action per screen** — `Start run` on the Worktrees board.
-3. **Polling + WebSocket hybrid** — list views poll every 5 s; the focused execution streams over WS. Avoid 1 WS per row.
-4. **Optimistic state with reconciliation** — on `cancel`, mark the row `cancelling` immediately, then reconcile from `GET /executions/{id}`.
-5. **Empty / loading / error states for every async surface** — never blank panels.
-6. **Keyboard reachable** — `⌘K` palette; `Esc` closes drawers; arrow keys move list selection.
-7. **Token never logged** — store bearer in `sessionStorage`, redact in dev tools view.
-8. **Idempotency on writes** — every `POST /executions` includes a generated `Idempotency-Key`.
-9. **Rate-limit aware** — toast on 429; back off polling.
-10. **Read-only safety prompts** — destructive verbs (cancel) require a typed-confirm of the ticket ID.
-
-A v0.2 follow-up will reconcile this list against the perplexity reference doc.
+1. **Inverted-pyramid information density** — top row is 3–5 KPI cards (system health, active runs, error rate, cost/duration); middle band carries time-series; lower band is the executions/worktrees table. F-pattern places the most critical signal in the top-left quadrant. (PPLX §1.3, §3.1; [GOV.UK redesign](https://www.tempertemper.net/portfolio/efficient-simple-and-usable-govuk-dashboard-pages))
+2. **One page, one decision** — `Overview` answers "is the Command Center healthy right now?"; `Worktrees` answers "what work is in flight?"; `Executions` answers "what changed and where?". Pages that cannot be stated as one of those questions get split. (PPLX §4.2; [OpenObserve](https://openobserve.ai/blog/observability-dashboards/))
+3. **Golden signals at the top** — Overview KPIs map to request rate (executions started/min), error rate (failed %), latency (median run duration), and saturation (active executions vs. configured worker cap). (PPLX §4.1)
+4. **Drawers (not modals) for detail; deep links everywhere** — every drawer has its own URL so operators can paste a link to a teammate. URL state encodes filters, time range, and selected execution. (PPLX §2.2, §12; [UX Pilot](https://uxpilot.ai/blogs/dashboard-design-principles))
+5. **Real-time update channel chosen per direction** — read-only feeds (event stream, log tail) use SSE/WebSocket frames from the existing `WS /executions/{id}/stream`; bidirectional control (cancel/retry) goes through REST writes plus optimistic UI. List views poll every 5 s. WebSocket reconnect uses exponential backoff `1s → 2s → 4s → max 30s` per the report's recommendation. (PPLX §6.1, §9.2)
+6. **Empty / loading / error states for every async surface** — initial load uses skeletons, background refresh uses a thin top progress bar over stale data, error states give a specific message + recovery action + error code. No blank panels. (PPLX §6.1–§6.3; [LogRocket](https://blog.logrocket.com/ui-design-best-practices-loading-error-empty-state-react/))
+7. **Command palette (⌘K)** — fuzzy-search palette is the primary navigation aid: jump to worktree, jump to execution by id, run actions on the focused row. Number-key shortcuts (`1`–`5`) activate sidebar tabs. (PPLX §2.3, §2.4; [UX Patterns for Developers](https://uxpatterns.dev/patterns/advanced/command-palette))
+8. **Friction on destructive actions, in proportion to risk** — `Cancel` (medium risk: terminates a run) is a modal with an explicit action label; `Retry` is medium risk and uses a modal that explains a *new* execution will be linked; any future `Reset / Cancel-all` belongs in a "Danger Zone" panel with type-to-confirm, separated spatially from safe controls. Cancel must never be the default focus. (PPLX §5.1–§5.3; [GitHub Danger Zone pattern](https://thecrunch.io/ai-agent-dashboard/), [UX Psychology](https://uxpsychology.substack.com/p/how-to-design-better-destructive))
+9. **Status vocabulary uses color + icon + text** — a status pill is never color alone; lozenge pattern from Atlassian Design System is followed (Operational / Degraded / Partial / Major / Maintenance / Unknown). (PPLX §4.3, §8.2; [WCAG 1.4.1](https://webaim.org/standards/wcag/checklist), [Atlassian Lozenge](https://atlassian.design/components))
+10. **Drill-down with preserved context** — Overview KPI card → filtered Executions table → Run drawer with live tail / phases / agent results. Time range and global filters carry through; breadcrumb is always visible. (PPLX §12; mirrors Grafana / Linear / Mixpanel patterns)
+11. **Progressive disclosure, two levels max** — Run drawer summary → expandable log → trace/agent-result detail. "Advanced" config and any future "Danger Zone" sit behind explicit toggles, never on the primary surface. (PPLX §7; [NN/G](https://www.nngroup.com/articles/progressive-disclosure/))
+12. **WCAG 2.2 AA baseline** — 4.5:1 contrast on body text, visible focus on every interactive element, 24×24 CSS-px minimum touch target, ARIA live regions for toast/async completion, focus trap on modal dialogs, full keyboard reachability for the command palette and run drawer. Charts must have a data-table alternative or text summary. (PPLX §8; [WebAIM](https://webaim.org/standards/wcag/checklist), [Accessible.org WCAG 2.2](https://accessible.org/wcag/))
+13. **Performance budgets** — initial load < 2 s, view transitions < 300 ms, real-time updates < 100 ms perceived latency; debounce filter inputs 300–500 ms; throttle event-stream rendering to 60 fps and batch incoming events per animation frame. Tables ≥ 200 rows must virtualize (react-window). (PPLX §9.1–§9.2; [BootstrapDash](https://www.bootstrapdash.com/blog/react-dashboard-performance))
+14. **Token never logged; auth on backend only** — bearer stored in `sessionStorage`, redacted from dev tooling, never persisted. RBAC is enforced server-side; the dashboard adapts visually (hides controls the role cannot exercise) but never trusts frontend role claims. Disabled controls explain *why* via tooltip. (PPLX §14)
+15. **Idempotency and rate-limit handling on writes** — every `POST /executions` carries a generated `Idempotency-Key`; a 429 or `rate_limited` event triggers a backoff banner and pauses polling. (PPLX §9.2 *real-time architecture*, §11.1 *background job status pattern*)
+16. **Audit-log surface, even minimal** — the executions table itself is the audit timeline today (timestamp + actor-as-token-owner + action kind + ticket); a future Activity Timeline page is reserved with the canonical entry format (timestamp, actor, action, resource, before/after diff, correlation id). (PPLX §13.1–§13.2; [Martin Fowler — Audit Log](https://martinfowler.com/eaaDev/AuditLog.html))
 
 ---
 
@@ -106,18 +110,24 @@ These predicates are entirely client-side aggregations over `GET /executions?lim
 
 ## 6. Run drawer (execution detail)
 
-Opens for `/executions/:id`. Sections:
+Opens for `/executions/:id`. Implements the three-level drill-down architecture from PPLX §12 (Overview KPI → Executions list → Run drawer) with preserved time range / filter context and a deep-linkable URL per level.
 
-1. **Header** — ticket, project, kind, status pill, started/ended, cost.
-2. **Live tail** — last N events from WS, rendered with type-specific chips (`tool.called` → tool name + args summary; `phase.changed` → phase pill; `cost.accrued` → cost delta; `rate_limited` → warning banner).
-3. **Phases timeline** — derived from `phase.changed` events.
-4. **Agent results** — collapsed cards from `GET /executions/{id}/agent-results`.
-5. **Actions** — Cancel (with typed-confirm), Retry, Copy command (`sentinel <kind> <ticket_id>`).
-6. **Future-compatible empty states** — `agent.started`, `test.result`, `finding.posted`, `debrief.turn` rendered when present (currently rare per gap analysis).
+Sections:
 
-Safety prompts:
-- **Cancel** requires typing the ticket ID.
-- **Retry** explains that a *new* execution will be created and linked.
+1. **Header** — ticket, project, kind, status pill (color + icon + label per PPLX §4.3), started/ended, cost. Breadcrumb back to source list is always visible (PPLX §2.2).
+2. **Live tail** — last N events from WS, rendered with type-specific chips (`tool.called` → tool name + args summary; `phase.changed` → phase pill; `cost.accrued` → cost delta; `rate_limited` → warning banner). Rendering is throttled to ≤60 fps and batches incoming events per animation frame (PPLX §9.2). Long buffers (>1000 events in one run) trigger a virtualized list.
+3. **Phases timeline** — derived from `phase.changed` events; styled as the Activity Timeline pattern (timestamp + actor + action + resource), so its conventions transfer 1:1 to the future Activity page (PPLX §13.2).
+4. **Agent results** — collapsed cards from `GET /executions/{id}/agent-results`; expand discloses logs and tool I/O (progressive disclosure, two-level max per PPLX §7).
+5. **Actions** — Cancel (medium-risk: modal with explicit action label `Cancel run #<id>`, Cancel button red, default focus on safer "Keep running"), Retry (modal explaining a *new* execution is linked and the original is preserved), Copy command (`sentinel <kind> <ticket_id>`). Buttons are visually separated from the read sections per the Danger Zone principle (PPLX §5.3).
+6. **Empty / loading / error states** — every async block (live tail, agent results, phases) has its own skeleton/empty/error state per PPLX §6; "no events yet" differs visibly from "events failed to load".
+7. **Future-compatible event types** — `agent.started`, `test.result`, `finding.posted`, `debrief.turn` render when emitted, otherwise show an explicit empty state explaining "not produced by this run kind yet" (PPLX §6.2).
+
+Safety prompts (PPLX §5.2 risk matrix):
+- **Cancel** is medium-risk → modal with explicit "Cancel run" label, color-distinguished destructive button, explanation that the run will stop at the next safe boundary, and a non-default focus (Cancel is never the focused button on open).
+- **Retry** is medium-risk → modal explaining a *new* execution will be created and linked back to the original; the original is not modified.
+- A future **Reset / Cancel-all** (see §11 item 10) is critical-risk → modal + type-to-confirm of the workspace name, isolated in a Danger Zone panel.
+
+Accessibility: drawer traps focus on open, returns focus to invoking row on close, supports `Esc` to close, exposes status messages via `aria-live="polite"` (PPLX §8.1).
 
 ---
 
@@ -204,18 +214,22 @@ Errors:
 
 ## 11. Coming-soon features (10)
 
-Each is rendered as a clearly-labelled placeholder that does **not** call any nonexistent endpoint. They are the product roadmap for the next dashboard waves.
+Each is rendered as a clearly-labelled placeholder that does **not** call any nonexistent endpoint. They are the product roadmap for the next dashboard waves. Priority annotations come from the PPLX cross-reference (§16 of the report — "Sentinel CLI Feature Checklist Cross-Reference").
 
-1. **Worktree CRUD** — create / delete / reset worktrees from the UI (today: CLI only).
-2. **Ticket inbox** — Jira / GitLab proxy showing assigned tickets and quick "Plan it".
-3. **Compose container view** — show child appserver containers per execution (read from supervisor metadata once exposed).
-4. **Cost analytics** — daily/weekly cost-by-project chart with top-N tickets.
-5. **Findings & test results** — render `finding.posted` and `test.result` events as a per-run review surface.
-6. **Multi-user & RBAC** — replace the shared bearer with per-user tokens, roles, and audit history.
-7. **Saved searches & filters** — full-text execution search by phase, error message, ticket.
-8. **Notifications & webhooks** — Slack/email when an execution finishes or rate-limits.
-9. **Settings editor** — view + safely diff the YAML config from the UI.
-10. **Cancel-all / drain mode** — operator panic button to halt every running execution and stop accepting new ones.
+1. **Worktree CRUD** — create / delete / reset worktrees from the UI (today: CLI only). *PPLX §16.2: must back with type-to-confirm on destroy.*
+2. **Ticket inbox** — Jira / GitLab proxy showing assigned tickets and quick "Plan it". *PPLX §16.1: maps to the "list jobs / queue" surface.*
+3. **Compose container view** — show child appserver containers per execution (read from supervisor metadata once exposed). *PPLX §16.4: resource utilization gauges.*
+4. **Cost analytics** — daily/weekly cost-by-project chart with top-N tickets. *PPLX §3.4: line/bar selection per question type.*
+5. **Findings & test results** — render `finding.posted` and `test.result` events as a per-run review surface. *PPLX §6.2: empty state must distinguish "not yet emitted" from "no findings".*
+6. **Multi-user & RBAC** — replace the shared bearer with per-user tokens, roles, and audit history. *PPLX §14: enforce server-side, hide controls the role cannot exercise, tooltip on disabled.*
+7. **Saved searches & filters** — full-text execution search by phase, error message, ticket. *PPLX §1.1: filters must be persistent and shareable via URL.*
+8. **Notifications & webhooks** — Slack/email when an execution finishes or rate-limits. *PPLX §6.3: toast pattern for background-completion.*
+9. **Settings editor** — view + safely diff the YAML config from the UI. *PPLX §13.1: pair with a config-change history (field-level diff).*
+10. **Cancel-all / drain mode** — operator panic button to halt every running execution and stop accepting new ones. *PPLX §5.2: critical-risk action — Danger Zone panel + type-to-confirm + spatially separated from safe controls.*
+
+**PPLX-driven additions to the roadmap (recorded for future passes, not yet placeholder-rendered):**
+- **Activity timeline page** — a first-class audit timeline with actor / action / resource / timestamp / correlation id, exportable to CSV/JSON (PPLX §13). The Run drawer's phases timeline is the v0.1 stand-in.
+- **Accessibility audit pass** — keyboard-only walkthrough + NVDA/VoiceOver smoke before the dashboard is exposed beyond developer preview (PPLX §8.3).
 
 These are surfaced as disabled cards or `ComingSoon.tsx` pages so the user *sees* the roadmap without confusing it with shipped functionality.
 
@@ -223,7 +237,7 @@ These are surfaced as disabled cards or `ComingSoon.tsx` pages so the user *sees
 
 ## 12. Validation log
 
-Five iteration passes were run against this spec and the implementation:
+Six iteration passes were run against this spec and the implementation. Full command logs and per-pass detail live in `VALIDATION.md`; brief recaps follow.
 
 ### Pass 1 — Backend reverse-engineering
 - Read `src/service/app.py`, `routes/{executions,commands,stream}.py`, `schemas.py`, `core/events/types.py`, `core/execution/{models,repository}.py`.
@@ -252,6 +266,14 @@ Five iteration passes were run against this spec and the implementation:
 - Confirmed Python tests still pass shape-wise (no Python files touched).
 - **Result:** Branch `v2/command-center-ui` is buildable, types check, no backend drift. See VALIDATION.md for command logs.
 
+### Pass 6 — PPLX research-report reconciliation
+- Read `/home/user/workspace/admin-dashboard-best-practices.pplx.md` (742 lines, 17 sections).
+- Replaced every `[NEEDS PPLX]` placeholder in this spec with concrete principles and citations from that report (see §3, §6, §11, §14).
+- Promoted spec status from **Draft v0.1** to **Reconciled v0.2**.
+- Added two PPLX-driven roadmap items (Activity Timeline page; Accessibility audit pass) and four follow-up doc actions (a11y QA, activity timeline promotion, performance regression sweep, status-vocabulary lint).
+- Re-verified no backend file (`src/`, `tests/`, `docker-compose.yml`, `pyproject.toml`, `poetry.lock`) was touched.
+- **Result:** spec is fully reconciled with the canonical research source; no orphan `[NEEDS PPLX]` markers remain. See VALIDATION.md Pass 6 for full diff and the no-backend-drift verification.
+
 ---
 
 ## 13. Out of scope
@@ -264,15 +286,15 @@ Five iteration passes were run against this spec and the implementation:
 
 ---
 
-## 14. Future doc actions  **`[NEEDS PPLX]`**
+## 14. Future doc actions
 
-Once `admin-dashboard-best-practices.pplx.md` arrives:
+The PPLX research report has been reconciled into §3, §6, and §11 (see Pass 6 in `VALIDATION.md`). Open follow-ups derived from that pass:
 
-1. Cross-reference its principles against §3 and §11 of this doc.
-2. Promote any of the 10 coming-soon items it flags as essential.
-3. Re-pass §6 (run drawer) for any "must-have" admin operations (e.g., audit trail surfacing, structured error grouping).
-4. Add a follow-up validation pass (Pass 6) recording the diff.
+1. **Accessibility QA** — execute the manual checklist in PPLX §8.3 (unplug mouse, NVDA on Firefox / VoiceOver on Safari, 200% zoom, contrast checker) before the dashboard ships beyond developer preview.
+2. **Activity timeline** — promote the audit timeline (PPLX §13) from "future addition" to a placeholder page once the backend exposes a structured activity stream.
+3. **Performance regression sweep** — once a real workload exists, validate the budgets in §3 item 13 (initial < 2 s, view transitions < 300 ms, real-time < 100 ms perceived) and add table virtualization on any list that crosses 200 rows (PPLX §9.2).
+4. **Status-vocabulary lint** — add a unit-level guard that every status pill renders color + icon + text together (PPLX §4.3, §8.2).
 
 ---
 
-*End of spec — v0.1, 2026-04-27.*
+*End of spec — v0.2 (PPLX-reconciled), 2026-04-27.*
