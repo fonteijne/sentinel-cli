@@ -1,6 +1,7 @@
 # Command Center — Gap Analysis
 
 **Date:** 2026-04-24
+**Last updated:** 2026-04-27 — G-00..G-09 closed on `v2/command-center-close-the-gap` (commit `b2afdaa`); see `.claude/PRPs/reports/command-center-07-gap-closure-report.md`.
 **Scope:** Plans 01–06 (foundation → production-exposure), their reports, `bd-residuals.md`, and the code in `src/core/`, `src/service/`, `src/cli.py`, `src/agent_sdk_wrapper.py`.
 **Method:** Cross-referenced plan acceptance criteria / validation sections against shipped code; grepped every code-level scope-cut marker (`scaffold`, `not yet`, `later track`, `TODO`); ran event-catalogue audit (declared vs. emitted).
 
@@ -27,7 +28,9 @@ Severity rubric:
 
 ## BLOCKERs
 
-### G-00. Orchestrator has no `plan()` / `execute()` / `debrief()` verbs — FastAPI route is a no-op
+> **All three BLOCKERs closed 2026-04-27** on `v2/command-center-close-the-gap` (plan 07, phases 1–2). Kept below for traceability.
+
+### G-00. Orchestrator has no `plan()` / `execute()` / `debrief()` verbs — FastAPI route is a no-op  ✅ CLOSED
 
 - **Location:** `src/core/execution/worker.py:129-137` (scaffold fallback); `src/core/execution/orchestrator.py:1-14` (module docstring admits the scope cut).
 - **Evidence:** `_resolve_method()` returns `None` because Orchestrator exposes only `begin/complete/fail/set_phase/record_agent_result`. Worker falls back to `_scaffold_run()` which only emits lifecycle events and transitions the row to `succeeded` — no agents run. POST `/executions` therefore returns 202 with a "successful" execution that did zero work.
@@ -35,82 +38,94 @@ Severity rubric:
 - **Severity:** BLOCKER.
 - **Owner:** `cc-orchestrator-expert`.
 - **Note:** No numbered plan file exists for the extraction; owner is defined but work is untracked.
+- **Status (2026-04-27):** Closed. `Orchestrator.plan/execute/debrief` added; `_scaffold_run` deleted; worker now fails loudly if a kind can't resolve. CLI thinning (Task 1.6) deferred as follow-up — the HTTP path is fully wired.
 
-### G-01. `register_compose_project` has zero callers — plan 04's container-cleanup chain is dead
+### G-01. `register_compose_project` has zero callers — plan 04's container-cleanup chain is dead  ✅ CLOSED
 
 - **Location:** `src/core/execution/repository.py:416-451` (defined); no callers anywhere in `src/` or `tests/`.
 - **Evidence:** `grep -rn register_compose_project src/ tests/` returns only the definition. Supervisor's `post_mortem` reads `execution.metadata["compose_projects"]` (supervisor.py:393) to run `docker compose down -p <name>`, but the list is always empty because nothing registers a project.
 - **Plan ref:** Plan 04 §"Child containers — pre-registration ordering"; acceptance criterion *"Per-ticket appserver-* containers are cleaned up on cancel/failure/orphan (no leaks)"*.
 - **Severity:** BLOCKER. The 04-report claims the criterion is met via `post_mortem`-reads-metadata, but the read side never sees populated data.
 - **Owner:** `cc-orchestrator-expert` (wire `repo.register_compose_project(...)` before `docker compose up` in the agent flow) + `cc-supervisor-expert` (assertion/log when post_mortem sees an empty list for a non-trivial run).
+- **Status (2026-04-27):** Closed. `Orchestrator.execute` now calls `repo.register_compose_project(...)` before the first compose up; post_mortem has real projects to tear down.
 
-### G-02. `repo.create()` hard-codes `status=RUNNING` — contradicts plan 04 API contract and breaks Set-C reconciliation
+### G-02. `repo.create()` hard-codes `status=RUNNING` — contradicts plan 04 API contract and breaks Set-C reconciliation  ✅ CLOSED
 
 - **Location:** `src/core/execution/repository.py:118, 135` (hard-codes `ExecutionStatus.RUNNING`); `src/core/execution/worker.py:122-123` (`if status == QUEUED: set_status(RUNNING)` — dead code); `tests/core/test_supervisor.py:172` papers over it: `# Coerce status to QUEUED since create() defaults to RUNNING`.
 - **Evidence:** Verified via direct read. Row is inserted as `RUNNING`; endpoint returns `RUNNING` with HTTP 202; worker's queued→running transition is unreachable.
 - **Plan ref:** Plan 04 endpoints table: *"POST /executions → 202 + ExecutionOut (status queued, worker transitions it to running)"*. Plan 04 §Startup reconciliation Set C: *"orphaned queued rows (service died between repo.create and supervisor.spawn)"* — set cannot populate.
 - **Severity:** BLOCKER. Crashes between `create` and `spawn.start` leave a row in `RUNNING` with no worker, which Set A misclassifies as "running without worker row → failed with `orphaned_on_restart`" — wrong error label, wrong recovery path. Dashboards also see `running` immediately even before the worker is up.
 - **Owner:** `cc-persistence-expert` (decide: default QUEUED and let the worker transition; or delete QUEUED everywhere and update plan text).
+- **Status (2026-04-27):** Closed. `repo.create()` defaults to `QUEUED`; worker's queued→running transition is live; Set-C reconciliation can now populate. `tests/core/test_supervisor.py:172` coercion workaround removed.
 
 ---
 
 ## HIGH
 
-### G-03. `cancel_flag` stored on Orchestrator but never `.is_set()`-checked in production paths
+> **All seven HIGH gaps closed 2026-04-27** on `v2/command-center-close-the-gap` (plan 07, phases 1/3/4/5). Kept below for traceability.
+
+### G-03. `cancel_flag` stored on Orchestrator but never `.is_set()`-checked in production paths  ✅ CLOSED
 
 - **Location:** `src/core/execution/orchestrator.py:57,66` (stored); only `src/core/execution/worker.py:204` (`_scaffold_run`) reads it.
 - **Evidence:** `grep -n cancel_flag src/core/execution/orchestrator.py` — assigned, never read.
 - **Plan ref:** Plan 04 §Worker Process Model: *"Cancel flag: threading.Event checked by Orchestrator between agent turns; orchestrator observes and bails cleanly."*
 - **Severity:** HIGH. Cancellation today relies entirely on signal escalation (SIGTERM→SIGINT→SIGKILL, 30s total). No cooperative early exit.
 - **Owner:** `cc-orchestrator-expert`. Tied to G-00 but distinct — even the thin orchestrator should expose a phase-boundary check.
+- **Status (2026-04-27):** Closed. `Orchestrator.set_phase` raises `OrchestratorCancelled` when `cancel_flag.is_set()`; cancel is now cooperative at phase boundaries.
 
-### G-04. Six declared event types never emitted
+### G-04. Six declared event types never emitted  ✅ CLOSED
 
 - **Location:** `src/core/events/types.py` declares `AgentStarted`, `AgentFinished`, `TestResultRecorded`, `FindingPosted`, `DebriefTurn`, `RevisionRequested`. No instantiations anywhere in `src/` other than re-exports.
 - **Evidence:** `grep -rn "AgentStarted\|AgentFinished\|TestResultRecorded\|FindingPosted\|DebriefTurn\|RevisionRequested" src/` returns only type-definition lines.
 - **Plan ref:** Plan 01 §"Event Types"; Plan 01 Task 10 GOTCHA (re: DebriefTurn); `bd-residuals.md` item 10 presupposes emission.
 - **Severity:** HIGH. `AgentStarted` / `AgentFinished` are the most basic per-agent timeline signals any dashboard will want.
 - **Owner:** `cc-event-bus-expert` (catalogue) + `cc-orchestrator-expert` (wire emission in `BaseAgent` and `Orchestrator.set_phase`).
+- **Status (2026-04-27):** Closed. `AgentStarted`/`AgentFinished` emitted via `Orchestrator._agent_run` contextmanager (once per run, not per `_send_message_async` call); `DebriefTurn`, `RevisionRequested`, `TestResultRecorded`, `FindingPosted` emitted at orchestrator boundaries; `RateLimited` closed under G-05. All 7 declared-but-orphaned types now have emit sites.
 
-### G-05. `_publish_rate_limited` helper defined but never called
+### G-05. `_publish_rate_limited` helper defined but never called  ✅ CLOSED
 
 - **Location:** `src/agent_sdk_wrapper.py:244-258` (defined); zero call sites.
 - **Evidence:** `grep -n _publish_rate_limited src/agent_sdk_wrapper.py` — only the definition. `execute_with_tools` stream loop has no 429/529 branch.
 - **Plan ref:** Plan 01 Task 9: *"On 429/529 / rate-limit exception: publish RateLimited(retry_after_s) before re-raising or backing off."*
 - **Severity:** HIGH. Dashboards will never render "Anthropic is throttling." Documented acceptance criterion unmet.
 - **Owner:** `cc-orchestrator-expert` (SDK-wrapper owner).
+- **Status (2026-04-27):** Closed. `_classify_rate_limit` helper sniffs `ProcessError` stderr + in-stream `error == "rate_limit"` marker (the vendored `claude-agent-sdk 0.1.20` has no typed exception class) and calls `_publish_rate_limited(retry_after_s=…)` on 429/529 before re-raising. Wire string stays `rate_limited` (G-19 rename is deferred — wire strings immutable after real data lands).
 
-### G-06. No WS connection cap — `get_repo` dep holds threadpool slot for entire connection lifetime
+### G-06. No WS connection cap — `get_repo` dep holds threadpool slot for entire connection lifetime  ✅ CLOSED
 
 - **Location:** `src/service/routes/stream.py:55-62` (depends on `get_repo` → `get_db_conn` sync generator).
 - **Evidence:** Sync generator holds SQLite connection until socket closes. Plan 03 GOTCHA flagged this as "40 simultaneous connections exhaust default threadpool."
 - **Plan ref:** Plan 03 Risks (accepted for MVP); `bd-residuals.md` item 4 specifies `service.rate_limits.ws_concurrent_per_token` (default 10).
 - **Severity:** HIGH. A misbehaving or leaked client brings the service to its knees.
 - **Owner:** `cc-fastapi-expert` (semaphore keyed on `token_prefix` inside `require_token_ws`).
+- **Status (2026-04-27):** Closed. `WsConnectionLimiter` (per-token async counter, default cap=10 via `service.rate_limits.ws_concurrent_per_token`) wired through `app.state`; `ws_token_prefix` dep keys the limiter; `stream.py` acquires before `ws.accept()`, closes with code 1008 on cap, releases in `finally`. **Note:** read-endpoint cap (G-11) still open; this only caps WS connections.
 
-### G-07. Named test `test_entry_dict_jsonl_bus_parity` never written
+### G-07. Named test `test_entry_dict_jsonl_bus_parity` never written  ✅ CLOSED
 
 - **Location:** `tests/test_agent_sdk_wrapper.py` has no `entry_dict` / `parity` test.
 - **Evidence:** `grep -n "entry_dict\|parity" tests/test_agent_sdk_wrapper.py` returns nothing.
 - **Plan ref:** Plan 01 Task 9 — test is named explicitly.
 - **Severity:** HIGH. The test was the guard against silent drift between JSONL diagnostic output and `events.payload_json`.
 - **Owner:** `cc-event-bus-expert`.
+- **Status (2026-04-27):** Closed. Test exists in `tests/test_agent_sdk_wrapper.py` and guards against silent drift between the JSONL diagnostic file and `events.payload_json`.
 
-### G-08. `set_worker_heartbeat` defined but worker bypasses it with raw SQL
+### G-08. `set_worker_heartbeat` defined but worker bypasses it with raw SQL  ✅ CLOSED
 
 - **Location:** `src/core/execution/repository.py:390-400` (defined); `src/core/execution/worker.py:80-85` (runs raw `UPDATE workers SET last_heartbeat_at = ?`).
 - **Evidence:** `grep -rn set_worker_heartbeat src/` returns only the definition.
 - **Plan ref:** Plan 04 Task 4: *"Worker's heartbeat thread calls this instead of raw SQL; lets tests mock the method."*
 - **Severity:** HIGH. Behaviour is correct today; testability is lost.
 - **Owner:** `cc-supervisor-expert` / `cc-worker-runtime-expert`.
+- **Status (2026-04-27):** Closed. Heartbeat thread now builds a per-thread `ExecutionRepository` and calls `repo.set_worker_heartbeat(execution_id)`; raw SQL removed. `grep -n "UPDATE workers SET last_heartbeat_at" src/core/execution/worker.py` returns zero hits.
 
-### G-09. `multiprocessing.Process` env handling is a data race on global `os.environ`
+### G-09. `multiprocessing.Process` env handling is a data race on global `os.environ`  ✅ CLOSED
 
 - **Location:** `src/core/execution/supervisor.py:136-146`.
 - **Evidence:** 04-report Deviation #4: `multiprocessing.Process` has no `env=` kwarg, so the supervisor does `saved = os.environ.copy(); os.environ.clear(); os.environ.update(env); proc.start(); os.environ = saved`. Global `os.environ` is mutated while the HTTP threadpool may be reading it.
 - **Plan ref:** Plan 04 §Worker Process Model (specified `env=` semantics).
 - **Severity:** HIGH. Under concurrent starts, env leaks between spawns. Many libs read `os.environ` at call time (httpx proxies, logging TZ, etc.).
 - **Owner:** `cc-supervisor-expert`. Options: serialize spawns under `_lock` and document the hold window; or switch to a `subprocess.Popen`-based spawn path.
+- **Status (2026-04-27):** Closed. The existing `@_locked` spawn already held the env-swap window to a minimum — change was the documenting gotcha comment plus `test_spawn_env_isolation_under_concurrent_requests` covering the 4-thread concurrent-spawn case. A full `Popen` rewrite was evaluated and explicitly rejected (breaks DooD env inheritance; severity didn't justify it).
 
 ---
 
@@ -276,29 +291,37 @@ These are catalogued in `.claude/PRPs/plans/command-center/bd-residuals.md` and 
 
 ## Summary
 
-| Severity | Count |
-|---|---|
-| BLOCKER | 3 (G-00, G-01, G-02) |
-| HIGH | 7 (G-03 … G-09) |
-| MEDIUM | 8 (G-10 … G-17) |
-| LOW | 9 (G-18 … G-26) |
-| Residuals | 19 (R-1 … R-19) |
-| **Total** | **46** |
+| Severity | Original | Closed 2026-04-27 | Remaining |
+|---|---|---|---|
+| BLOCKER | 3 (G-00..G-02) | 3 | 0 |
+| HIGH | 7 (G-03..G-09) | 7 | 0 |
+| MEDIUM | 8 (G-10..G-17) | 0 | 8 |
+| LOW | 9 (G-18..G-26) | 0 | 9 |
+| Residuals | 19 (R-1..R-19) | 0 | 19 |
+| **Total** | **46** | **10** | **36** |
 
-The three BLOCKERs together describe a consistent picture: **the HTTP command path (POST `/executions`) is end-to-end wired for lifecycle events and status transitions, but the agent-work step in the middle, the compose-cleanup bookkeeping, and the API's own declared status-transition contract are all missing.** G-00 is the single biggest — fixing it likely pulls G-01 and G-03 along with it (the orchestrator extraction is the natural place to register compose projects and to check `cancel_flag` between phases).
+The three BLOCKERs together described a consistent picture: **the HTTP command path (POST `/executions`) was end-to-end wired for lifecycle events and status transitions, but the agent-work step in the middle, the compose-cleanup bookkeeping, and the API's own declared status-transition contract were all missing.** The 2026-04-27 closure pass resolved that middle — POST `/executions` now runs real agent work, cleans up compose stacks, honours the queued→running handshake, and emits the full event timeline. One session follow-up remains: **Task 1.6 CLI thinning** (move `src/cli.py` plan/debrief/execute inline logic onto `Orchestrator.plan/execute/debrief`); deferred to avoid breaking `sentinel execute` CLI parity in this pass.
 
 ## Suggested sequencing
 
-1. **Land the orchestrator extraction (G-00).** This is the keystone. While doing it:
+Steps 1–5 below were executed on 2026-04-27 (plan 07 phases 1–5) and are complete. Remaining work:
+
+6. **MEDIUM** (G-10..G-17) as the next polish pass. G-10 (CLI `--remote --follow` WS auth on non-loopback URLs) and G-14 (`follow_up_ticket` either wire or remove) are the two with behavioural consequences; the rest are mostly ambiguity fixes and missing tests.
+7. **LOW** (G-18..G-26) as opportunistic cleanup. G-19 (`rate_limited` → `rate.limited` wire rename) is explicitly deferred — wire strings are immutable once real data lands; costs a forward-only migration to change.
+8. **Residuals** (R-1..R-19) tracked in `bd-residuals.md`; R-19 (meta: none filed in a tracker) remains true until `bd` returns on this worktree.
+9. **Task 1.6** (CLI thinning) — ~600 lines of `src/cli.py` lift-and-shift onto the new Orchestrator verbs; requires fleshing out `Orchestrator.execute` to full CLI parity (revision flow, MR posting, config validation, Drupal iteration).
+
+### Historical sequencing (executed 2026-04-27)
+
+1. **Land the orchestrator extraction (G-00).** Keystone. While doing it:
    - Wire `repo.register_compose_project(...)` before every `docker compose up` (closes G-01).
    - Check `cancel_flag.is_set()` at phase boundaries in `Orchestrator.set_phase` (closes G-03).
-   - Emit `AgentStarted` / `AgentFinished` in `BaseAgent` entry/exit (partial close of G-04).
+   - Emit `AgentStarted` / `AgentFinished` in `BaseAgent` entry/exit — ultimately landed at Orchestrator level via `_agent_run` contextmanager (partial close of G-04).
    - Emit `DebriefTurn` / `RevisionRequested` in the debrief loop (rest of G-04).
-2. **Fix G-02** (status default). Tiny change, but reshapes reconciliation tests — best done alongside G-00 because the worker's queued→running transition becomes live at the same time.
+2. **Fix G-02** (status default). Tiny change; done alongside G-00 so the worker's queued→running transition went live at the same time.
 3. **Fix G-05 / G-07** (`_publish_rate_limited` + parity test). Self-contained; lands in the SDK wrapper.
 4. **G-09** (supervisor env race). Self-contained in supervisor.py.
-5. **G-06 + G-11 + G-21** (rate-limit + header validation). One router-config pass.
-6. Remaining MEDIUM/LOW as polish backlog.
+5. **G-06** (WS connection cap). One router-config pass. Note: G-11 + G-21 were pulled out of this pass — they need a different dep shape on read routers; kept for the MEDIUM polish pass above.
 
 ## Out of scope for this doc
 
