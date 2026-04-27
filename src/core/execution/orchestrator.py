@@ -212,3 +212,67 @@ class Orchestrator:
         ) as execution:
             runner(execution)
         return self.repo.get(execution.id) or execution
+
+    # --------------------------------------------------------- workflow verbs
+
+    def plan(self, execution_id: str, **_ignored: Any) -> Execution:
+        """Worker entry point for the ``plan`` workflow.
+
+        ``**_ignored`` is intentional — :func:`src.core.execution.worker.main`
+        passes the persisted options dict positionally as ``**options`` for
+        symmetry with the other verbs. The real options are read from the
+        execution row inside :func:`run_workflow_for_execution` so they go
+        through :class:`WorkflowOptions` validation, not back-compatible
+        kwarg unpacking.
+        """
+        return self._run_workflow(execution_id)
+
+    def execute(self, execution_id: str, **_ignored: Any) -> Execution:
+        return self._run_workflow(execution_id)
+
+    def debrief(self, execution_id: str, **_ignored: Any) -> Execution:
+        return self._run_workflow(execution_id)
+
+    def _run_workflow(self, execution_id: str) -> Execution:
+        from src.core.execution.workflows import (
+            NoOpExecutionError,
+            WorkflowCancelled,
+            WorkflowError,
+            run_workflow_for_execution,
+        )
+
+        execution = self.repo.get(execution_id)
+        if execution is None:
+            raise LookupError(f"execution {execution_id} not found")
+
+        # Re-publish ExecutionStarted only if the row hasn't already been
+        # introduced to the bus (worker path skips the CLI's begin() call).
+        latest_seq = self.repo.latest_event_seq(execution_id)
+        if latest_seq == 0:
+            self.bus.publish(
+                ExecutionStarted(
+                    execution_id=execution.id,
+                    kind=execution.kind.value,
+                    ticket_id=execution.ticket_id,
+                    project=execution.project,
+                )
+            )
+
+        try:
+            result = run_workflow_for_execution(
+                self, execution, cancel_flag=self.cancel_flag
+            )
+            # The non-negotiable: no real artifact ⇒ run is failed.
+            result.assert_real_work()
+        except WorkflowCancelled as exc:
+            return self.fail(execution, error=f"cancelled: {exc}")
+        except NoOpExecutionError as exc:
+            return self.fail(execution, error=f"no_op_detected: {exc}")
+        except WorkflowError as exc:
+            return self.fail(execution, error=str(exc))
+        except Exception as exc:
+            logger.exception("workflow execution failed for %s", execution_id)
+            return self.fail(
+                execution, error=str(exc) or type(exc).__name__
+            )
+        return self.complete(execution)
