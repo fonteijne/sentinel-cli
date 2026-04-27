@@ -289,6 +289,60 @@ Seven iteration passes were run against this spec and the implementation. Full c
 
 ---
 
+## 12a. Docker Compose deployment
+
+The dashboard ships with its own multi-stage `dashboard/Dockerfile` and is wired into the top-level `docker-compose.yml` as a profile-gated `dashboard` service. The image is a static SPA bundle served by `nginx:1.27-alpine`; it never proxies API calls — the browser talks straight to the FastAPI backend (the same model as `npm run preview` locally).
+
+### Run it
+
+```bash
+# From the repo root.
+docker compose --profile dashboard up -d dashboard
+
+# Open the dashboard:
+open http://localhost:5174
+
+# To stop it:
+docker compose --profile dashboard down
+```
+
+Run alongside the backend (typical local-on-host workflow):
+
+```bash
+# Terminal A — backend on 127.0.0.1:8787
+docker compose --profile dev up sentinel-dev
+
+# Terminal B — dashboard on 127.0.0.1:5174
+docker compose --profile dashboard up -d dashboard
+```
+
+On the splash screen, leave the API base URL as `http://localhost:8787` and paste the bearer token. (Both fields persist in the browser exactly as in `npm run dev` — no new storage paths were added.)
+
+### Ports & env
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SENTINEL_DASHBOARD_PORT` | `5174` | Host port for the dashboard, bound to `127.0.0.1` only (matches the loopback-only contract used by `sentinel-dev`). |
+| `SENTINEL_DASHBOARD_HOSTNAME` | `dashboard.localhost` | Traefik `Host(...)` rule used **only** when an operator runs the `traefik` profile or attaches their own Traefik to `sentinel-edge`. Ignored otherwise. |
+
+The container listens on port `80` internally; the compose mapping is `127.0.0.1:${SENTINEL_DASHBOARD_PORT:-5174}:80`. To expose the dashboard on a different host port, set `SENTINEL_DASHBOARD_PORT=NNNN` in `.env` or the shell — no compose edit required.
+
+### Networks
+
+`dashboard` joins both `default` and `sentinel-edge`. The latter is the Traefik-shared network used by `sentinel-serve`; this lets a BYO/bundled Traefik route to the dashboard alongside the backend without further config. The dashboard does not depend on the backend service for startup — they are independent and can be brought up in either order.
+
+### Behavior of the image
+
+- `Dockerfile` is multi-stage: `node:20-alpine` runs `npm ci && npm run build`; `nginx:1.27-alpine` serves the resulting `dist/`.
+- `nginx.conf` does SPA fallback to `/index.html`, caches hashed `/assets/*` aggressively, never caches `index.html`, and exposes a `/healthz` endpoint used by the compose `healthcheck`.
+- No backend files (`src/`, `pyproject.toml`, `poetry.lock`) and no dashboard source files were modified for this wiring — only `dashboard/Dockerfile`, `dashboard/nginx.conf`, `dashboard/.dockerignore`, and the new `dashboard:` block in `docker-compose.yml`.
+
+### Local dev workflow is preserved
+
+`npm run dev` / `npm run build` / `npm run preview` continue to work unchanged. Compose is purely additive: no rebuild of backend images is required, and the existing default `docker compose up` (no profile) still starts only the `sentinel` CLI-idle container.
+
+---
+
 ## 13. Out of scope
 
 - Backend changes of any kind.
