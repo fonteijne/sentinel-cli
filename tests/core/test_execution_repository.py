@@ -21,19 +21,25 @@ def db(tmp_path, monkeypatch):
     conn.close()
 
 
-def test_create_inserts_running_row(db):
+def test_create_defaults_to_queued(db):
     repo = ExecutionRepository(db)
 
     ex_no_opts = repo.create("T-1", "ACME", ExecutionKind.PLAN)
-    assert ex_no_opts.status == ExecutionStatus.RUNNING
+    assert ex_no_opts.status == ExecutionStatus.QUEUED
     assert ex_no_opts.id
     assert ex_no_opts.metadata == {}
 
     ex_with_opts = repo.create(
         "T-2", "ACME", ExecutionKind.EXECUTE, options={"k": "v"}
     )
-    assert ex_with_opts.status == ExecutionStatus.RUNNING
+    assert ex_with_opts.status == ExecutionStatus.QUEUED
     assert ex_with_opts.metadata == {"options": {"k": "v"}}
+
+    # DB persists the same state
+    from src.core.execution.repository import ExecutionRepository as _Repo
+    got = _Repo(db).get(ex_no_opts.id)
+    assert got is not None
+    assert got.status == ExecutionStatus.QUEUED
 
 
 def test_get_roundtrips_all_fields(db):

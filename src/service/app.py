@@ -35,7 +35,7 @@ from src.service.auth import (
     require_token_ws,
 )
 from src.service.deps import command_center_lifespan, get_db_conn
-from src.service.rate_limit import TokenRateLimiter
+from src.service.rate_limit import TokenRateLimiter, WsConnectionLimiter
 from src.service.routes import commands, executions, stream
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,11 @@ def create_app() -> FastAPI:
     app.state.rate_limiter = TokenRateLimiter(
         max_concurrent=int(cfg.get("service.rate_limits.max_concurrent", 3)),
         max_per_minute=int(cfg.get("service.rate_limits.max_per_minute", 30)),
+    )
+    app.state.ws_limiter = WsConnectionLimiter(
+        max_per_token=int(
+            cfg.get("service.rate_limits.ws_concurrent_per_token", 10)
+        )
     )
 
     cors_origins = cfg.get("service.cors_origins", []) or []

@@ -92,6 +92,24 @@ def test_start_happy_path_returns_202_and_spawns(
     assert fake_supervisor.spawn_calls[0] == body["id"]
 
 
+def test_post_executions_returns_queued_initially(
+    authed_client_with_fake_supervisor, fake_supervisor
+):
+    """G-02: the 202 body reports ``status=queued``; the worker transitions
+    the row to ``running`` once it has started. With a fake supervisor that
+    never spawns a subprocess, the status observed at response time is the
+    initial ``queued``.
+    """
+    client = authed_client_with_fake_supervisor
+    resp = client.post(
+        "/executions",
+        json={"ticket_id": "PROJ-2", "project": "proj", "kind": "plan"},
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "queued"
+
+
 def test_start_rejects_extra_fields_with_422(authed_client_with_fake_supervisor):
     client = authed_client_with_fake_supervisor
     resp = client.post(
@@ -138,7 +156,7 @@ def test_start_accepts_underscored_ticket_ids(
         "/executions",
         json={"ticket_id": ticket_id, "project": "proj", "kind": "execute"},
     )
-    assert resp.status_code == 200, resp.json()
+    assert resp.status_code == 202, resp.json()
     assert resp.json()["ticket_id"] == ticket_id
 
 
@@ -187,7 +205,7 @@ def test_start_derives_project_from_ticket_when_missing(
     """
     client = authed_client_with_fake_supervisor
     resp = client.post("/executions", json=payload)
-    assert resp.status_code == 200, resp.json()
+    assert resp.status_code == 202, resp.json()
     assert resp.json()["project"] == expected_project
 
 
@@ -207,7 +225,7 @@ def test_start_accepts_explicit_project_over_derivation(
             "kind": "execute",
         },
     )
-    assert resp.status_code == 200, resp.json()
+    assert resp.status_code == 202, resp.json()
     assert resp.json()["project"] == "shared-infra"
 
 
@@ -227,7 +245,7 @@ def test_options_follow_up_ticket_empty_string_treated_as_absent(
             "options": {"follow_up_ticket": ""},
         },
     )
-    assert resp.status_code == 200, resp.json()
+    assert resp.status_code == 202, resp.json()
 
 
 def test_start_spawn_failure_marks_row_failed_and_500s(

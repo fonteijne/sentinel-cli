@@ -133,10 +133,8 @@ class Supervisor:
             args=(execution_id,),
             daemon=False,
         )
-        # multiprocessing.Process does not accept env=; spawn inherits os.environ
-        # of the launching interpreter. Temporarily scrub+restore so the child
-        # only sees the allowlist.
         saved = os.environ.copy()
+        # GOTCHA: env swap window held under self._lock (RLock) — other threads reading os.environ mid-swap would see an empty dict otherwise.
         try:
             os.environ.clear()
             os.environ.update(env)
