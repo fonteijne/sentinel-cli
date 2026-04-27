@@ -53,6 +53,23 @@ export interface StreamFrame {
   execution_status?: ExecutionStatus;
 }
 
+/**
+ * Stage = the workflow column the card lives in. The board is now ordered
+ * `debrief → plan → execute` so the dashboard matches the user-facing
+ * ticket-flow vocabulary. `null` means there is no execution yet (idle
+ * card); we render those in the first column with a neutral status.
+ */
+export type WorktreeStage = ExecutionKind;
+
+/**
+ * Status sub-state inside a stage — drives the card's color chip.
+ *   running  → blue   (queued/running/cancelling all collapse to this)
+ *   failed   → red    (failed)
+ *   done     → green  (succeeded)
+ *   idle     → neutral (no execution recorded yet, or cancelled)
+ */
+export type WorktreeStatus = "running" | "failed" | "done" | "idle";
+
 export interface Worktree {
   slug: string; // `${project}__${ticket_id}`
   project: string;
@@ -60,5 +77,8 @@ export interface Worktree {
   latest: ExecutionOut | null;
   total_cost_cents: number;
   run_count: number;
-  bucket: "idle" | "running" | "at_risk" | "failed" | "done";
+  /** Workflow column the card belongs to (debrief / plan / execute). */
+  stage: WorktreeStage;
+  /** Visual status within the current stage. */
+  status: WorktreeStatus;
 }

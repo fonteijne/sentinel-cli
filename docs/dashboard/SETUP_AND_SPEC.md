@@ -1,6 +1,6 @@
 # Sentinel Command Center Dashboard — Setup & Spec
 
-**Status:** Reconciled (v0.3 — close-the-gap aligned) — 2026-04-27
+**Status:** Reconciled (v0.4 — Debrief → Plan → Execution flow) — 2026-04-27
 **Author:** automated subagent on `v2/command-center-ui`
 **Branches:** read-only against `v2/command-center-close-the-gap` (HEAD `4b742cc`); v0.2 was pinned to `v2/command-center` (HEAD `37a30b0`).
 **Scope:** Single-page admin dashboard for the Sentinel Command Center FastAPI service. **No backend changes.**
@@ -27,11 +27,11 @@ The dashboard is **read-mostly** today: only `POST /executions`, `cancel`, and `
 
 | CLI feature | Backend surface today | Dashboard surface | Status |
 | --- | --- | --- | --- |
-| `sentinel plan TICKET` | `POST /executions kind=plan` | **Worktree → Plan** action (card-scoped, calls API directly with the card's ticket+kind; `data-testid="worktree-<slug>-start-plan"`) | wired |
-| `sentinel execute TICKET` | `POST /executions kind=execute` | **Worktree → Execute** action (card-scoped) | wired |
-| `sentinel debrief TICKET` | `POST /executions kind=debrief` | **Worktree → Debrief** action (card-scoped) | wired |
-| Cancel a running run | `POST /executions/{id}/cancel` | **Run drawer → Cancel** | wired |
-| Retry a finished run | `POST /executions/{id}/retry` | **Run drawer → Retry** | wired |
+| `sentinel plan TICKET` | `POST /executions kind=plan` | **Worktree → Plan** action (card-scoped, calls API directly with the card's ticket+kind; `data-testid="worktree-<slug>-start-plan"`). Card moves to the **Plan** column on next list snapshot. | wired |
+| `sentinel execute TICKET` | `POST /executions kind=execute` | **Worktree → Execute** action (card-scoped). Card moves to the **Execution** column. | wired |
+| `sentinel debrief TICKET` | `POST /executions kind=debrief` | **Worktree → Debrief** action (card-scoped). Card moves to the **Debrief** column. | wired |
+| Cancel a running run | `POST /executions/{id}/cancel` | **Worktree card → Cancel** (live only) and **Run drawer → Cancel** | wired |
+| Retry the current stage | `POST /executions/{latest.id}/retry` | **Worktree card → Retry** (re-runs the card's current `kind` against the same ticket) and **Run drawer → Retry** | wired |
 | Live event tail | `WS /executions/{id}/stream` | **Run drawer → Live tail** | wired |
 | Cost & duration | `cost_cents`, `started_at`, `ended_at` on `ExecutionOut` | **KPIs, run rows** | wired |
 | Worktree create / cleanup | CLI-only (`WorktreeManager`) | Per-card `Reset…` / `Delete…` buttons open an explanatory `UnavailableActionDialog` with the planned route + CLI fallback. List view still derives worktrees from `(project, ticket_id)` rows. | partial — affordances visible, action not wired |
@@ -72,7 +72,7 @@ Reconciled against the PPLX research report (`/home/user/workspace/admin-dashboa
 
 ```
 /                       → Overview (KPIs + recent runs + active worktrees)
-/worktrees              → Worktrees board (tickets-as-cards, kanban grouped by status)
+/worktrees              → Worktrees board (tickets-as-cards, kanban grouped by workflow stage Debrief → Plan → Execution)
 /worktrees/:slug        → Single worktree drawer (project_ticketId)
 /executions             → Executions table, filterable
 /executions/:id         → Execution detail (events, agent results, cost) — opens as a drawer
@@ -89,23 +89,54 @@ The browser URL is the source of truth for "what is open"; deep links work.
 
 Each worktree card represents a `(project, ticket_id)` pair. It aggregates:
 
-- **Latest execution status** (one of the six lifecycle states).
+- **Latest execution kind** (`debrief` | `plan` | `execute`) — drives the column.
+- **Latest execution status** (one of the six lifecycle states) — drives the colour chip.
 - **Latest phase** (`phase` field; falls back to "—").
 - **Cost-to-date** sum of `cost_cents` across executions for that worktree.
 - **Last activity** = most recent `ended_at` or `started_at`.
-- **Action chips:** `Plan`, `Execute`, `Debrief`, `Cancel` (only when live), `Retry` (only when terminal).
+- **Action chips:** `Debrief`, `Plan`, `Execute`, `Retry` (when there is a latest run), `Cancel` (only while live).
 
-Kanban columns:
+Board columns are the **workflow stage** of the ticket — order **Debrief → Plan → Execution** — not status. A ticket card moves left-to-right as the operator advances it through the flow:
 
 | Column | Predicate |
 | --- | --- |
-| **Idle** | no live execution in the last hour |
-| **Running** | latest execution is `running` or `queued` (and within the at-risk thresholds) |
-| **At risk** | latest is `running` and `started_at` > 5 min ago, **or** `queued` and `started_at` > 2 min ago |
-| **Failed** | latest is `failed` |
-| **Done** | latest is `succeeded` or `cancelled` |
+| **Debrief** | `latest.kind === "debrief"` (or no executions yet) |
+| **Plan** | `latest.kind === "plan"` |
+| **Execution** | `latest.kind === "execute"` |
+
+Within a column the card's **status** is rendered as a colour chip on the card (border-left + status pill):
+
+| Status | Colour | Source `ExecutionStatus` |
+| --- | --- | --- |
+| **Running** | blue (`var(--info)`) | `running`, `queued`, `cancelling` |
+| **Failed** | red (`var(--danger)`) | `failed` |
+| **Done** | green (`var(--success)`) | `succeeded` |
+| **Idle** | neutral (`var(--text-subtle)`) | `cancelled`, no executions yet |
+
+Action semantics:
+
+- `[Debrief]` / `[Plan]` / `[Execute]` — `POST /executions` with the card's `ticket_id` + `project` + that `kind`. The card refreshes via `onChanged()` and visibly moves to the corresponding column on the next list snapshot. No "New run" modal is opened; the toolbar's **New run** button is the only entry point that still uses the dialog.
+- `[Retry]` — `POST /executions/{latest.id}/retry`. The backend re-runs the *current stage* (same `kind`, same ticket), which matches the user's mental model: "retry whatever stage I'm in." Available whenever there is a `latest` execution; the button surface remains while the run is live so an operator can re-roll a flapping retry without waiting for terminal state.
+- `[Cancel]` — only rendered while `latest` is `running` / `queued` / `cancelling`. Confirms via the existing type-to-confirm dialog and posts `/cancel`.
 
 These predicates are entirely client-side aggregations over `GET /executions?limit=200`.
+
+Card test IDs encode the stage and status so e2e tests can assert workflow movement:
+
+```
+worktree-card-<slug>                       — the card root
+worktree-column-<debrief|plan|execute>     — column container
+worktree-<slug>-stage                       — text node "Debrief" | "Plan" | "Execute"
+worktree-<slug>-status-<running|failed|done|idle>
+worktree-<slug>-start-debrief
+worktree-<slug>-start-plan
+worktree-<slug>-start-execute
+worktree-<slug>-retry
+worktree-<slug>-cancel
+worktree-<slug>-reset / -delete            — coming-soon affordances
+```
+
+Unknown `kind` or `status` values from the backend are handled gracefully: a card with an unrecognised `kind` lands in the **Debrief** column (workflow start) so it stays visible; an unrecognised `status` falls through to neutral `idle` instead of disappearing.
 
 ---
 
@@ -279,6 +310,22 @@ User feedback after the close-the-gap landed flagged three real issues. None of 
 
 Reverified zero backend changes (`src/`, `tests/`, `docker-compose.yml`, `pyproject.toml`, `poetry.lock`, `Dockerfile`). Only `dashboard/src/**` and `docs/dashboard/*` were touched.
 
+### Pass 9 — Workflow-stage board (Debrief → Plan → Execution) (2026-04-27)
+
+User feedback: "tickets should move across columns Debrief → Plan → Execution, with status (running/failed/done) being the colour inside the column, not the column itself." Previously the kanban grouped by *status* (Running / At risk / Failed / Done / Idle), which conflicted with the product mental model of a ticket flowing through stages.
+
+Implementation:
+
+1. `Worktree["bucket"]` was retired in favour of two orthogonal axes: `stage` (`debrief` | `plan` | `execute`) and `status` (`running` | `failed` | `done` | `idle`). `deriveWorktrees` now classifies on `latest.kind` for the column and collapses `latest.status` for the colour.
+2. `pages/Worktrees.tsx` renders the three workflow columns in fixed order. The kanban column header carries `data-testid="worktree-column-<stage>"`; the card carries `data-testid="worktree-card-<slug>"` plus `data-stage` / `data-status` attributes for e2e selectors.
+3. `WorktreeCard` reorders the action chips to `Debrief → Plan → Execute` (matches the column order and the user's spoken workflow). `[Retry]` now retries the card's *current stage* via `POST /executions/{latest.id}/retry` (the backend re-runs the same `kind`), and is exposed whenever a `latest` exists — not only on terminal — so an operator can re-roll a flapping retry without waiting. `[Cancel]` remains live-only.
+4. Stage buttons no longer navigate away to the Run drawer. They `POST /executions` and call `onChanged()`, so on the next 5 s list refresh the card visibly slides into the matching column. We intentionally keep the operator on the board because the stage-flow *is* the unit of work.
+5. Unknown `kind` or `status` values fall through to `debrief` / `idle` respectively so the board never silently drops a card.
+6. Card colour: `running` blue (`var(--info)`), `failed` red (`var(--danger)`), `done` green (`var(--success)`), `idle` neutral. Rendered as a 3 px left border plus the existing `Badge` pill (`statusToneFor(status)`) — colour is never the sole signal (PPLX §4.3, §8.2 still satisfied).
+7. Docs (§5, §2 cross-ref, §4 IA) re-pointed at the new semantics; Pass 9 entry added to `VALIDATION.md`.
+
+No backend file touched. `npm run typecheck` and `npm run build` pass; backend drift check (`git status -s -- src/ tests/ pyproject.toml poetry.lock docker-compose.yml Dockerfile`) is empty.
+
 ### Pass 7 — Close-the-gap reconciliation
 
 - Re-pinned to `v2/command-center-close-the-gap` HEAD `4b742cc`. The orchestrator now emits `agent.started`, `agent.finished`, `test.result`, `finding.posted`, `debrief.turn`, and `revision.requested`; the WebSocket route enforces a per-token connection cap (`service.rate_limits.ws_concurrent_per_token`, default 10) closing with code `1008` and reason `ws_connections_per_token_exhausted`.
@@ -375,4 +422,4 @@ The PPLX research report has been reconciled into §3, §6, and §11 (see Pass 6
 
 ---
 
-*End of spec — v0.3 (close-the-gap reconciled, HEAD `4b742cc`), 2026-04-27.*
+*End of spec — v0.4 (workflow-stage board: Debrief → Plan → Execution), 2026-04-27.*

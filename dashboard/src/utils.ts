@@ -1,4 +1,11 @@
-import type { ExecutionOut, ExecutionStatus, Worktree } from "./types";
+import type {
+  ExecutionKind,
+  ExecutionOut,
+  ExecutionStatus,
+  Worktree,
+  WorktreeStage,
+  WorktreeStatus,
+} from "./types";
 
 export function fmtCost(cents: number | undefined | null): string {
   if (!cents) return "$0.00";
@@ -51,9 +58,6 @@ export function statusTone(
   }
 }
 
-const FIVE_MIN_MS = 5 * 60 * 1000;
-const TWO_MIN_MS = 2 * 60 * 1000;
-const ONE_HOUR_MS = 60 * 60 * 1000;
 
 export function fmtElapsed(start: string | null | undefined): string {
   if (!start) return "—";
@@ -118,7 +122,8 @@ export function deriveWorktrees(executions: ExecutionOut[]): Worktree[] {
       latest,
       total_cost_cents,
       run_count: arr.length,
-      bucket: bucketFor(latest),
+      stage: stageFor(latest),
+      status: statusFor(latest),
     });
   }
   out.sort((a, b) => {
@@ -129,45 +134,83 @@ export function deriveWorktrees(executions: ExecutionOut[]): Worktree[] {
   return out;
 }
 
-function bucketFor(latest: ExecutionOut | null): Worktree["bucket"] {
-  if (!latest) return "idle";
-  const startedAt = new Date(latest.started_at).getTime();
-  const live = latest.status === "running" || latest.status === "queued";
-  if (live) {
-    // Queued runs are flagged at-risk earlier (2m) — sitting in the queue
-    // longer than that usually means the worker pool is exhausted, not that
-    // the run is healthy. Running gets the original 5m grace.
-    const ageMs = Date.now() - startedAt;
-    const threshold =
-      latest.status === "queued" ? TWO_MIN_MS : FIVE_MIN_MS;
-    const stale = ageMs > threshold && !latest.ended_at;
-    return stale ? "at_risk" : "running";
+/**
+ * The card lives in whichever stage column matches its latest execution
+ * `kind`. If there is no execution yet, the ticket starts at the front of
+ * the workflow (`debrief`). Unknown kinds fall back to `debrief` so the
+ * board never silently drops a card.
+ */
+function stageFor(latest: ExecutionOut | null): WorktreeStage {
+  if (!latest) return "debrief";
+  if (latest.kind === "debrief" || latest.kind === "plan" || latest.kind === "execute") {
+    return latest.kind;
   }
-  if (latest.status === "failed") return "failed";
-  if (latest.status === "succeeded" || latest.status === "cancelled")
-    return "done";
-  if (latest.status === "cancelling") return "running";
-  // idle if last activity > 1h
-  const last = latest.ended_at ? new Date(latest.ended_at).getTime() : startedAt;
-  return Date.now() - last > ONE_HOUR_MS ? "idle" : "done";
+  return "debrief";
 }
 
-export function bucketLabel(b: Worktree["bucket"]): string {
-  return {
-    idle: "Idle",
-    running: "Running",
-    at_risk: "At risk",
-    failed: "Failed",
-    done: "Done",
-  }[b];
+/**
+ * Visual status inside the stage. The user-facing semantics are:
+ *   running → blue   (queued / running / cancelling collapse here)
+ *   failed  → red
+ *   done    → green  (succeeded only — cancelled is treated as idle)
+ *   idle    → neutral
+ */
+function statusFor(latest: ExecutionOut | null): WorktreeStatus {
+  if (!latest) return "idle";
+  switch (latest.status) {
+    case "running":
+    case "queued":
+    case "cancelling":
+      return "running";
+    case "failed":
+      return "failed";
+    case "succeeded":
+      return "done";
+    case "cancelled":
+      return "idle";
+  }
 }
 
-export function bucketDot(b: Worktree["bucket"]): string {
+export const WORKTREE_STAGES: WorktreeStage[] = ["debrief", "plan", "execute"];
+
+export function stageLabel(s: WorktreeStage): string {
+  return { debrief: "Debrief", plan: "Plan", execute: "Execution" }[s];
+}
+
+export function stageDot(s: WorktreeStage): string {
   return {
-    idle: "var(--text-subtle)",
+    debrief: "var(--text-subtle)",
+    plan: "var(--primary)",
+    execute: "var(--success)",
+  }[s];
+}
+
+export function statusLabel(s: WorktreeStatus): string {
+  return { running: "Running", failed: "Failed", done: "Done", idle: "Idle" }[s];
+}
+
+/**
+ * Status colour token. Maps to the requested palette: running blue, failed
+ * red, done green, idle neutral. Used both for the chip border and the
+ * rounded indicator on the card.
+ */
+export function statusColor(s: WorktreeStatus): string {
+  return {
     running: "var(--info)",
-    at_risk: "var(--warning)",
     failed: "var(--danger)",
     done: "var(--success)",
-  }[b];
+    idle: "var(--text-subtle)",
+  }[s];
+}
+
+export function statusToneFor(
+  s: WorktreeStatus
+): "info" | "danger" | "success" | "default" {
+  return { running: "info", failed: "danger", done: "success", idle: "default" }[
+    s
+  ] as "info" | "danger" | "success" | "default";
+}
+
+export function kindLabel(k: ExecutionKind): string {
+  return { debrief: "Debrief", plan: "Plan", execute: "Execute" }[k];
 }

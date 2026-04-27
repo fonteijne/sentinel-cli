@@ -1,6 +1,6 @@
 # Dashboard validation log
 
-Nine passes have been run against the spec and the implementation on branch `v2/command-center-ui`. The reference branch was re-pinned in Pass 7 from `v2/command-center` (HEAD `37a30b0`) to `v2/command-center-close-the-gap` (HEAD `4b742cc`). Pass 8 ships the dashboard as a profile-gated service in the existing `docker-compose.yml`. Pass 9 fixes three user-feedback issues: card action buttons not honoring kind, missing worktree reset/delete affordances, and the "no GitLab plan/debrief" silence. This log is the authoritative record referenced by `SETUP_AND_SPEC.md` §12.
+Ten passes have been run against the spec and the implementation on branch `v2/command-center-ui`. The reference branch was re-pinned in Pass 7 from `v2/command-center` (HEAD `37a30b0`) to `v2/command-center-close-the-gap` (HEAD `4b742cc`). Pass 8 ships the dashboard as a profile-gated service in the existing `docker-compose.yml`. Pass 9 fixes three user-feedback issues: card action buttons not honoring kind, missing worktree reset/delete affordances, and the "no GitLab plan/debrief" silence. Pass 10 retools the worktree board so columns represent the user's workflow stage (Debrief → Plan → Execution) and status is rendered as a colour chip inside each card. This log is the authoritative record referenced by `SETUP_AND_SPEC.md` §12.
 
 ---
 
@@ -325,6 +325,67 @@ $ git diff --stat origin/v2/command-center-ui... -- src/ tests/ pyproject.toml p
 - No live browser walkthrough was performed (no display in the agent sandbox); the build + typecheck are the validation gates this pass.
 
 **Result:** the three reported issues are addressed without backend changes, and the docs no longer overclaim what the dashboard does. ✅
+
+---
+
+## Pass 10 — Workflow-stage worktree board (Debrief → Plan → Execution)
+
+**Date:** 2026-04-27
+**User feedback:** "tickets should move across columns Debrief → Plan → Execution. Status (running/failed/done) should be the colour inside the column. `[retry]` should retry the card's current stage. `[debrief]` / `[plan]` / `[execute]` should trigger that flow and the card should move to the matching column."
+
+**Root cause:** the previous board grouped by *status* (Running / At risk / Failed / Done / Idle), which conflicted with the user's product mental model — a ticket flows through workflow stages, not through statuses. Status is sub-state inside the stage.
+
+**Files changed (frontend only):**
+
+| File | Change |
+| --- | --- |
+| `dashboard/src/types.ts` | Replaced `Worktree["bucket"]` with two orthogonal axes: `stage` (`debrief` \| `plan` \| `execute`) and `status` (`running` \| `failed` \| `done` \| `idle`). Added exported `WorktreeStage` / `WorktreeStatus` aliases. |
+| `dashboard/src/utils.ts` | `deriveWorktrees` now classifies on `latest.kind` for the stage and collapses `latest.status` for the status. New helpers `WORKTREE_STAGES`, `stageLabel`, `stageDot`, `statusLabel`, `statusColor`, `statusToneFor`, `kindLabel`. Old `bucketFor` / `bucketLabel` / `bucketDot` and the `FIVE_MIN_MS` / `TWO_MIN_MS` / `ONE_HOUR_MS` thresholds removed. |
+| `dashboard/src/pages/Worktrees.tsx` | Columns iterate `WORKTREE_STAGES` (Debrief / Plan / Execution). Stage actions no longer navigate to the run drawer — they `POST /executions` and `onChanged()` so the card moves columns on the next list refresh. New per-card `retry` handler retries `latest.id` (same `kind`). Pending-action key extended to support `retry`. New testid `worktree-column-<stage>`. |
+| `dashboard/src/components/WorktreeCard.tsx` | Stage chip order is Debrief → Plan → Execute (matches column order). Status badge uses `statusToneFor(status)` — running info-blue, failed danger-red, done success-green, idle neutral. Card root carries `data-stage` / `data-status` for e2e selectors and a 3 px left border in the stage colour. `[Retry]` button is now stage-aware and rendered whenever a `latest` execution exists, not only when terminal. New testids: `worktree-card-<slug>`, `worktree-<slug>-stage`, `worktree-<slug>-status-<state>`, `worktree-<slug>-raw-status`. |
+| `docs/dashboard/SETUP_AND_SPEC.md` | §2 cross-ref table updated; §4 IA descriptor; §5 rewritten around stages/status; new Pass 9 entry under §12; status-line bumped to v0.4. |
+| `docs/dashboard/VALIDATION.md` | This Pass 10 entry. |
+
+**Behaviour now:**
+
+- Three columns, fixed left-to-right: **Debrief**, **Plan**, **Execution**. Cards land in whichever column matches `latest.kind`; cards with no executions yet sit in **Debrief** (workflow start).
+- Card colour: `running` blue (`var(--info)`), `failed` red (`var(--danger)`), `done` green (`var(--success)`), `idle` neutral. Rendered as both a `Badge` pill (icon + dot + text) and a 3 px left border on the card so colour is never the sole signal (PPLX §4.3, §8.2 still satisfied).
+- Stage buttons (`[Debrief]` / `[Plan]` / `[Execute]`) post a fresh execution of that kind for the card's `(ticket_id, project)` with an Idempotency-Key. Card refreshes on `onChanged()` and visibly slides into the matching column on the next 5 s list refresh. No "New run" dialog is opened (toolbar's New run button still uses it). HTTP 422 falls through to the dialog as a validation safety net.
+- `[Retry]` posts `POST /executions/{latest.id}/retry`. The backend re-runs the same `kind` against the same ticket, which matches "retry the current stage." Available whenever there is a `latest` execution; the button stays available while a run is live so an operator can re-roll a flapping retry.
+- `[Cancel]` is rendered only while `latest.status` ∈ {`running`, `queued`, `cancelling`} and goes through the existing type-to-confirm dialog.
+- Unknown `kind` from the backend falls through to **Debrief** (workflow start) and unknown `status` falls through to `idle` neutral, so the board never silently drops a card.
+
+**Verification:**
+
+```bash
+$ cd dashboard && npm install --no-audit --no-fund
+(node_modules already populated)
+$ npm run typecheck
+> tsc --noEmit
+(no output — clean)
+$ npm run build
+> tsc -b && vite build
+✓ built in 1.35s — dashboard/dist/ produced (213.45 kB JS, 18.32 kB CSS)
+```
+
+**No-backend-drift check:**
+
+```bash
+$ git status -s -- src/ tests/ pyproject.toml poetry.lock Dockerfile docker-compose.yml
+(empty)
+```
+
+**Storage check:** no new `localStorage` / `sessionStorage` paths introduced.
+**Accessibility check:** every card action keeps its `aria-label`; status badges expose colour + icon (dot) + text per PPLX §4.3; new test IDs are additive.
+
+**Limitations:**
+
+- Card movement is *eventual*, not optimistic — it relies on the 5 s `GET /executions` poll picking up the newly-created execution. The previous behaviour of navigating to the run drawer on click was removed because it disrupted the board flow; if the operator wants to inspect events, the card title remains a link.
+- The `[Cancel]` confirm dialog still uses type-to-confirm on the ticket id (existing behaviour, not part of this pass).
+- No live browser walkthrough was performed (no display in the agent sandbox); typecheck + build are the validation gates.
+- Backend `WorktreeManager` HTTP CRUD remains absent — `Reset…` / `Delete…` still surface `UnavailableActionDialog`. Out of scope per the no-backend-changes constraint.
+
+**Result:** the worktree board now matches the user's stated workflow vocabulary; status is colour, stage is column; backend untouched. ✅
 
 ---
 

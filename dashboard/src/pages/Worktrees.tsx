@@ -6,8 +6,18 @@ import { StartRunDialog } from "../components/StartRunDialog";
 import { WorktreeCard } from "../components/WorktreeCard";
 import { Icon } from "../icons";
 import { navigate } from "../routes";
-import type { ExecutionKind, ExecutionOut, Worktree } from "../types";
-import { bucketDot, bucketLabel, deriveWorktrees } from "../utils";
+import type {
+  ExecutionKind,
+  ExecutionOut,
+  Worktree,
+  WorktreeStage,
+} from "../types";
+import {
+  WORKTREE_STAGES,
+  deriveWorktrees,
+  stageDot,
+  stageLabel,
+} from "../utils";
 import { api, ApiError, makeIdempotencyKey } from "../api";
 
 interface Props {
@@ -18,7 +28,10 @@ interface Props {
   onChanged: () => void;
 }
 
-const COLUMNS: Worktree["bucket"][] = ["running", "at_risk", "failed", "done", "idle"];
+// Workflow column order: a ticket flows Debrief → Plan → Execution. The
+// card's column is determined by the `kind` of its latest execution; status
+// (running / failed / done) is rendered inside the card via colour.
+const COLUMNS: WorktreeStage[] = WORKTREE_STAGES;
 
 export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Props) {
   const worktrees = useMemo(() => deriveWorktrees(executions), [executions]);
@@ -52,14 +65,12 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
       )
     : worktrees;
 
-  const grouped: Record<Worktree["bucket"], Worktree[]> = {
-    running: [],
-    at_risk: [],
-    failed: [],
-    done: [],
-    idle: [],
+  const grouped: Record<WorktreeStage, Worktree[]> = {
+    debrief: [],
+    plan: [],
+    execute: [],
   };
-  for (const w of filtered) grouped[w.bucket].push(w);
+  for (const w of filtered) grouped[w.stage].push(w);
 
   // Track which card+kind action is currently submitting so we can disable
   // its button and keep clicks idempotent. Keyed by `${slug}::${kind}`.
@@ -81,7 +92,7 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
     setPendingCardAction(key);
     setError(null);
     try {
-      const created = await api.startExecution(
+      await api.startExecution(
         { baseUrl, token },
         {
           ticket_id: wt.ticket_id,
@@ -90,8 +101,11 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
         },
         makeIdempotencyKey()
       );
+      // Refetch executions — the card will re-render in the new stage column
+      // (debrief / plan / execute) on the next snapshot. We intentionally
+      // don't navigate away to the run drawer so the operator stays on the
+      // board and watches the card move; the ticket-flow is the goal here.
       onChanged();
-      navigate("executions", created.id);
     } catch (e) {
       if (e instanceof ApiError) {
         // 422 from the backend means our preset failed validation — fall
@@ -126,12 +140,23 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
     }
   };
 
-  const retry = async (id: string) => {
+  // Retry the card's *current stage* — the backend `POST /executions/{id}/retry`
+  // re-runs the same `kind` against the same ticket, which is exactly what
+  // the user expects from the per-card `[retry]` button.
+  const retry = async (wt: Worktree) => {
+    if (!wt.latest) return;
+    const key = `${wt.slug}::retry`;
+    if (pendingCardAction === key) return;
+    setPendingCardAction(key);
+    setError(null);
     try {
-      await api.retryExecution({ baseUrl, token }, id);
+      await api.retryExecution({ baseUrl, token }, wt.latest.id);
       onChanged();
     } catch (e) {
       if (e instanceof ApiError) setError(`Retry failed: HTTP ${e.status} ${e.detail ?? ""}`);
+      else if (e instanceof Error) setError(`Retry failed: ${e.message}`);
+    } finally {
+      setPendingCardAction(null);
     }
   };
 
@@ -215,8 +240,12 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
         />
       ) : (
         <div className="kanban">
-          {COLUMNS.map((b) => (
-            <div key={b} className="kanban-col">
+          {COLUMNS.map((stage) => (
+            <div
+              key={stage}
+              className="kanban-col"
+              data-testid={`worktree-column-${stage}`}
+            >
               <div className="kanban-col-head between">
                 <div className="inline-2">
                   <span
@@ -224,35 +253,53 @@ export function Worktrees({ baseUrl, token, executions, loading, onChanged }: Pr
                       width: 8,
                       height: 8,
                       borderRadius: 50,
-                      background: bucketDot(b),
+                      background: stageDot(stage),
                       display: "inline-block",
                     }}
                   />
-                  <span>{bucketLabel(b)}</span>
-                  <span className="kanban-col-count">{grouped[b].length}</span>
+                  <span>{stageLabel(stage)}</span>
+                  <span className="kanban-col-count">
+                    {grouped[stage].length}
+                  </span>
                 </div>
               </div>
-              {grouped[b].map((w) => (
-                <WorktreeCard
-                  key={w.slug}
-                  wt={w}
-                  pendingKind={
-                    pendingCardAction?.startsWith(`${w.slug}::`)
-                      ? (pendingCardAction.split("::")[1] as ExecutionKind)
-                      : null
-                  }
-                  onOpen={() => w.latest && navigate("executions", w.latest.id)}
-                  onStart={(k) => startKindFromCard(w, k)}
-                  onCancel={() => {
-                    if (w.latest) {
-                      setConfirmCancel({ id: w.latest.id, ticket: w.ticket_id });
+              {grouped[stage].map((w) => {
+                const cardPending = pendingCardAction?.startsWith(`${w.slug}::`)
+                  ? (pendingCardAction.split("::")[1] ?? null)
+                  : null;
+                const pendingKind =
+                  cardPending && cardPending !== "retry"
+                    ? (cardPending as ExecutionKind)
+                    : null;
+                const retrying = cardPending === "retry";
+                return (
+                  <WorktreeCard
+                    key={w.slug}
+                    wt={w}
+                    pendingKind={pendingKind}
+                    retrying={retrying}
+                    onOpen={() =>
+                      w.latest && navigate("executions", w.latest.id)
                     }
-                  }}
-                  onRetry={() => w.latest && retry(w.latest.id)}
-                  onResetRequest={() => setResetRequest({ slug: w.slug })}
-                  onDeleteRequest={() => setDeleteRequest({ slug: w.slug })}
-                />
-              ))}
+                    onStart={(k) => startKindFromCard(w, k)}
+                    onCancel={() => {
+                      if (w.latest) {
+                        setConfirmCancel({
+                          id: w.latest.id,
+                          ticket: w.ticket_id,
+                        });
+                      }
+                    }}
+                    onRetry={() => retry(w)}
+                    onResetRequest={() =>
+                      setResetRequest({ slug: w.slug })
+                    }
+                    onDeleteRequest={() =>
+                      setDeleteRequest({ slug: w.slug })
+                    }
+                  />
+                );
+              })}
             </div>
           ))}
         </div>

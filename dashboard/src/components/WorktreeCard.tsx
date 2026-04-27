@@ -1,13 +1,23 @@
 import { Badge } from "./Badge";
 import { Icon } from "../icons";
 import type { ExecutionKind, Worktree } from "../types";
-import { fmtCost, fmtElapsed, fmtRelative, statusTone } from "../utils";
+import {
+  fmtCost,
+  fmtElapsed,
+  fmtRelative,
+  kindLabel,
+  statusColor,
+  statusLabel,
+  statusToneFor,
+} from "../utils";
 
 interface Props {
   wt: Worktree;
-  /** When set, the matching action button shows a busy state and is
+  /** When set, the matching stage button shows a busy state and is
    *  disabled. Other action buttons stay clickable. */
   pendingKind: ExecutionKind | null;
+  /** True while a `[retry]` is in flight for this card. */
+  retrying: boolean;
   onOpen: () => void;
   onStart: (kind: ExecutionKind) => void;
   onCancel: () => void;
@@ -21,6 +31,7 @@ interface Props {
 export function WorktreeCard({
   wt,
   pendingKind,
+  retrying,
   onOpen,
   onStart,
   onCancel,
@@ -32,13 +43,20 @@ export function WorktreeCard({
     wt.latest?.status === "running" ||
     wt.latest?.status === "queued" ||
     wt.latest?.status === "cancelling";
-  const terminal =
-    wt.latest?.status === "succeeded" ||
-    wt.latest?.status === "failed" ||
-    wt.latest?.status === "cancelled";
+  const hasLatest = !!wt.latest;
+  const stageColor = statusColor(wt.status);
+  const stageBadgeText = statusLabel(wt.status);
 
   return (
-    <div className="task-card">
+    <div
+      className="task-card"
+      data-testid={`worktree-card-${wt.slug}`}
+      data-stage={wt.stage}
+      data-status={wt.status}
+      style={{
+        borderLeft: `3px solid ${stageColor}`,
+      }}
+    >
       <div className="between">
         <span
           className="badge"
@@ -46,11 +64,13 @@ export function WorktreeCard({
         >
           {wt.project}
         </span>
-        {wt.latest && (
-          <Badge tone={statusTone(wt.latest.status)} dot>
-            {wt.latest.status}
-          </Badge>
-        )}
+        <Badge
+          tone={statusToneFor(wt.status)}
+          dot
+          data-testid={`worktree-${wt.slug}-status-${wt.status}`}
+        >
+          {stageBadgeText}
+        </Badge>
       </div>
 
       {wt.latest?.status === "queued" && (
@@ -70,19 +90,33 @@ export function WorktreeCard({
           background: "none",
           padding: 0,
           textAlign: "left",
-          cursor: wt.latest ? "pointer" : "default",
+          cursor: hasLatest ? "pointer" : "default",
         }}
-        onClick={() => wt.latest && onOpen()}
+        onClick={() => hasLatest && onOpen()}
       >
         <span className="font-mono">{wt.ticket_id}</span>
       </button>
 
-      {wt.latest?.phase && (
-        <div className="inline-2 muted" style={{ fontSize: "var(--fs-xs)" }}>
-          <Icon name="layers" size={12} />
-          phase: <strong>{wt.latest.phase}</strong>
-        </div>
-      )}
+      <div className="inline-2 muted" style={{ fontSize: "var(--fs-xs)" }}>
+        <Icon name="layers" size={12} />
+        stage:{" "}
+        <strong data-testid={`worktree-${wt.slug}-stage`}>
+          {kindLabel(wt.stage)}
+        </strong>
+        {wt.latest?.phase ? (
+          <span style={{ marginLeft: 8 }}>
+            · phase: <strong>{wt.latest.phase}</strong>
+          </span>
+        ) : null}
+        {wt.latest?.status ? (
+          <span
+            style={{ marginLeft: 8 }}
+            data-testid={`worktree-${wt.slug}-raw-status`}
+          >
+            · {wt.latest.status}
+          </span>
+        ) : null}
+      </div>
 
       <div className="task-meta" style={{ alignItems: "center" }}>
         <div className="inline-3 muted" style={{ fontSize: "var(--fs-xs)" }}>
@@ -99,10 +133,19 @@ export function WorktreeCard({
         </div>
       </div>
 
+      {/* Stage actions — clicking moves the card into that workflow column.
+          Order matches the board: Debrief → Plan → Execute. */}
       <div className="inline-2" style={{ marginTop: 8, flexWrap: "wrap" }}>
         <KindButton
+          kind="debrief"
+          icon="msg"
+          slug={wt.slug}
+          ticket={wt.ticket_id}
+          pendingKind={pendingKind}
+          onStart={onStart}
+        />
+        <KindButton
           kind="plan"
-          label="Plan"
           icon="rocket"
           slug={wt.slug}
           ticket={wt.ticket_id}
@@ -111,17 +154,7 @@ export function WorktreeCard({
         />
         <KindButton
           kind="execute"
-          label="Execute"
           icon="play"
-          slug={wt.slug}
-          ticket={wt.ticket_id}
-          pendingKind={pendingKind}
-          onStart={onStart}
-        />
-        <KindButton
-          kind="debrief"
-          label="Debrief"
-          icon="msg"
           slug={wt.slug}
           ticket={wt.ticket_id}
           pendingKind={pendingKind}
@@ -137,14 +170,16 @@ export function WorktreeCard({
             <Icon name="stop" size={12} /> Cancel
           </button>
         )}
-        {terminal && (
+        {hasLatest && (
           <button
-            className="btn btn-primary btn-sm"
+            className="btn btn-secondary btn-sm"
             onClick={onRetry}
+            disabled={retrying}
             data-testid={`worktree-${wt.slug}-retry`}
-            aria-label={`Retry latest run for ${wt.ticket_id}`}
+            aria-label={`Retry ${kindLabel(wt.stage).toLowerCase()} for ${wt.ticket_id}`}
+            title={`Retry ${kindLabel(wt.stage)} for ${wt.ticket_id}`}
           >
-            <Icon name="refresh" size={12} /> Retry
+            <Icon name="refresh" size={12} /> {retrying ? "Retry…" : "Retry"}
           </button>
         )}
       </div>
@@ -192,7 +227,6 @@ export function WorktreeCard({
 
 function KindButton({
   kind,
-  label,
   icon,
   slug,
   ticket,
@@ -200,7 +234,6 @@ function KindButton({
   onStart,
 }: {
   kind: ExecutionKind;
-  label: string;
   icon: "rocket" | "play" | "msg";
   slug: string;
   ticket: string;
@@ -208,6 +241,7 @@ function KindButton({
   onStart: (k: ExecutionKind) => void;
 }) {
   const busy = pendingKind === kind;
+  const label = kindLabel(kind);
   return (
     <button
       className="btn btn-secondary btn-sm"
