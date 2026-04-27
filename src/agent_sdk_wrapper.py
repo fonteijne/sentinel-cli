@@ -4,12 +4,13 @@ import asyncio
 import json as _json
 import os
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ClaudeSDKError
 from claude_agent_sdk.types import AssistantMessage, SystemPromptPreset, TextBlock, ToolUseBlock
 
 from typing import TYPE_CHECKING
@@ -26,6 +27,39 @@ class AgentTimeoutError(Exception):
     """Raised when an agent exceeds its configured execution timeout."""
 
 logger = logging.getLogger(__name__)
+
+
+_RATE_LIMIT_HINT = re.compile(r"\b(?:429|529|rate[ _-]?limit(?:ed)?)\b", re.IGNORECASE)
+_RETRY_AFTER_HINT = re.compile(
+    r"retry[ _-]?after[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE
+)
+
+
+def _classify_rate_limit(exc: BaseException) -> tuple[bool, float | None]:
+    """Return (is_rate_limit, retry_after_s) for a SDK/CLI exception.
+
+    The claude-agent-sdk does not expose a dedicated rate-limit exception
+    class (all CLI failures bubble as ``ClaudeSDKError``/``ProcessError``).
+    We sniff the message and, if present, the ``stderr`` attribute for the
+    429/529 signatures plus any ``retry-after`` hint.
+    """
+    haystacks: list[str] = [str(exc)]
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, str):
+        haystacks.append(stderr)
+
+    blob = "\n".join(haystacks)
+    if not _RATE_LIMIT_HINT.search(blob):
+        return False, None
+
+    retry_after: float | None = None
+    m = _RETRY_AFTER_HINT.search(blob)
+    if m:
+        try:
+            retry_after = float(m.group(1))
+        except ValueError:
+            retry_after = None
+    return True, retry_after
 
 
 def _usage_field(usage: Any, name: str) -> int:
@@ -442,63 +476,88 @@ class AgentSDKWrapper:
             last_heartbeat = stream_start
             msg_count = 0
             text_chars = 0
-            async for message in client.receive_response():
-                msg_count += 1
-                now = time.monotonic()
+            # Wrap the stream in a try/except: when the SDK surfaces a rate
+            # limit (429/529 from upstream) we publish ``RateLimited`` as an
+            # observation before re-raising. The SDK itself does retry/backoff
+            # for transient blips; what reaches us here is the final failure
+            # so the supervisor/worker can decide what to do.
+            try:
+                async for message in client.receive_response():
+                    msg_count += 1
+                    now = time.monotonic()
 
-                # Heartbeat: log progress every 30s during long generation
-                if now - last_heartbeat >= 30:
-                    elapsed = now - stream_start
-                    logger.info(
-                        f"[{self.agent_name}] ♥ alive: {elapsed:.0f}s, "
-                        f"{msg_count} msgs, {len(tool_uses)} tools, "
-                        f"{text_chars} text chars so far"
-                    )
-                    last_heartbeat = now
+                    # Heartbeat: log progress every 30s during long generation
+                    if now - last_heartbeat >= 30:
+                        elapsed = now - stream_start
+                        logger.info(
+                            f"[{self.agent_name}] ♥ alive: {elapsed:.0f}s, "
+                            f"{msg_count} msgs, {len(tool_uses)} tools, "
+                            f"{text_chars} text chars so far"
+                        )
+                        last_heartbeat = now
 
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            responses.append(block.text)
-                            text_chars += len(block.text)
-                            elapsed_in_stream = now - stream_start
-                            logger.debug(
-                                f"[{self.agent_name}] Text block ({len(block.text)} chars, "
-                                f"{elapsed_in_stream:.1f}s into stream)"
-                            )
-                        elif isinstance(block, ToolUseBlock):
-                            elapsed_in_stream = now - stream_start
-                            tool_uses.append({
-                                "tool": block.name,
-                                "input": block.input
-                            })
-                            input_preview = str(block.input.get("command", block.input))[:200] if isinstance(block.input, dict) else str(block.input)[:200]
-                            logger.info(f"[{self.agent_name}] Tool use: {block.name} ({elapsed_in_stream:.1f}s into stream) - {input_preview}")
-                            self._write_diagnostic("tool_use", {
-                                "tool": block.name,
-                                "input": block.input if isinstance(block.input, dict) else str(block.input),
-                                "tool_index": len(tool_uses),
-                                "elapsed_s": round(elapsed_in_stream, 1),
-                            }, cwd=cwd)
-                            self._publish_tool_called(tool=block.name, args_summary=input_preview)
-                # Extract session ID from ResultMessage
-                if hasattr(message, 'session_id'):
-                    final_session_id = message.session_id
+                    # In-stream rate_limit signal: AssistantMessage.error is a
+                    # soft marker the CLI emits when upstream throttles briefly.
+                    # We publish the observation and let the stream keep going —
+                    # raising here would short-circuit valid later content.
+                    if (
+                        isinstance(message, AssistantMessage)
+                        and getattr(message, "error", None) == "rate_limit"
+                    ):
+                        self._publish_rate_limited(retry_after_s=None)
 
-                # Best-effort cost accrual — not every ResultMessage carries usage,
-                # but when it does we forward tokens_in/out/cost to the bus so the
-                # orchestrator's subscriber can update executions.cost_cents.
-                usage = getattr(message, "usage", None)
-                total_cost_usd = getattr(message, "total_cost_usd", None)
-                if usage is not None or total_cost_usd is not None:
-                    tokens_in = _usage_field(usage, "input_tokens")
-                    tokens_out = _usage_field(usage, "output_tokens")
-                    cents = int(round((total_cost_usd or 0) * 100))
-                    self._publish_cost_accrued(
-                        tokens_in=tokens_in,
-                        tokens_out=tokens_out,
-                        cents=cents,
-                    )
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                responses.append(block.text)
+                                text_chars += len(block.text)
+                                elapsed_in_stream = now - stream_start
+                                logger.debug(
+                                    f"[{self.agent_name}] Text block ({len(block.text)} chars, "
+                                    f"{elapsed_in_stream:.1f}s into stream)"
+                                )
+                            elif isinstance(block, ToolUseBlock):
+                                elapsed_in_stream = now - stream_start
+                                tool_uses.append({
+                                    "tool": block.name,
+                                    "input": block.input
+                                })
+                                input_preview = str(block.input.get("command", block.input))[:200] if isinstance(block.input, dict) else str(block.input)[:200]
+                                logger.info(f"[{self.agent_name}] Tool use: {block.name} ({elapsed_in_stream:.1f}s into stream) - {input_preview}")
+                                self._write_diagnostic("tool_use", {
+                                    "tool": block.name,
+                                    "input": block.input if isinstance(block.input, dict) else str(block.input),
+                                    "tool_index": len(tool_uses),
+                                    "elapsed_s": round(elapsed_in_stream, 1),
+                                }, cwd=cwd)
+                                self._publish_tool_called(tool=block.name, args_summary=input_preview)
+                    # Extract session ID from ResultMessage
+                    if hasattr(message, 'session_id'):
+                        final_session_id = message.session_id
+
+                    # Best-effort cost accrual — not every ResultMessage carries usage,
+                    # but when it does we forward tokens_in/out/cost to the bus so the
+                    # orchestrator's subscriber can update executions.cost_cents.
+                    usage = getattr(message, "usage", None)
+                    total_cost_usd = getattr(message, "total_cost_usd", None)
+                    if usage is not None or total_cost_usd is not None:
+                        tokens_in = _usage_field(usage, "input_tokens")
+                        tokens_out = _usage_field(usage, "output_tokens")
+                        cents = int(round((total_cost_usd or 0) * 100))
+                        self._publish_cost_accrued(
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            cents=cents,
+                        )
+            except ClaudeSDKError as exc:
+                # The SDK does not ship a dedicated RateLimitError; 429/529 from
+                # upstream bubble up as ``ClaudeSDKError`` subclasses (notably
+                # ``ProcessError`` with stderr set). We publish the observation
+                # before re-raising so downstream failure handling is unchanged.
+                is_rl, retry_after = _classify_rate_limit(exc)
+                if is_rl:
+                    self._publish_rate_limited(retry_after_s=retry_after)
+                raise
 
         total_elapsed = time.monotonic() - sdk_start
         logger.info(f"[{self.agent_name}] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {total_elapsed:.1f}s total")

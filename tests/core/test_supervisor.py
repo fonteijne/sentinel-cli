@@ -168,8 +168,8 @@ def test_reconcile_orphaned_queued_row(db, supervisor):
     """Set C: a queued row without a workers row is marked failed=spawn_interrupted."""
     repo = ExecutionRepository(db)
     ex = repo.create("T-QORPH", "proj", ExecutionKind.EXECUTE)
-    # Coerce status to QUEUED since create() defaults to RUNNING
-    db.execute("UPDATE executions SET status='queued' WHERE id=?", (ex.id,))
+    # create() defaults to QUEUED — no coercion needed.
+    assert ex.status == ExecutionStatus.QUEUED
 
     adopted, reconciled = supervisor.adopt_or_reconcile_on_startup()
 
@@ -219,3 +219,104 @@ def test_env_allowlist_shape():
     finally:
         os.environ.pop("SENTINEL_TEST_KEY", None)
         os.environ.pop("DEFINITELY_NOT_ALLOWED_QZQZ", None)
+
+
+def test_spawn_env_isolation_under_concurrent_requests(db, supervisor, monkeypatch):
+    """Concurrent ``Supervisor.spawn`` calls must not leak env vars between spawns.
+
+    Seeds four allow-listed marker env vars (``SENTINEL_TEST_MARKER_<i>``) *before*
+    the concurrent spawn burst. Each spawn's fake ``Process.start`` snapshots the
+    value of its assigned marker from ``os.environ``. Plan 04's guarantee: the
+    env-swap window is serialized under ``self._lock``, so during any one spawn's
+    ``proc.start()`` the global ``os.environ`` contains the full allowlist — no
+    other thread can be mid-swap (``clear()`` then ``update()``) while this one
+    reads. Without serialization, a concurrent spawn's ``os.environ.clear()``
+    would leave readers seeing ``<missing>`` (G-09).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from src.core.execution.models import ExecutionKind
+
+    repo = ExecutionRepository(db)
+    executions = [
+        repo.create(f"T-CONC-{i}", "proj", ExecutionKind.EXECUTE) for i in range(4)
+    ]
+    for ex in executions:
+        repo.set_status(ex.id, ExecutionStatus.QUEUED)
+
+    # Seed one marker per execution. All use the ``SENTINEL_`` prefix so they
+    # pass the allowlist and land in the snapshotted env.
+    id_to_key = {ex.id: f"SENTINEL_TEST_MARKER_{i}" for i, ex in enumerate(executions)}
+    for ex_id, key in id_to_key.items():
+        os.environ[key] = ex_id
+
+    observed: dict[str, str] = {}
+    observed_lock = __import__("threading").Lock()
+
+    class _FakeProc:
+        """Mimics multiprocessing.Process just enough for Supervisor.spawn."""
+
+        _next_pid = 900000
+
+        def __init__(self, *args, **kwargs):
+            self.pid: int | None = None
+            type(self)._next_pid += 1
+            self._assigned_pid = type(self)._next_pid
+            # Capture the execution id passed to _worker_entry as args=(execution_id,).
+            positional = kwargs.get("args", args[0] if args else ())
+            self._execution_id = positional[0] if positional else None
+
+        def start(self) -> None:
+            # Dwell a hair inside the lock so concurrent spawns are forced to queue.
+            time.sleep(0.005)
+            my_key = id_to_key[self._execution_id]
+            val = os.environ.get(my_key, "<missing>")
+            # With correct serialization, every marker we seeded is still present
+            # when this executes — no concurrent swap can have wiped them.
+            observed_all = {
+                k: os.environ.get(k, "<missing>") for k in id_to_key.values()
+            }
+            with observed_lock:
+                observed[self._execution_id] = val
+                observed[f"_all_for_{self._execution_id}"] = repr(observed_all)
+            self.pid = self._assigned_pid
+
+        def is_alive(self) -> bool:
+            return False
+
+    class _FakeCtx:
+        def Process(self, *args, **kwargs):
+            return _FakeProc(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "_ctx", _FakeCtx())
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(supervisor.spawn, ex.id) for ex in executions]
+            pids = [f.result(timeout=10) for f in futures]
+
+        # 1. Each spawn saw its own marker under its own key — no leakage.
+        for ex in executions:
+            assert observed.get(ex.id) == ex.id, (
+                f"execution {ex.id} saw {observed.get(ex.id)!r} "
+                f"(full env snapshot: {observed.get(f'_all_for_{ex.id}')})"
+            )
+
+        # 2. No spawn observed ``<missing>`` for any marker — i.e. no spawn's
+        #    proc.start() overlapped another's ``os.environ.clear()`` window.
+        for ex in executions:
+            snapshot = observed.get(f"_all_for_{ex.id}", "")
+            assert "<missing>" not in snapshot, (
+                f"spawn for {ex.id} observed a mid-swap env: {snapshot}"
+            )
+
+        assert len(pids) == 4
+        # 3. Every execution got a workers row (INSERT OR REPLACE inside lock).
+        for ex in executions:
+            row = db.execute(
+                "SELECT execution_id FROM workers WHERE execution_id=?", (ex.id,)
+            ).fetchone()
+            assert row is not None, f"missing workers row for {ex.id}"
+    finally:
+        for key in id_to_key.values():
+            os.environ.pop(key, None)

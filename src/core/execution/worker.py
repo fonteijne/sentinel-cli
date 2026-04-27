@@ -74,20 +74,12 @@ def main() -> int:
 
     def _heartbeat_loop() -> None:
         hb_conn = connect()
+        hb_repo = ExecutionRepository(hb_conn)
         try:
             while not shutdown.wait(HEARTBEAT_INTERVAL_S):
                 try:
-                    hb_conn.execute("BEGIN IMMEDIATE")
-                    hb_conn.execute(
-                        "UPDATE workers SET last_heartbeat_at=? WHERE execution_id=?",
-                        (_now_iso(), execution_id),
-                    )
-                    hb_conn.execute("COMMIT")
+                    hb_repo.set_worker_heartbeat(execution_id)
                 except Exception:
-                    try:
-                        hb_conn.execute("ROLLBACK")
-                    except Exception:
-                        pass
                     logger.exception("heartbeat write failed")
         finally:
             try:
@@ -127,14 +119,20 @@ def main() -> int:
         options = (execution.metadata or {}).get("options", {}) or {}
 
         if method is None:
-            # Orchestrator doesn't yet expose plan/execute/debrief (landed in
-            # a later track). For plan 04's scaffold path, run a minimal
-            # begin→complete cycle so the row transitions and events fire.
-            logger.warning(
-                "orchestrator.%s not implemented; running scaffold lifecycle",
-                execution.kind.value,
+            # This is a bug: the orchestrator must expose plan/execute/debrief
+            # for every ExecutionKind. Fail loudly and mark the row failed so
+            # ops can spot the missing wiring.
+            logger.error(
+                "orchestrator method not found for kind=%s (execution=%s)",
+                execution.kind.value, execution_id,
             )
-            return _scaffold_run(orchestrator, execution, cancel)
+            try:
+                orchestrator.fail(execution, error="orchestrator method not found")
+            except Exception:
+                logger.exception(
+                    "worker: orchestrator.fail raised while handling missing method"
+                )
+            return 1
 
         try:
             result = method(execution_id=execution_id, **options)
@@ -190,32 +188,6 @@ def _resolve_method(orchestrator, kind):  # type: ignore[no-untyped-def]
     if attr is None:
         return None
     return getattr(orchestrator, attr, None)
-
-
-def _scaffold_run(orchestrator, execution, cancel_flag) -> int:
-    """Minimal begin/complete cycle when orchestrator verbs don't yet exist.
-
-    Lets plan 04 land and be exercised (events written, row transitions) before
-    the plan/execute/debrief extraction completes.
-    """
-    from src.core.execution.models import ExecutionStatus
-
-    logger = logging.getLogger("src.core.execution.worker")
-    if cancel_flag.is_set():
-        orchestrator.repo.set_status(
-            execution.id, ExecutionStatus.CANCELLING
-        )
-        orchestrator.repo.record_ended(
-            execution.id, ExecutionStatus.CANCELLED
-        )
-        return 1
-    try:
-        orchestrator.complete(execution)
-        return 0
-    except Exception:
-        logger.exception("scaffold_run: complete() failed")
-        orchestrator.fail(execution, error="scaffold_complete_failed")
-        return 1
 
 
 if __name__ == "__main__":

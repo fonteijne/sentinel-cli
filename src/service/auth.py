@@ -202,6 +202,24 @@ def require_token(request: Request) -> str:
     return presented
 
 
+async def ws_token_prefix(ws: WebSocket) -> str:
+    """WebSocket dep that resolves the ``token_prefix`` of the handshake creds.
+
+    Exists because ``require_token_ws`` already returns the raw token string
+    and changing its shape (e.g. to a tuple) would ripple through every WS
+    route. A separate dep keeps the rate-limit key derivation local to the
+    stream route without touching the auth contract.
+
+    No compare happens here — ``require_token_ws`` is expected to run in the
+    same dep chain and raise 1008 on auth failure. If this ran alone on an
+    unauthenticated ws it would still return *some* prefix, which is fine for
+    use as a map key but never as an identity decision.
+    """
+
+    presented = _extract_bearer(ws)
+    return token_prefix(presented)
+
+
 async def require_token_ws(ws: WebSocket) -> str:
     """WebSocket bearer-auth dep — raise close-code 1008 on failure.
 
