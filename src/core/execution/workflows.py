@@ -637,11 +637,18 @@ def run_revise(
                 orchestrator.set_phase(
                     execution_id, f"drupal_fix_{drupal_attempt}"
                 )
-                developer.run_revision(
+                fix_result = developer.run_revision(
                     ticket_id=ticket_id,
                     worktree_path=worktree_path,
                     user_prompt=fix_prompt,
                 )
+                orchestrator.record_agent_result(
+                    execution_id, developer.agent_name, fix_result
+                )
+                result.agent_results[
+                    f"{developer.agent_name}_drupal_fix_{drupal_attempt}"
+                ] = fix_result
+                result.add_artifact("drupal.self_fix_attempted")
 
         # Post side effects — push + revision log comment.
         runner = post_execute_runner or run_post_execute_side_effects
