@@ -87,7 +87,10 @@ def test_start_happy_path_returns_202_and_spawns(
     body = resp.json()
     assert body["ticket_id"] == "PROJ-1"
     assert body["kind"] == "execute"
-    assert body["metadata"]["options"]["revise"] is True
+    # The persisted shape is versioned: ``{schema_version, values}``.
+    # ``values`` is the typed ``ExecuteOptions`` payload.
+    assert body["metadata"]["options"]["schema_version"] >= 1
+    assert body["metadata"]["options"]["values"]["revise"] is True
     assert len(fake_supervisor.spawn_calls) == 1
     assert fake_supervisor.spawn_calls[0] == body["id"]
 

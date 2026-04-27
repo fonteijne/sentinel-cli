@@ -778,7 +778,10 @@ def execute(
             project=project,
             options={
                 "revise": revise,
-                "max_turns": None,
+                "force": force,
+                "no_env": no_env,
+                "max_iterations": max_iterations,
+                "prompt": prompt,
             },
             follow=follow,
             idempotency_key=idempotency_key,
