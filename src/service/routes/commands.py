@@ -16,13 +16,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Annotated, Optional
+from typing import Annotated, Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from src.core.execution.models import ExecutionKind, ExecutionStatus
+from src.core.execution.options import (
+    DebriefOptions,
+    ExecuteOptions,
+    PlanOptions,
+    to_metadata_options,
+)
 from src.core.execution.repository import ExecutionRepository
 from src.core.execution.supervisor import Supervisor
 from src.service.deps import get_repo, get_supervisor
@@ -61,23 +67,81 @@ def _empty_string_to_none(value):  # type: ignore[no-untyped-def]
     return value
 
 
-class ExecutionOptions(BaseModel):
-    """Explicit enumerated options — never a free-form dict.
+# Back-compat shim: previous API tests POST `{"options": {"revise": true}}` etc.
+# We now route the dict into the kind-specific WorkflowOptions class so a
+# misnamed flag (e.g. `--no-env` against a plan run) returns 422 instead of
+# being silently dropped. ExecutionOptions is kept as an alias of
+# ExecuteOptions for one release so existing API consumers don't break.
+ExecutionOptions = ExecuteOptions
 
-    ``extra="forbid"`` is load-bearing: the body flows into ``metadata_json``
-    and is later read by the worker → orchestrator → agent prompts → ``Bash``
-    tool calls. Any free-form dict is a prompt-injection vector.
+
+_OPTIONS_BY_KIND = {
+    ExecutionKind.PLAN: PlanOptions,
+    ExecutionKind.EXECUTE: ExecuteOptions,
+    ExecutionKind.DEBRIEF: DebriefOptions,
+}
+
+
+def _allowed_options_for(cls) -> list[str]:  # type: ignore[no-untyped-def]
+    """Field names declared on a :class:`WorkflowOptions` subclass — used in
+    422 messages so the operator can see which flags the selected ``kind``
+    actually accepts. Sorted for deterministic output.
     """
+    return sorted(cls.model_fields.keys())
 
-    model_config = ConfigDict(extra="forbid")
 
-    revise: bool = False
-    max_turns: Optional[int] = Field(default=None, ge=1, le=200)
-    follow_up_ticket: Optional[str] = Field(default=None, pattern=_TICKET_ID_PATTERN)
+def _build_options_error_detail(
+    kind: ExecutionKind, cls, exc: ValidationError  # type: ignore[no-untyped-def]
+) -> Dict[str, Any]:
+    """Turn a pydantic ``ValidationError`` against a kind-specific options
+    model into an explanatory 422 detail.
 
-    _follow_up_empty_to_none = field_validator("follow_up_ticket", mode="before")(
-        _empty_string_to_none
-    )
+    The historical message was the raw ``str(exc)`` — a multi-line dump of
+    pydantic internals which surfaced verbatim in the dashboard. Operators
+    couldn't tell at a glance *which* fields were wrong or what was allowed
+    instead, so they ended up reading the source. This helper keeps the
+    machine-readable ``errors`` list (so future tooling can drill in) while
+    leading with a single human sentence that names the offending fields,
+    the selected kind, and the allowed-for-this-kind options.
+    """
+    pyd_errors = exc.errors()
+    bad_fields: list[str] = []
+    other_messages: list[str] = []
+    for err in pyd_errors:
+        loc = err.get("loc") or ()
+        # ``loc`` for an ``extra_forbidden`` error is the field name; for a
+        # type/value error on a known field it's also the field name.
+        field = str(loc[0]) if loc else ""
+        if err.get("type") == "extra_forbidden":
+            if field:
+                bad_fields.append(field)
+        else:
+            msg = err.get("msg", "validation error")
+            other_messages.append(f"{field}: {msg}" if field else msg)
+
+    allowed = _allowed_options_for(cls)
+    parts: list[str] = []
+    if bad_fields:
+        parts.append(
+            f"options {sorted(set(bad_fields))} are not valid for "
+            f"kind={kind.value!r}"
+        )
+    if other_messages:
+        parts.append("; ".join(other_messages))
+    if not parts:
+        # Fallback — pydantic surfaced something we didn't categorise.
+        parts.append("invalid options")
+
+    message = ". ".join(parts)
+    return {
+        "message": (
+            f"{message}. Allowed options for kind={kind.value!r}: {allowed}."
+        ),
+        "kind": kind.value,
+        "allowed_options": allowed,
+        "rejected_options": sorted(set(bad_fields)),
+        "errors": pyd_errors,
+    }
 
 
 class StartExecutionBody(BaseModel):
@@ -89,20 +153,55 @@ class StartExecutionBody(BaseModel):
     # ``-p`` default in src/cli.py (``project or ticket_id.split("-")[0]``).
     project: Optional[str] = Field(default=None, pattern=_PROJECT_PATTERN)
     kind: ExecutionKind
-    options: ExecutionOptions = Field(default_factory=ExecutionOptions)
+    # ``options`` is parsed lazily against the kind-specific WorkflowOptions
+    # subclass in the model_validator so we get clean 422 errors with the
+    # field that was unsupported, rather than a generic "extra fields"
+    # message against a union type.
+    options: Dict[str, Any] = Field(default_factory=dict)
 
     _project_empty_to_none = field_validator("project", mode="before")(
         _empty_string_to_none
     )
 
     @model_validator(mode="after")
-    def _derive_project_from_ticket(self) -> "StartExecutionBody":
+    def _derive_project_and_validate_options(self) -> "StartExecutionBody":
         if self.project is None:
             # ticket_id is already pattern-validated at this point, so the
             # prefix is guaranteed [A-Z][A-Z0-9_]+ which lowercases into a
             # valid Compose project name. No re-validation needed.
             self.project = self.ticket_id.split("-", 1)[0].lower()
+
+        # Coerce ``options`` (a free-form dict at this point) into the
+        # kind-specific :class:`WorkflowOptions`. ``extra="forbid"`` means
+        # an unsupported flag fails with 422 — we never silently strip it.
+        cls = _OPTIONS_BY_KIND.get(self.kind)
+        if cls is None:  # defensive — ExecutionKind enum is exhaustive
+            raise ValueError(f"unsupported kind: {self.kind!r}")
+        try:
+            self.options = cls.model_validate(self.options or {}).model_dump(
+                mode="json"
+            )
+        except ValidationError as exc:
+            # Translate pydantic's multi-line internal report into a single
+            # actionable message: which options were rejected, what kind was
+            # selected, and which options the kind actually accepts. The raw
+            # pydantic ``errors()`` list is preserved under ``errors`` so a
+            # tooling client can still drill in.
+            raise HTTPException(
+                status_code=422,
+                detail=_build_options_error_detail(self.kind, cls, exc),
+            )
         return self
+
+    def workflow_options(self):
+        """Return the parsed :class:`WorkflowOptions` instance.
+
+        ``options`` is a plain dict in this model so the OpenAPI schema
+        keeps the union explicit per ``kind``; this helper turns it back
+        into the typed model right before persistence.
+        """
+        cls = _OPTIONS_BY_KIND[self.kind]
+        return cls.model_validate(self.options or {})
 
 
 # ---------------------------------------------------------------- helpers
@@ -146,11 +245,12 @@ def start(
         if existing is not None:
             return _to_execution_out(existing)
 
+    options_payload = to_metadata_options(body.workflow_options())
     execution = repo.create(
         ticket_id=body.ticket_id,
         project=body.project,
         kind=body.kind,
-        options=body.options.model_dump(),
+        options=options_payload,
         idempotency_token_prefix=token_prefix,
         idempotency_key=idempotency_key,
     )

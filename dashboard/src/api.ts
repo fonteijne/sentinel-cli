@@ -111,11 +111,12 @@ export const api = {
       ticket_id: string;
       project?: string;
       kind: ExecutionKind;
-      options?: {
-        revise?: boolean;
-        max_turns?: number | null;
-        follow_up_ticket?: string | null;
-      };
+      // ``options`` is validated server-side against the kind-specific
+      // WorkflowOptions subclass (PlanOptions / ExecuteOptions /
+      // DebriefOptions), which forbids extras. Callers must build a
+      // payload appropriate to ``kind`` — see ``buildOptionsForKind``
+      // in ``StartRunDialog.tsx``.
+      options?: Record<string, unknown>;
     },
     idempotencyKey?: string
   ) =>

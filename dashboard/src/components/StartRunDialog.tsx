@@ -15,6 +15,37 @@ interface Props {
 
 const TICKET_RE = /^[A-Z][A-Z0-9_]+-\d+$/;
 
+interface FormOptions {
+  revise: boolean;
+  maxTurns: string;
+  followUp: string;
+}
+
+/**
+ * Per-kind option payload. Mirrors ``PlanOptions`` / ``ExecuteOptions`` /
+ * ``DebriefOptions`` in ``src/core/execution/options.py``: the API rejects
+ * any flag that isn't on the kind-specific model, so the UI must omit
+ * irrelevant fields rather than send ``null`` / ``false``.
+ */
+export function buildOptionsForKind(
+  kind: ExecutionKind,
+  form: FormOptions
+): Record<string, unknown> {
+  if (kind === "execute") {
+    const opts: Record<string, unknown> = { revise: form.revise };
+    if (form.maxTurns) opts.max_turns = Number.parseInt(form.maxTurns, 10);
+    return opts;
+  }
+  if (kind === "debrief") {
+    const opts: Record<string, unknown> = {};
+    if (form.followUp) opts.follow_up_ticket = form.followUp;
+    return opts;
+  }
+  // plan: only ``prompt`` / ``force`` are supported and we don't expose
+  // either in this dialog yet, so an empty object is correct.
+  return {};
+}
+
 export function StartRunDialog({
   open,
   baseUrl,
@@ -60,17 +91,22 @@ export function StartRunDialog({
     setBusy(true);
     setError(null);
     try {
+      // Build a kind-specific options payload so we never POST a flag that
+      // the API's strict ``extra="forbid"`` validators will reject — e.g.
+      // ``revise`` / ``max_turns`` are execute-only, ``follow_up_ticket``
+      // is debrief-only, and plan accepts neither.
+      const options = buildOptionsForKind(kind, {
+        revise,
+        maxTurns,
+        followUp,
+      });
       const created = await api.startExecution(
         { baseUrl, token },
         {
           ticket_id: ticket,
           project: project || undefined,
           kind,
-          options: {
-            revise,
-            max_turns: maxTurns ? Number.parseInt(maxTurns, 10) : null,
-            follow_up_ticket: followUp || null,
-          },
+          options,
         },
         makeIdempotencyKey()
       );
@@ -153,42 +189,50 @@ export function StartRunDialog({
             </div>
           </div>
 
-          <details>
-            <summary
-              style={{ cursor: "pointer", fontSize: "var(--fs-sm)", color: "var(--text-muted)" }}
-            >
-              Options
-            </summary>
-            <div className="stack-3" style={{ marginTop: 12 }}>
-              <label className="inline-3" style={{ cursor: "pointer" }}>
-                <span
-                  className={"switch " + (revise ? "on" : "")}
-                  onClick={() => setRevise(!revise)}
-                />
-                <span style={{ fontSize: "var(--fs-base)" }}>Revise mode</span>
-              </label>
-              <div className="stack-2">
-                <label className="label">Max turns (1–200)</label>
-                <input
-                  className="input"
-                  type="number"
-                  min={1}
-                  max={200}
-                  value={maxTurns}
-                  onChange={(e) => setMaxTurns(e.target.value)}
-                />
+          {kind !== "plan" && (
+            <details>
+              <summary
+                style={{ cursor: "pointer", fontSize: "var(--fs-sm)", color: "var(--text-muted)" }}
+              >
+                Options
+              </summary>
+              <div className="stack-3" style={{ marginTop: 12 }}>
+                {kind === "execute" && (
+                  <>
+                    <label className="inline-3" style={{ cursor: "pointer" }}>
+                      <span
+                        className={"switch " + (revise ? "on" : "")}
+                        onClick={() => setRevise(!revise)}
+                      />
+                      <span style={{ fontSize: "var(--fs-base)" }}>Revise mode</span>
+                    </label>
+                    <div className="stack-2">
+                      <label className="label">Max turns (1–200)</label>
+                      <input
+                        className="input"
+                        type="number"
+                        min={1}
+                        max={200}
+                        value={maxTurns}
+                        onChange={(e) => setMaxTurns(e.target.value)}
+                      />
+                    </div>
+                  </>
+                )}
+                {kind === "debrief" && (
+                  <div className="stack-2">
+                    <label className="label">Follow-up ticket</label>
+                    <input
+                      className="input"
+                      value={followUp}
+                      onChange={(e) => setFollowUp(e.target.value.trim())}
+                      placeholder="ACME-124"
+                    />
+                  </div>
+                )}
               </div>
-              <div className="stack-2">
-                <label className="label">Follow-up ticket</label>
-                <input
-                  className="input"
-                  value={followUp}
-                  onChange={(e) => setFollowUp(e.target.value.trim())}
-                  placeholder="ACME-124"
-                />
-              </div>
-            </div>
-          </details>
+            </details>
+          )}
 
           {error && (
             <div
