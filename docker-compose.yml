@@ -232,6 +232,11 @@ services:
       - traefik-acme:/acme
     networks:
       - sentinel-edge
+    environment:
+      # DNS-01 provider credential. Scoped token (Zone:DNS:Edit + Zone:Zone:Read)
+      # for the zone(s) being issued against. Required because the ACME resolver
+      # below uses dnschallenge=cloudflare.
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN:?CF_DNS_API_TOKEN required}
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
@@ -240,8 +245,17 @@ services:
       - --entrypoints.websecure.address=:443
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --certificatesresolvers.le.acme.httpchallenge=true
-      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      # DNS-01, not HTTP-01. Operators typically front this stack with
+      # Cloudflare in Full (Strict), which creates a chicken-and-egg for
+      # HTTP-01: the LE validator hits CF (not Traefik), CF's "Always Use
+      # HTTPS" redirects the challenge to 443, and Full (Strict) refuses the
+      # origin connection because no cert exists yet. DNS-01 validates via a
+      # TXT record and is unaffected by CF proxying. Public resolvers are
+      # pinned so Traefik doesn't poll a CF-authoritative resolver that might
+      # serve stale negative answers during propagation.
+      - --certificatesresolvers.le.acme.dnschallenge=true
+      - --certificatesresolvers.le.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,1.0.0.1:53
       - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL required}
       - --certificatesresolvers.le.acme.storage=/acme/acme.json
       - --accesslog=true
