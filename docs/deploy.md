@@ -12,8 +12,17 @@ auth, event bus, worker supervisor — lives in plans 01–05.
 | Goal | Command |
 |---|---|
 | Dev on your laptop | `docker compose --profile dev up -d sentinel-dev` → `http://localhost:8787/docs` |
+| Dashboard SPA via compose | `docker compose --profile serve --profile dashboard up -d --build` → `http://localhost:5174` (API base URL field defaults to `/api`; leave it as is) |
 | Prod, bundled Traefik | `cp .env.example .env && $EDITOR .env` → `docker compose --profile serve --profile traefik up -d` |
 | Prod, BYO Traefik | `docker compose --profile serve up -d` → `docker network connect sentinel-edge <your-traefik>` |
+
+The dashboard nginx reverse-proxies `/api/` (HTTP and the WebSocket stream)
+to the backend over the compose default network, so the browser only ever
+talks to one same-origin host. Override the upstream with
+`SENTINEL_API_UPSTREAM=host:port` in `.env` if you need to point at a
+backend other than `sentinel-serve`. `sentinel-dev` uses
+`network_mode: bridge` and is **not** reachable by service name from the
+dashboard container — pair `--profile dashboard` with `--profile serve`.
 
 ---
 

@@ -153,6 +153,63 @@ services:
       # No IP allowlist or forwarded-headers trust needed here anymore.
       - "traefik.http.services.sentinel.loadbalancer.server.port=8787"
 
+  # Command Center dashboard — static SPA built from dashboard/ and served by
+  # nginx. Profile-gated (`dashboard`) so bare `docker compose up` still
+  # behaves like today. The host port defaults to 5174 (chosen so it
+  # doesn't collide with Vite's local-dev 5173) and is bound to 127.0.0.1 —
+  # exactly like sentinel-dev — so the dashboard is never exposed on the
+  # host's wider network without an explicit override.
+  #
+  # The dashboard nginx ALSO reverse-proxies the FastAPI backend at /api/
+  # (HTTP + WebSocket) so the browser only ever talks to one same-origin
+  # host. This is what makes `docker compose --profile dashboard --profile
+  # serve up` work without the operator publishing the backend's 8787 port
+  # or wrestling with CORS. The upstream is `${SENTINEL_API_UPSTREAM}` —
+  # defaults to `sentinel-serve:8787`, which is reachable on the compose
+  # default network. Pair the dashboard profile with `serve`; sentinel-dev
+  # uses `network_mode: bridge` and is NOT reachable by service name from
+  # this container.
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      target: serve
+    container_name: sentinel-dashboard
+    profiles:
+      - dashboard
+    ports:
+      - "127.0.0.1:${SENTINEL_DASHBOARD_PORT:-5174}:80"
+    environment:
+      # Backend host:port the nginx /api/ block forwards to. The image
+      # default (`sentinel-serve:8787`) matches the compose service below;
+      # operators can point at any reachable backend (e.g. their own
+      # internal hostname) by setting SENTINEL_API_UPSTREAM in .env.
+      - SENTINEL_API_UPSTREAM=${SENTINEL_API_UPSTREAM:-sentinel-serve:8787}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # Attach to the edge network so a BYO/bundled Traefik can route to it
+    # alongside sentinel-serve. The default network is also required so
+    # nginx's /api/ block can resolve the backend service by name.
+    networks:
+      - default
+      - sentinel-edge
+    labels:
+      # Opt-in Traefik routing. Off unless an operator sets
+      # SENTINEL_DASHBOARD_HOSTNAME (e.g. dashboard.example.com). The
+      # service stays reachable on 127.0.0.1:5174 either way.
+      - "traefik.enable=true"
+      - "traefik.docker.network=sentinel-edge"
+      - "traefik.http.routers.sentinel-dashboard.rule=Host(`${SENTINEL_DASHBOARD_HOSTNAME:-dashboard.localhost}`)"
+      - "traefik.http.routers.sentinel-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.sentinel-dashboard.tls=true"
+      - "traefik.http.routers.sentinel-dashboard.tls.certresolver=le"
+      - "traefik.http.services.sentinel-dashboard.loadbalancer.server.port=80"
+
   # Bundled Traefik reverse proxy — profile-gated so operators with an
   # existing Traefik can opt out. They attach their Traefik to sentinel-edge
   # manually; the labels on sentinel-serve still apply.

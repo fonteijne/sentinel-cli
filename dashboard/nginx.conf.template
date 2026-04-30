@@ -1,0 +1,76 @@
+# Sentinel dashboard — static SPA + same-origin API/WS reverse proxy.
+#
+# nginx:1.27-alpine processes any *.template under /etc/nginx/templates/
+# through `envsubst` at container start, so ${SENTINEL_API_UPSTREAM} below
+# is replaced with the value of that environment variable. The Dockerfile
+# defaults it to `sentinel-serve:8787`, which is the production backend on
+# the compose default network. Operators can override it (e.g.
+# `SENTINEL_API_UPSTREAM=sentinel-dev:8787`) without rebuilding.
+#
+# All API and WebSocket traffic from the SPA goes to `/api/...` on the same
+# origin as the dashboard. nginx strips the `/api` prefix and forwards to
+# the backend so FastAPI sees its real route paths (`/executions`,
+# `/health`, …). This avoids browser CORS and host-port discovery entirely.
+
+# Map Connection header so WebSocket Upgrade requests are forwarded
+# verbatim while regular HTTP keepalive still works.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Don't cache index.html — bundle hashes change on every build, and
+    # the entry point must always reflect the latest deploy.
+    location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        try_files $uri =404;
+    }
+
+    # Hashed Vite assets are content-addressed; safe to cache aggressively.
+    location /assets/ {
+        access_log off;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        try_files $uri =404;
+    }
+
+    # Reverse-proxy the FastAPI backend at /api/. The trailing slash on
+    # both `location` and `proxy_pass` strips `/api` before forwarding,
+    # so a request to `/api/executions` reaches the backend as
+    # `/executions`. proxy_http_version + Upgrade/Connection headers also
+    # carry through the WebSocket handshake at `/api/executions/{id}/stream`.
+    location /api/ {
+        proxy_pass http://${SENTINEL_API_UPSTREAM}/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        # Long-lived WS streams: disable proxy buffering and bump timeouts
+        # so the connection doesn't drop on idle ticks between events.
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+
+    # SPA fallback: any unknown path is a client-side route.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Lightweight liveness probe for compose healthcheck / k8s.
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+}
