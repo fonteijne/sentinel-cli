@@ -2614,6 +2614,22 @@ def serve(
     uvicorn.run(create_app(), host=bind_host, port=bind_port, log_config=None)
 
 
+@cli.command("interactive")
+def interactive() -> None:
+    """Launch the interactive TUI launcher."""
+    from src.tui.app import run as run_tui
+
+    run_tui()
+
+
+@cli.command("i", hidden=True)
+def interactive_alias() -> None:
+    """Alias for ``sentinel interactive``."""
+    from src.tui.app import run as run_tui
+
+    run_tui()
+
+
 @cli.command("push-pending")
 @click.option(
     "--quiet", is_flag=True,

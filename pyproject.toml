@@ -18,6 +18,7 @@ claude-agent-sdk = "^0.1.20"
 python-dotenv = "^1.2.1"
 fastapi = "^0.136.0"
 uvicorn = {extras = ["standard"], version = "^0.46.0"}
+textual = ">=0.80"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"
