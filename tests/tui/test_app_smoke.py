@@ -53,6 +53,36 @@ async def test_ticket_prompt_cancels_on_escape() -> None:
     assert captured == [None]
 
 
+def test_strip_emoji_handles_validate_command_markers() -> None:
+    """The emoji the existing CLI commands print must vanish from the
+    captured output — otherwise Textual measures width=2 for each glyph,
+    the operator's terminal often renders width=1 (or a replacement
+    char), and the border columns drift until the top bar is offscreen.
+    """
+    from src.tui.widgets.run_output import _strip_emoji
+
+    samples = [
+        ("🔐 Validating API Credentials (Sentinel v0.3.6)",
+         "Validating API Credentials (Sentinel v0.3.6)"),
+        # keycap sequence "1" + VS16 + combining-keycap: the VS16 and the
+        # combining-keycap go, the plain digit is kept — it's width-1 and
+        # still communicates the step number.
+        ("1️⃣  Testing Jira API...",
+         "1  Testing Jira API..."),
+        ("   ✅ Jira connected: Carsten de la Fonteijne",
+         "Jira connected: Carsten de la Fonteijne"),
+        ("📊 Sentinel Status", "Sentinel Status"),
+        ("🏗️  Project: COE_JIRATESTAI", "Project: COE_JIRATESTAI"),
+        ("📤 push-pending: drained=0 still_pending=0 errors=0",
+         "push-pending: drained=0 still_pending=0 errors=0"),
+        ("plain text, no emoji", "plain text, no emoji"),
+    ]
+    for raw, expected in samples:
+        assert _strip_emoji(raw).strip() == expected.strip(), (
+            f"raw={raw!r} → got={_strip_emoji(raw)!r}, want={expected!r}"
+        )
+
+
 def test_capture_stdout_to_log_monkeypatches_click_echo() -> None:
     """Regression: ``click.echo`` caches its stream at first use; plain
     ``sys.stdout`` replacement misses it. The capture context must monkey-

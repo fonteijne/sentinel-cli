@@ -25,12 +25,42 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import sys
 from typing import TYPE_CHECKING, Any, Iterator
 
 if TYPE_CHECKING:
     from textual.app import App
     from textual.widgets import RichLog
+
+
+# Many CLI commands (validate, status, execute) print emoji like 🔐 📊 ✅ 1️⃣.
+# Textual's layout engine measures these as 2 cells wide via `wcwidth`, but
+# if the operator's terminal font lacks the glyph it renders as a 1-cell
+# replacement character (or 0-cell with a combiner). The mismatch
+# accumulates across lines and skews every border to the right, eventually
+# pushing the top-bar / project-select off-screen.
+#
+# Rather than require a specific terminal font, strip emoji from captured
+# output before it hits the Log. The surrounding text still identifies each
+# step (1️⃣ becomes "1", ✅ disappears, etc. — all preceded by the step's
+# own text label like "Testing Jira API...").
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"   # pictographs, transport, supplementals
+    "\U0001F1E0-\U0001F1FF"   # regional indicators (flags)
+    "☀-➿"           # misc symbols + dingbats (☀-➿)
+    "⌀-⏿"           # misc technical (⏱, ⏳)
+    "️"                  # variation selector 16 (emoji presentation)
+    "‍"                  # zero-width joiner (emoji sequences)
+    "⃣"                  # combining enclosing keycap (for 1️⃣ 2️⃣ etc.)
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_emoji(line: str) -> str:
+    return _EMOJI_PATTERN.sub("", line).rstrip()
 
 
 class _LineForwarder(io.TextIOBase):
@@ -61,8 +91,9 @@ class _LineForwarder(io.TextIOBase):
     def _emit(self, line: str) -> None:
         # call_from_thread marshals the write onto Textual's event loop.
         # Log.write_line appends the trailing newline; we stripped it above.
+        clean = _strip_emoji(line)
         try:
-            self._app.call_from_thread(self._log.write_line, line)
+            self._app.call_from_thread(self._log.write_line, clean)
         except Exception:
             # App may have exited between write and emit. Swallow — the
             # stream contract is best-effort.

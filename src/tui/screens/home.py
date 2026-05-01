@@ -38,15 +38,14 @@ class HomeScreen(Screen[None]):
     ]
 
     DEFAULT_CSS = """
-    /* Pin the Screen so a growing Log can never push the top-bar /
-       project-select out of view. Every direct child has an explicit
-       height — the Screen's default overflow: auto would otherwise
-       scroll the whole launcher when long output arrives. */
     HomeScreen {
         overflow: hidden;
     }
 
+    /* dock: top pins the top-bar above the body unconditionally — no
+       amount of body growth can push it off-screen. */
     #top-bar {
+        dock: top;
         height: 3;
         padding: 0 1;
     }
