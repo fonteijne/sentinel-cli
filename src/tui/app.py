@@ -28,5 +28,12 @@ class SentinelApp(App[None]):
 
 
 def run() -> None:
-    """Run the Sentinel TUI. Blocks until the user quits."""
-    SentinelApp().run()
+    """Run the Sentinel TUI. Blocks until the user quits.
+
+    Mouse input is disabled: the launcher is keyboard-first, and some
+    terminal/docker-exec combinations deliver X10-protocol mouse reports
+    whose bytes (≥ 0x80 once the click is past column ~95) aren't valid
+    UTF-8, which crashes Textual's input-decoder thread. Keyboard-only
+    sidesteps the protocol mismatch entirely.
+    """
+    SentinelApp().run(mouse=False)
