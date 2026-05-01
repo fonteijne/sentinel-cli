@@ -220,8 +220,14 @@ class HomeScreen(Screen[None]):
         else:
             self._dispatch(action, ticket_id=None)
 
+    # Plan and debrief can start on a brand-new ticket; execute requires
+    # an existing worktree (the workflow `execute()` raises
+    # "worktree not found for {ticket}; run 'sentinel plan' first").
+    _ACTIONS_ALLOWING_NEW: tuple[str, ...] = ("plan", "debrief")
+
     def _prompt_ticket_then_run(self, action: ActionDef) -> None:
         prefix = self._jira_prefix_for_current_project()
+        existing = self._existing_worktree_tickets()
 
         def _after_prompt(ticket: Optional[str]) -> None:
             if ticket is None:
@@ -236,9 +242,28 @@ class HomeScreen(Screen[None]):
             self._dispatch(action, ticket_id=resolved)
 
         self.app.push_screen(
-            TicketPromptScreen(action.label, project_prefix=prefix),
+            TicketPromptScreen(
+                action.label,
+                project_prefix=prefix,
+                existing_tickets=existing,
+                allow_new=action.key in self._ACTIONS_ALLOWING_NEW,
+            ),
             _after_prompt,
         )
+
+    def _existing_worktree_tickets(self) -> list[str]:
+        """Worktrees on disk for the current project, sorted."""
+        if self._current_project is None:
+            return []
+        try:
+            from src.worktree_manager import WorktreeManager
+
+            mgr = WorktreeManager()
+            tickets = mgr.list_worktrees(self._current_project)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"[tui] could not list worktrees: {exc}")
+            return []
+        return sorted(tickets)
 
     def _jira_prefix_for_current_project(self) -> Optional[str]:
         """Resolve the Jira project-key prefix used to complete bare tickets.

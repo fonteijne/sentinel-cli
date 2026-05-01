@@ -53,6 +53,89 @@ async def test_ticket_prompt_cancels_on_escape() -> None:
     assert captured == [None]
 
 
+@pytest.mark.asyncio
+async def test_ticket_prompt_lists_existing_worktrees_and_new_item() -> None:
+    """Plan/debrief modals must list existing worktrees plus a '+ New
+    ticket' row; execute must list worktrees only (no new-ticket
+    affordance) because the execute workflow requires a plan first.
+    """
+    from src.tui.app import SentinelApp
+    from src.tui.screens.ticket import TicketPromptScreen
+    from textual.widgets import ListView
+
+    app = SentinelApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        # plan-style modal: existing tickets + New
+        captured: list[object] = []
+        app.push_screen(
+            TicketPromptScreen(
+                "Plan a ticket",
+                project_prefix="DHLEXS_DHLEXC",
+                existing_tickets=["DHLEXS_DHLEXC-289", "DHLEXS_DHLEXC-356"],
+                allow_new=True,
+            ),
+            captured.append,
+        )
+        await pilot.pause()
+        lst = app.screen.query_one("#ticket-list", ListView)
+        ids = [c.id for c in lst.children]
+        assert ids == [
+            "ticket-item-DHLEXS_DHLEXC-289",
+            "ticket-item-DHLEXS_DHLEXC-356",
+            "ticket-item-new",
+        ]
+        await pilot.press("escape")
+        await pilot.pause()
+        assert captured == [None]
+
+        # execute-style modal: no New row.
+        captured2: list[object] = []
+        app.push_screen(
+            TicketPromptScreen(
+                "Execute a plan",
+                project_prefix="DHLEXS_DHLEXC",
+                existing_tickets=["DHLEXS_DHLEXC-289"],
+                allow_new=False,
+            ),
+            captured2.append,
+        )
+        await pilot.pause()
+        lst2 = app.screen.query_one("#ticket-list", ListView)
+        ids2 = [c.id for c in lst2.children]
+        assert ids2 == ["ticket-item-DHLEXS_DHLEXC-289"]
+        await pilot.press("escape")
+        await pilot.pause()
+        assert captured2 == [None]
+
+
+@pytest.mark.asyncio
+async def test_ticket_prompt_dismisses_with_selected_existing_ticket() -> None:
+    """Picking a worktree from the list dismisses the modal with that id."""
+    from src.tui.app import SentinelApp
+    from src.tui.screens.ticket import TicketPromptScreen
+
+    captured: list[object] = []
+    app = SentinelApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(
+            TicketPromptScreen(
+                "Plan a ticket",
+                existing_tickets=["DHLEXS_DHLEXC-289", "DHLEXS_DHLEXC-356"],
+                allow_new=True,
+            ),
+            captured.append,
+        )
+        await pilot.pause()
+        # Default focus is on the ListView; Enter on the first item.
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert captured == ["DHLEXS_DHLEXC-289"]
+
+
 def test_resolve_ticket_id_prefixes_bare_numbers() -> None:
     """Bare numbers must get auto-prefixed with the project's Jira key so
     the user can type just '356' when DHLEXS_DHLEXC is active.
