@@ -166,6 +166,35 @@ class ExecutionRepository:
         ).fetchone()
         return _row_to_execution(row) if row else None
 
+    def find_active(
+        self,
+        project: str,
+        ticket_id: str,
+        kind: ExecutionKind,
+    ) -> Optional[Execution]:
+        """Return the newest in-flight row for ``(project, ticket_id, kind)``.
+
+        "Active" here is the attach-lookup set: ``status IN (queued, running)``.
+        ``CANCELLING`` is deliberately excluded — a row mid-cancel should not
+        be attached to, so the caller will start a fresh run.
+
+        Used by the Track 2 ``POST /executions`` attach-or-start handler.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM executions "
+            "WHERE project = ? AND ticket_id = ? AND kind = ? "
+            "AND status IN (?, ?) "
+            "ORDER BY started_at DESC LIMIT 1",
+            (
+                project,
+                ticket_id,
+                kind.value,
+                ExecutionStatus.QUEUED.value,
+                ExecutionStatus.RUNNING.value,
+            ),
+        ).fetchone()
+        return _row_to_execution(row) if row else None
+
     def list(
         self,
         *,

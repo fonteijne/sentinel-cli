@@ -160,6 +160,12 @@ def create_app() -> FastAPI:
             Depends(audit_write),
         ]
     )
+    # Track 2 attach-or-start and cancel live on ``executions.write_router``
+    # so they share the exact URL space as the read handlers while still
+    # being guarded by the write-bucket deps (rate limit + audit). Mount it
+    # *before* ``commands.router`` so ``POST /executions/{id}/retry`` (only
+    # on commands.router) continues to resolve; the paths do not collide.
+    http_write_protected.include_router(executions.write_router)
     http_write_protected.include_router(commands.router)
     app.include_router(http_write_protected)
 

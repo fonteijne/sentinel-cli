@@ -450,10 +450,14 @@ def test_rate_limit_over_minute_returns_429_with_retry_after(
     client = authed_client_with_fake_supervisor
 
     body = {"ticket_id": "PROJ-1", "project": "proj", "kind": "execute"}
-    # First 30 succeed.
+    # First 30 succeed. Track 2's attach-or-start returns 201 for the fresh
+    # row and 200 for every subsequent attach to the same active triple; both
+    # count against the rate-limit bucket.
     for i in range(30):
         r = client.post("/executions", json=body)
-        assert r.status_code == 202, f"request {i} got {r.status_code}: {r.text}"
+        assert r.status_code in (200, 201), (
+            f"request {i} got {r.status_code}: {r.text}"
+        )
 
     # 31st is rate-limited.
     r = client.post("/executions", json=body)

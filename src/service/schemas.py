@@ -63,3 +63,51 @@ class ListResponse(BaseModel, Generic[T]):
 
     items: List[T]
     next_cursor: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Track 2 — attach-or-start / cancel request/response models
+# ---------------------------------------------------------------------------
+
+
+class ExecutionCreate(BaseModel):
+    """Request body for ``POST /executions`` (attach-or-start).
+
+    ``extra="forbid"`` because the body flows into ``metadata_json`` and
+    eventually into agent prompts; a free-form dict is a prompt-injection
+    vector. ``options`` stays open-ended (the Orchestrator ignores unknown
+    keys) but the top-level envelope is locked down.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: str
+    ticket_id: str
+    kind: ExecutionKind
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionStartResponse(BaseModel):
+    """Response body for ``POST /executions``.
+
+    ``attached=True`` means the response echoes an already-running row that
+    matched the ``(project, ticket_id, kind)`` triple; ``banner`` is a human-
+    readable string the TUI renders verbatim. Populated only on attach.
+    """
+
+    execution: ExecutionOut
+    attached: bool = False
+    banner: Optional[str] = None
+
+
+class ExecutionCancelResponse(BaseModel):
+    """Response body for ``POST /executions/{id}/cancel``.
+
+    ``signalled=True`` means ``supervisor.cancel`` was invoked (or, for a
+    ``QUEUED`` row that hadn't yet spawned, the row was directly marked
+    ``CANCELLED``). Idempotent — a second cancel on a ``CANCELLING`` row
+    returns ``signalled=True`` too.
+    """
+
+    execution: ExecutionOut
+    signalled: bool = True
