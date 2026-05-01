@@ -53,6 +53,23 @@ async def test_ticket_prompt_cancels_on_escape() -> None:
     assert captured == [None]
 
 
+def test_resolve_ticket_id_prefixes_bare_numbers() -> None:
+    """Bare numbers must get auto-prefixed with the project's Jira key so
+    the user can type just '356' when DHLEXS_DHLEXC is active.
+    """
+    from src.tui.screens.home import HomeScreen
+
+    assert HomeScreen._resolve_ticket_id("356", "DHLEXS_DHLEXC") == "DHLEXS_DHLEXC-356"
+    assert HomeScreen._resolve_ticket_id("  356 ", "DHLEXS_DHLEXC") == "DHLEXS_DHLEXC-356"
+    # Already qualified — leave alone.
+    assert HomeScreen._resolve_ticket_id("IO-42", "DHLEXS_DHLEXC") == "IO-42"
+    assert HomeScreen._resolve_ticket_id("DHLEXS_DHLEXC-356", "DHLEXS_DHLEXC") == "DHLEXS_DHLEXC-356"
+    # No project selected — can't prefix; return as typed.
+    assert HomeScreen._resolve_ticket_id("356", None) == "356"
+    # Empty stays empty (the modal rejects this before calling).
+    assert HomeScreen._resolve_ticket_id("", "DHLEXS_DHLEXC") == ""
+
+
 def test_strip_emoji_handles_validate_command_markers() -> None:
     """The emoji the existing CLI commands print must vanish from the
     captured output — otherwise Textual measures width=2 for each glyph,

@@ -48,14 +48,28 @@ class TicketPromptScreen(ModalScreen[Optional[str]]):
     }
     """
 
-    def __init__(self, action_label: str) -> None:
+    def __init__(
+        self, action_label: str, project_prefix: Optional[str] = None
+    ) -> None:
         super().__init__()
         self._action_label = action_label
+        self._project_prefix = project_prefix
 
     def compose(self) -> ComposeResult:
+        placeholder = (
+            f"e.g. 356  (prefixed with {self._project_prefix}-)"
+            if self._project_prefix
+            else "e.g. IO-123"
+        )
+        hint = (
+            f"{self._action_label} — ticket id "
+            f"(a bare number becomes {self._project_prefix}-<n>):"
+            if self._project_prefix
+            else f"{self._action_label} — ticket id:"
+        )
         with Vertical(id="ticket-prompt-box"):
-            yield Label(f"{self._action_label} — ticket id:")
-            yield Input(placeholder="e.g. IO-123", id="ticket-input")
+            yield Label(hint)
+            yield Input(placeholder=placeholder, id="ticket-input")
             with Horizontal(id="ticket-prompt-buttons"):
                 yield Button("Cancel", id="ticket-cancel", variant="default")
                 yield Button("Go", id="ticket-go", variant="primary")

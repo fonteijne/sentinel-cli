@@ -221,13 +221,58 @@ class HomeScreen(Screen[None]):
             self._dispatch(action, ticket_id=None)
 
     def _prompt_ticket_then_run(self, action: ActionDef) -> None:
+        prefix = self._jira_prefix_for_current_project()
+
         def _after_prompt(ticket: Optional[str]) -> None:
             if ticket is None:
                 self._log(f"[{action.key}] cancelled")
                 return
-            self._dispatch(action, ticket_id=ticket)
+            resolved = self._resolve_ticket_id(ticket, prefix)
+            if resolved != ticket:
+                self._log(
+                    f"[{action.key}] resolved '{ticket}' → '{resolved}' "
+                    f"(project prefix {prefix})"
+                )
+            self._dispatch(action, ticket_id=resolved)
 
-        self.app.push_screen(TicketPromptScreen(action.label), _after_prompt)
+        self.app.push_screen(
+            TicketPromptScreen(action.label, project_prefix=prefix),
+            _after_prompt,
+        )
+
+    def _jira_prefix_for_current_project(self) -> Optional[str]:
+        """Resolve the Jira project-key prefix used to complete bare tickets.
+
+        Falls back to the local project key if `jira_project_key` isn't
+        configured (ConfigLoader defaults it to the project key on
+        `projects add`, so they usually match).
+        """
+        if self._current_project is None:
+            return None
+        try:
+            from src.config_loader import get_config
+
+            cfg = get_config()
+            pcfg = cfg.get_project_config(self._current_project) or {}
+        except Exception:  # noqa: BLE001
+            return self._current_project
+        return str(pcfg.get("jira_project_key") or self._current_project)
+
+    @staticmethod
+    def _resolve_ticket_id(raw: str, prefix: Optional[str]) -> str:
+        """Prepend the Jira prefix when the user typed a bare number.
+
+        - "356" + DHLEXC → "DHLEXC-356"
+        - "DHLEXC-356"   → "DHLEXC-356"   (already qualified)
+        - "356" + None   → "356"          (no project selected)
+        - empty/whitespace → returned as-is (prompt layer already rejects this)
+        """
+        s = raw.strip()
+        if not s or prefix is None:
+            return s
+        if "-" in s:
+            return s
+        return f"{prefix}-{s}"
 
     # --------------------------------------------------------------- dispatch
 
