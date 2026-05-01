@@ -469,6 +469,9 @@ def run_execute(
         result.extra["mr_url"] = post.mr_web_url
         result.extra["pushed"] = post.pushed
         result.extra["push_error"] = post.push_error
+        result.extra["push_deferred"] = post.push_deferred
+        if post.deferred_marker is not None:
+            result.extra["deferred_marker"] = post.deferred_marker
         result.extra["mr_marked_ready"] = post.mr_marked_ready
         result.extra["decision_log_posted"] = post.decision_log_posted
         result.extra["drupal_findings_posted"] = post.drupal_findings_posted
@@ -476,9 +479,9 @@ def run_execute(
         if drupal_findings_to_post is not None:
             result.extra["drupal_findings"] = drupal_findings_to_post
 
-        # If push failed we surface that as a workflow failure so the run is
-        # marked failed rather than green-with-a-warning.
-        if not post.pushed:
+        # A deferred push means the work is safely committed locally and
+        # will be retried by ``sentinel push-pending`` — treat as success.
+        if not post.pushed and not post.push_deferred:
             raise WorkflowError(
                 f"git push failed — the work is committed locally but not on "
                 f"origin: {post.push_error or 'unknown error'}"
@@ -672,10 +675,13 @@ def run_revise(
         )
         result.extra["pushed"] = post.pushed
         result.extra["push_error"] = post.push_error
+        result.extra["push_deferred"] = post.push_deferred
+        if post.deferred_marker is not None:
+            result.extra["deferred_marker"] = post.deferred_marker
         result.extra["decision_log_posted"] = post.decision_log_posted
         result.extra["drupal_findings_posted"] = post.drupal_findings_posted
 
-        if not post.pushed:
+        if not post.pushed and not post.push_deferred:
             raise WorkflowError(
                 f"git push failed during revise — work is local only: "
                 f"{post.push_error or 'unknown error'}"

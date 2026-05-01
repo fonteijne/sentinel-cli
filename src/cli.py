@@ -817,6 +817,24 @@ def execute(
         )
         return
 
+    # Auto-drain any previously-deferred pushes before starting new work.
+    # Best-effort: never block execute on this.
+    try:
+        from src.core.execution.push_deferral import drain_pending
+        cfg = get_config()
+        report = drain_pending(cfg.workspace_root, logger=logger, quiet=True)
+        if report.drained:
+            click.echo(
+                f"↻ Drained {len(report.drained)} previously-deferred push(es)."
+            )
+        if report.still_pending:
+            click.echo(
+                f"⚠ {len(report.still_pending)} deferred push(es) still pending "
+                f"— run 'sentinel push-pending' to retry."
+            )
+    except Exception as exc:
+        logger.warning("auto-drain failed (continuing): %s", exc)
+
     try:
         conn, repo, bus, orchestrator = _open_command_center()
     except Exception as e:
@@ -904,6 +922,25 @@ def execute(
             click.echo("   ⚠️  Drupal findings posted to MR for human review")
         if "jira.completion_comment_posted" in artifacts:
             click.echo("   ✓ Jira notification posted")
+
+        if wf_result.extra.get("push_deferred"):
+            marker = wf_result.extra.get("deferred_marker")
+            m_branch = getattr(marker, "branch", "") or "(unknown)"
+            m_wt = getattr(marker, "worktree_path", "") or "(unknown)"
+            click.echo(
+                "\n═══════════════════════════════════════════════════════════════\n"
+                "⚠️  PUSH DEFERRED — GitLab unreachable\n"
+                f"   Ticket: {ticket_id}   Branch: {m_branch}\n"
+                f"   Worktree: {m_wt}\n"
+                "   Implementation is committed locally and safe.\n"
+                "   Retry with: sentinel push-pending\n"
+                "═══════════════════════════════════════════════════════════════"
+            )
+            click.echo(
+                "   ℹ MR mark-ready, Jira notify and decision-log comment "
+                "were skipped and may need manual follow-up."
+            )
+            return
 
         mr_url = wf_result.extra.get("mr_url")
         if mr_url:
@@ -1217,6 +1254,44 @@ def status(project: Optional[str] = None) -> None:
                     click.echo(f"     ... and {len(worktrees) - 5} more")
             else:
                 click.echo("   No active worktrees")
+
+        # Pending pushes section — deferred by VPN drops / transient errors.
+        try:
+            from src.core.execution.push_deferral import enumerate_pending
+            pending = enumerate_pending(config.workspace_root)
+        except Exception as exc:
+            logger.warning("status: enumerate_pending failed: %s", exc)
+            pending = []
+
+        click.echo("\n📤 Pending pushes")
+        if not pending:
+            click.echo("   ✓ None")
+        else:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            for m in pending:
+                age = ""
+                try:
+                    first = datetime.strptime(
+                        m.first_deferred_at, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc)
+                    delta = now - first
+                    hours = int(delta.total_seconds() // 3600)
+                    if hours >= 1:
+                        age = f"{hours}h"
+                    else:
+                        age = f"{int(delta.total_seconds() // 60)}m"
+                except Exception:
+                    age = "?"
+                err = (m.last_error or "")[:80]
+                click.echo(
+                    f"   ⚠️  {m.ticket_id}  branch={m.branch}  "
+                    f"age={age}  attempts={m.attempts}  "
+                    f"kind={m.last_error_kind}"
+                )
+                if err:
+                    click.echo(f"       last_error: {err}")
+            click.echo("   Run 'sentinel push-pending' to retry.")
 
     except Exception as e:
         logger.error(f"Status command failed: {e}", exc_info=True)
@@ -2537,6 +2612,49 @@ def serve(
     # state (plan 04) and SQLite connections are per-process; single-process
     # is a design constraint, not an oversight.
     uvicorn.run(create_app(), host=bind_host, port=bind_port, log_config=None)
+
+
+@cli.command("push-pending")
+@click.option(
+    "--quiet", is_flag=True,
+    help="Suppress per-item output; only print the summary.",
+)
+def push_pending(quiet: bool) -> None:
+    """Retry any deferred pushes whose worktrees have pending markers."""
+    try:
+        from src.core.execution.push_deferral import drain_pending
+
+        cfg = get_config()
+        report = drain_pending(cfg.workspace_root, logger=logger, quiet=quiet)
+    except Exception as e:
+        logger.error(f"push-pending failed: {e}", exc_info=True)
+        click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
+
+    if not quiet:
+        for m in report.drained:
+            click.echo(f"   ✓ {m.ticket_id}  pushed {m.branch}")
+        for m in report.still_pending:
+            click.echo(
+                f"   ⚠️  {m.ticket_id}  still pending "
+                f"(attempts={m.attempts}, kind={m.last_error_kind})"
+            )
+        for m, err in report.errors:
+            click.echo(f"   ❌ {m.ticket_id}  error: {err}")
+
+    click.echo(
+        f"\n📤 push-pending: drained={len(report.drained)} "
+        f"still_pending={len(report.still_pending)} "
+        f"errors={len(report.errors)}"
+    )
+    if report.drained:
+        click.echo(
+            "   ℹ MR mark-ready, Jira notify and decision-log comment from "
+            "the original execute run were skipped — those may need manual "
+            "follow-up."
+        )
+    if report.still_pending or report.errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
