@@ -183,60 +183,57 @@ def test_strip_emoji_handles_validate_command_markers() -> None:
         )
 
 
-def test_capture_stdout_to_log_monkeypatches_click_echo() -> None:
-    """Regression: ``click.echo`` caches its stream at first use; plain
-    ``sys.stdout`` replacement misses it. The capture context must monkey-
-    patch ``click.echo`` so output from Click-decorated callbacks still
-    reaches our forwarder. Without this the launcher looked frozen during
-    any action — the Click command ran, but every ``click.echo`` wrote past
-    our replaced stdout straight to the cached original.
+def test_capture_stdout_to_log_fd_level() -> None:
+    """Fd-level capture must pick up writes that happen at the OS fd layer:
 
-    Tests the monkey-patch logic directly with a fake ``app`` + ``log`` to
-    avoid the ``call_from_thread`` marshaling (which expects a background
-    thread); production always runs capture from ``@work(thread=True)``.
+    * ``os.write(1, ...)`` / ``os.write(2, ...)`` — what Python's
+      TextIOWrapper eventually calls under the hood.
+    * Child-process output — subprocess inherits the parent's fd 1/2
+      and writes past any Python-level pipe. This is the regression the
+      fd capture exists to close (git / ssh were splashing across the
+      TUI frame before).
+
+    We can't assert ``print(...)`` or ``click.echo(...)`` here because
+    pytest intercepts ``sys.stdout`` / ``sys.stderr`` at the Python
+    level, so those writes never touch fd 1/2 in a pytest environment.
+    In production the CLI commands use real file wrappers around fd 1/2,
+    so the underlying fd write is what matters — and that's what we test.
     """
-    import click
+    import os
+    import subprocess
+    import sys
+    import threading
     from src.tui.widgets.run_output import capture_stdout_to_log
 
-    # Warm Click's cache before capture, mimicking real-world use.
-    click.echo("warmup", err=True)
-
     captured: list[str] = []
+    lock = threading.Lock()
 
     class _FakeLog:
         def write_line(self, line: str) -> None:
-            captured.append(line)
+            with lock:
+                captured.append(line)
 
     class _FakeApp:
-        def call_from_thread(self, fn, *args, **kwargs):
-            # Same-thread variant: just run it.
+        # No _driver → the Textual-rescue step is a no-op. Good: we're
+        # not running a UI in this test.
+        def call_from_thread(self, fn, *args, **kwargs):  # type: ignore[no-untyped-def]
             fn(*args, **kwargs)
 
-    import logging
-    import sys
-
-    test_logger = logging.getLogger("src.tui.capture_test")
-    test_logger.setLevel(logging.INFO)
-    test_logger.propagate = False
-    # Handler captures sys.stderr at construction, exactly like the real CLI.
-    h = logging.StreamHandler(sys.stderr)
-    h.setLevel(logging.INFO)
-    test_logger.addHandler(h)
-
     with capture_stdout_to_log(_FakeApp(), _FakeLog()):  # type: ignore[arg-type]
-        click.echo("hello from click.echo")
-        print("hello from print")
-        test_logger.info("hello from logging")
-
-    test_logger.removeHandler(h)
+        os.write(1, b"hello from os.write stdout\n")
+        os.write(2, b"hello from os.write stderr\n")
+        # Spawn a subprocess that writes to its own fd 2 — must be
+        # captured because the child inherits the redirected fd 2.
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('hello from subprocess stderr\\n')",
+            ],
+            check=True,
+        )
 
     joined = "\n".join(captured)
-    assert "hello from click.echo" in joined, joined
-    assert "hello from print" in joined, joined
-    # The key regression: logging handlers that cached sys.stderr at
-    # construction used to write past the forwarder straight to the tty,
-    # splashing timestamped INFO lines over the TUI.
-    assert "hello from logging" in joined, joined
-
-    # Monkey-patch must be removed on exit.
-    assert click.echo.__module__ == "click.utils" or click.echo.__name__ == "echo"
+    assert "hello from os.write stdout" in joined, joined
+    assert "hello from os.write stderr" in joined, joined
+    assert "hello from subprocess stderr" in joined, joined

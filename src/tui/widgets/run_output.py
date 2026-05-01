@@ -1,55 +1,51 @@
-"""Stream-capture shim that forwards stdout lines into a Textual RichLog.
+"""File-descriptor-level capture of stdout/stderr into a Textual Log.
 
-Usage from a worker thread:
+Why fd-level and not a Python-attribute swap:
 
-    from src.tui.widgets.run_output import capture_stdout_to_log
+* Python's ``sys.stdout``/``sys.stderr`` attribute replacement doesn't
+  reach child processes. ``subprocess.run`` forks with the parent's
+  fd 1 and fd 2, so ``git`` / ``ssh`` / ``docker compose`` write straight
+  past a Python-level pipe (the user saw raw git progress and ssh
+  warnings splash across the TUI frame for exactly this reason).
+* ``click.echo`` caches its stream via ``click.utils._default_text_stdout``
+  and ``logging.StreamHandler.stream`` caches ``sys.stderr`` at handler
+  construction — but both of those end up writing to the underlying fd
+  1 / fd 2 via TextIOWrapper, so redirecting the fds captures them
+  transparently. No monkey-patching needed once we own the fds.
 
-    with capture_stdout_to_log(app, log_widget):
-        run_validate(None, None)
-
-Two capture paths matter:
-
-1. **Plain ``print`` / ``sys.stdout.write``**: we replace ``sys.stdout`` with
-   a forwarder; standard redirection catches it.
-2. **``click.echo``**: Click caches the text stream in
-   ``click.utils._default_text_stdout`` on first use, so replacing
-   ``sys.stdout`` after that cache is warm is a no-op. We monkey-patch
-   ``click.echo`` itself for the duration of the capture to always route
-   through the current ``sys.stdout`` — which is our forwarder.
-
-Each complete line is dispatched to the RichLog via ``app.call_from_thread``
-so Textual's render loop sees a safe update on its own thread.
+Gotcha: Textual's linux driver writes terminal output via
+``sys.__stderr__`` (immutable reference to the interpreter's original
+fd 2). If we naively redirect fd 2 to a pipe, Textual's frames start
+landing in the log and the UI stops rendering. Before the swap we
+``dup`` the original fd 2 to a new fd, wrap it in a file object, and
+re-point Textual's driver ``_file`` (and its ``_writer_thread._file``)
+at the wrap. Textual keeps painting the real tty while fd 2 goes to
+our pipe for everything else.
 """
 
 from __future__ import annotations
 
 import contextlib
-import io
+import os
 import re
 import sys
-from typing import TYPE_CHECKING, Any, Iterator
+import threading
+from typing import TYPE_CHECKING, Iterator, List, Tuple
 
 if TYPE_CHECKING:
     from textual.app import App
-    from textual.widgets import RichLog
+    from textual.widgets import Log
 
 
 # Many CLI commands (validate, status, execute) print emoji like 🔐 📊 ✅ 1️⃣.
-# Textual's layout engine measures these as 2 cells wide via `wcwidth`, but
-# if the operator's terminal font lacks the glyph it renders as a 1-cell
-# replacement character (or 0-cell with a combiner). The mismatch
-# accumulates across lines and skews every border to the right, eventually
-# pushing the top-bar / project-select off-screen.
-#
-# Rather than require a specific terminal font, strip emoji from captured
-# output before it hits the Log. The surrounding text still identifies each
-# step (1️⃣ becomes "1", ✅ disappears, etc. — all preceded by the step's
-# own text label like "Testing Jira API...").
+# Textual measures those as width-2 via wcwidth, but if the operator's
+# terminal font lacks the glyph it renders as a 1-cell replacement char.
+# Strip them so rows never desync.
 _EMOJI_PATTERN = re.compile(
     "["
     "\U0001F300-\U0001FAFF"   # pictographs, transport, supplementals
     "\U0001F1E0-\U0001F1FF"   # regional indicators (flags)
-    "☀-➿"           # misc symbols + dingbats (☀-➿)
+    "☀-➿"           # misc symbols + dingbats
     "⌀-⏿"           # misc technical (⏱, ⏳)
     "️"                  # variation selector 16 (emoji presentation)
     "‍"                  # zero-width joiner (emoji sequences)
@@ -63,102 +59,152 @@ def _strip_emoji(line: str) -> str:
     return _EMOJI_PATTERN.sub("", line).rstrip()
 
 
-class _LineForwarder(io.TextIOBase):
-    """File-like that forwards complete lines to a RichLog on the app thread."""
+def _forward_reader(
+    app: "App", log: "Log", fd: int, stop_event: threading.Event
+) -> None:
+    """Read bytes from ``fd`` until EOF, forwarding each complete line to ``log``.
 
-    def __init__(self, app: "App", log: "RichLog") -> None:
-        self._app = app
-        self._log = log
-        self._buf = ""
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, s: str) -> int:
-        if not s:
-            return 0
-        self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self._emit(line)
-        return len(s)
-
-    def flush(self) -> None:
-        if self._buf:
-            self._emit(self._buf)
-            self._buf = ""
-
-    def _emit(self, line: str) -> None:
-        # call_from_thread marshals the write onto Textual's event loop.
-        # Log.write_line appends the trailing newline; we stripped it above.
+    Runs in a background thread. Uses ``app.call_from_thread`` so Textual's
+    event loop is the one that actually mutates the widget.
+    """
+    buf = b""
+    while not stop_event.is_set():
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            line = raw.decode("utf-8", errors="replace")
+            clean = _strip_emoji(line)
+            try:
+                app.call_from_thread(log.write_line, clean)
+            except Exception:
+                # App may have exited between write and emit. Swallow.
+                pass
+    # Flush any trailing partial line.
+    if buf:
+        line = buf.decode("utf-8", errors="replace")
         clean = _strip_emoji(line)
         try:
-            self._app.call_from_thread(self._log.write_line, clean)
+            app.call_from_thread(log.write_line, clean)
         except Exception:
-            # App may have exited between write and emit. Swallow — the
-            # stream contract is best-effort.
             pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _rescue_textual_writes(
+    app: "App", tty_fd: int
+) -> Tuple[List[Tuple[object, str, object]], object]:
+    """Point Textual's driver output at a file object wrapping ``tty_fd``.
+
+    Textual's linux driver holds ``sys.__stderr__`` (fd 2) in ``_file`` and
+    in ``_writer_thread._file``. Once we redirect fd 2 to a pipe, those
+    references write to the pipe — the TUI goes dark. Wrap a dup'd copy of
+    the original fd 2 in a file object and swap it into both slots.
+
+    Returns ``(patches, tty_file)``. ``patches`` is a list of
+    ``(holder, attr, original)`` tuples for the caller to restore on exit;
+    ``tty_file`` is the file object that must be closed last.
+    """
+    patches: List[Tuple[object, str, object]] = []
+    tty_file = os.fdopen(os.dup(tty_fd), "w", buffering=1)
+
+    driver = getattr(app, "_driver", None)
+    if driver is None:
+        return patches, tty_file
+
+    if hasattr(driver, "_file"):
+        patches.append((driver, "_file", driver._file))
+        driver._file = tty_file
+
+    writer = getattr(driver, "_writer_thread", None)
+    if writer is not None and hasattr(writer, "_file"):
+        patches.append((writer, "_file", writer._file))
+        writer._file = tty_file
+
+    return patches, tty_file
 
 
 @contextlib.contextmanager
-def capture_stdout_to_log(app: "App", log: "RichLog") -> Iterator[None]:
-    """Redirect stdout, stderr, ``click.echo``, and Python logging into ``log``.
+def capture_stdout_to_log(app: "App", log: "Log") -> Iterator[None]:
+    """Capture every kind of output produced during the block into ``log``.
 
-    Three independent channels the CLI uses to produce output; each caches
-    its destination differently, so each needs its own override:
-
-    * ``sys.stdout`` / ``sys.stderr`` — just replace the module attribute.
-    * ``click.echo`` — cached via ``click.utils._default_text_stdout``;
-      monkey-patch ``click.echo`` to always resolve the current ``sys``
-      streams.
-    * ``logging`` — every ``StreamHandler.stream`` references the
-      ``sys.stderr`` value at handler-creation time. We rewrite each
-      StreamHandler's ``.stream`` to our forwarder for the duration of
-      the capture and restore on exit. ``FileHandler`` is skipped — disk
-      logs should keep going to disk.
+    Covers Python print / click.echo / logging handlers AND child-process
+    output (git, ssh, docker compose) via fd-level dup2. Textual's own
+    rendering is preserved by pointing its driver at a dup'd copy of the
+    original fd 2.
     """
-    import click
-    import logging
+    # Flush anything currently buffered so it lands on the real tty.
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
 
-    forwarder = _LineForwarder(app, log)
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout = forwarder
-    sys.stderr = forwarder
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
 
-    # click.echo
-    original_echo = click.echo
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
 
-    def patched_echo(
-        message: Any = None,
-        file: Any = None,
-        nl: bool = True,
-        err: bool = False,
-        color: Any = None,
-    ) -> None:
-        if file is None:
-            file = sys.stderr if err else sys.stdout
-        return original_echo(message, file=file, nl=nl, err=err, color=color)
+    driver_patches, tty_file = _rescue_textual_writes(app, saved_err)
 
-    click.echo = patched_echo  # type: ignore[assignment]
+    os.dup2(out_w, 1)
+    os.dup2(err_w, 2)
+    os.close(out_w)
+    os.close(err_w)
 
-    # logging — redirect every live StreamHandler (skip FileHandlers).
-    saved_streams: list[tuple[logging.StreamHandler, Any]] = []
-    for lg in (logging.getLogger(),) + tuple(
-        logging.getLogger(name) for name in list(logging.Logger.manager.loggerDict)
-    ):
-        for h in getattr(lg, "handlers", []):
-            if isinstance(h, logging.StreamHandler) and not isinstance(
-                h, logging.FileHandler
-            ):
-                saved_streams.append((h, h.stream))
-                h.stream = forwarder
+    stop_event = threading.Event()
+    t_out = threading.Thread(
+        target=_forward_reader, args=(app, log, out_r, stop_event), daemon=True
+    )
+    t_err = threading.Thread(
+        target=_forward_reader, args=(app, log, err_r, stop_event), daemon=True
+    )
+    t_out.start()
+    t_err.start()
 
     try:
         yield
     finally:
-        for h, original_stream in saved_streams:
-            h.stream = original_stream
-        click.echo = original_echo  # type: ignore[assignment]
-        forwarder.flush()
-        sys.stdout = old_stdout
-        sys.stderr = old_stderr
+        # Flush Python stdio through the pipe before restoring.
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+        # Restoring the fds drops the only remaining references to the pipe
+        # write ends, so the readers see EOF and exit cleanly.
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+
+        # Restore Textual driver's file references.
+        for holder, attr, original in driver_patches:
+            try:
+                setattr(holder, attr, original)
+            except Exception:
+                pass
+        try:
+            tty_file.close()
+        except Exception:
+            pass
+
+        stop_event.set()
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
