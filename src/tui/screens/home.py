@@ -258,7 +258,13 @@ class HomeScreen(Screen[None]):
         )
 
     def _existing_worktree_tickets(self) -> list[str]:
-        """Worktrees on disk for the current project, sorted."""
+        """Worktrees on disk for the current project, deduplicated and sorted.
+
+        ``WorktreeManager.list_worktrees`` occasionally returns the same
+        ticket twice (seen after a failed plan that left a partial
+        worktree registration). Dedup here so the ticket picker's
+        ListView doesn't choke on duplicate child ids.
+        """
         if self._current_project is None:
             return []
         try:
@@ -269,7 +275,7 @@ class HomeScreen(Screen[None]):
         except Exception as exc:  # noqa: BLE001
             self._log(f"[tui] could not list worktrees: {exc}")
             return []
-        return sorted(tickets)
+        return sorted(set(tickets))
 
     def _jira_prefix_for_current_project(self) -> Optional[str]:
         """Resolve the Jira project-key prefix used to complete bare tickets.

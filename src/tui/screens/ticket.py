@@ -81,7 +81,14 @@ class TicketPromptScreen(ModalScreen[Optional[str]]):
         super().__init__()
         self._action_label = action_label
         self._project_prefix = project_prefix
-        self._existing_tickets = list(existing_tickets or [])
+        # Dedupe while preserving first-seen order — duplicate ListItem ids
+        # would crash mount_all with MountError. The caller is supposed to
+        # dedupe, but do it here too so a buggy caller is degraded rather
+        # than fatal.
+        seen: set[str] = set()
+        self._existing_tickets = [
+            t for t in (existing_tickets or []) if not (t in seen or seen.add(t))
+        ]
         self._allow_new = allow_new
 
     # ----------------------------------------------------------------- compose

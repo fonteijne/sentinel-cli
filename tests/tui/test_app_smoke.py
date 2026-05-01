@@ -111,6 +111,43 @@ async def test_ticket_prompt_lists_existing_worktrees_and_new_item() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ticket_prompt_dedupes_duplicate_ticket_ids() -> None:
+    """WorktreeManager has been seen returning the same ticket twice after
+    a failed plan. Building ListItems with duplicate ids crashes Textual's
+    mount_all with MountError. The modal must dedupe defensively so the
+    picker never crashes for that reason.
+    """
+    from src.tui.app import SentinelApp
+    from src.tui.screens.ticket import TicketPromptScreen
+    from textual.widgets import ListView
+
+    app = SentinelApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(
+            TicketPromptScreen(
+                "Plan a ticket",
+                existing_tickets=[
+                    "DHLEXS_DHLEXC-311",
+                    "DHLEXS_DHLEXC-311",  # duplicate
+                    "DHLEXS_DHLEXC-356",
+                ],
+                allow_new=True,
+            ),
+            lambda _: None,
+        )
+        await pilot.pause()
+        lst = app.screen.query_one("#ticket-list", ListView)
+        ids = [c.id for c in lst.children]
+        assert ids == [
+            "ticket-item-DHLEXS_DHLEXC-311",
+            "ticket-item-DHLEXS_DHLEXC-356",
+            "ticket-item-new",
+        ]
+        await pilot.press("escape")
+
+
+@pytest.mark.asyncio
 async def test_ticket_prompt_dismisses_with_selected_existing_ticket() -> None:
     """Picking a worktree from the list dismisses the modal with that id."""
     from src.tui.app import SentinelApp
