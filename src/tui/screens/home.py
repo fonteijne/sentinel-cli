@@ -194,6 +194,12 @@ class HomeScreen(Screen[None]):
     def _on_project_changed(self, event: Select.Changed) -> None:
         value = event.value
         self._current_project = None if value == Select.BLANK else str(value)
+        # Auto-advance to the action list on a real project pick so the
+        # next keystroke starts the workflow. Stay put when the operator
+        # clears the selection (Select.BLANK) — they're probably about to
+        # pick a different project.
+        if self._current_project is not None:
+            self.query_one("#actions", ListView).focus()
 
     @on(ListView.Selected, "#actions")
     def _on_action_selected(self, event: ListView.Selected) -> None:
