@@ -54,29 +54,48 @@ class HomeScreen(Screen[None]):
         width: 60;
     }
 
+    /* Highlight the Select when it (or its open menu) has focus. */
+    #project-select:focus-within > SelectCurrent {
+        border: heavy $warning;
+    }
+
     #body {
         height: 1fr;
         width: 100%;
         overflow: hidden;
     }
 
+    /* Dim default borders; swap to heavy + bright $warning on focus so
+       the active panel is unmistakable. border_title is set on each
+       widget so the label stays inside the border. */
     #actions {
         width: 50;
         height: 100%;
-        border: round $accent;
+        border: round $primary;
+        border-title-color: $text-muted;
         padding: 0 1;
+    }
+
+    #actions:focus-within {
+        border: heavy $warning;
+        border-title-color: $warning;
+        border-title-style: bold;
     }
 
     #output-log {
         width: 1fr;
         height: 100%;
         border: round $primary;
+        border-title-color: $text-muted;
         padding: 0 1;
-        /* Log manages its own vertical scroll; disable horizontal scroll
-           (long lines truncate on the right rather than widening the
-           column and squeezing the Actions pane). */
         overflow-x: hidden;
         overflow-y: auto;
+    }
+
+    #output-log:focus {
+        border: heavy $warning;
+        border-title-color: $warning;
+        border-title-style: bold;
     }
     """
 
@@ -114,6 +133,11 @@ class HomeScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Label each panel inside its own border so the active panel is
+        # obvious even in a narrow terminal.
+        self.query_one("#actions", ListView).border_title = "Actions"
+        self.query_one("#output-log", Log).border_title = "Output"
+
         self._load_projects()
         # Land focus on the Project dropdown if nothing is picked yet so the
         # first Tab/Enter press does what a new user expects. If a project
