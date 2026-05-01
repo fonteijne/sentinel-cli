@@ -43,3 +43,39 @@ CREATE UNIQUE INDEX idx_executions_active_triple
 - `/workspace/sentinel/.agents/plans/interactive-tui/track-2-attach-or-start.md` — §Gotchas
 - `/workspace/sentinel/src/service/routes/executions.py` — `create_or_attach_execution`
 - `/workspace/sentinel/src/core/execution/repository.py` — `find_active`
+
+## FU-2 — auto-launch: reap spawned child on unexpected exceptions mid-spawn
+
+- **Priority:** 4
+- **Labels:** `tech-debt`, `tui`, `command-center`
+- **Source:** Track 1 (`track-1-auto-launch.md`), flagged by `cc-plan-reviewer` as concern #15.
+
+### Problem
+
+In `src/tui/bootstrap.py::ensure_service`, if `_spawn_serve()` succeeds but an
+unexpected exception (e.g. `KeyboardInterrupt`, stray `OSError` from
+`read_discovery`) escapes the health-poll block between spawn and the first
+successful health probe, the `Popen` child is leaked. The two documented exit
+paths (`RuntimeError` on health timeout, `TimeoutError` on lock contention)
+are intentional — operator diagnostics benefit from the child staying up —
+but any third exception class leaves a detached `sentinel serve` with no
+handle for reaping.
+
+### Proposed fix
+
+Wrap the post-spawn poll block in a try/except that, on any exception NOT in
+the documented set, calls `child.terminate()` (with a bounded wait + kill) or
+at minimum logs the pid at ERROR so the operator can clean up manually. Keep
+the existing "leave child running on health timeout" behaviour intact.
+
+### Acceptance
+
+- `KeyboardInterrupt` mid-spawn does not leak a `sentinel serve` process.
+- Existing tests in `tests/integration/test_auto_launch.py` still pass.
+- New unit test: monkeypatch `read_discovery` to raise an unexpected
+  `RuntimeError` inside the poll loop, assert the spawned child is reaped.
+
+### Context / references
+
+- `/workspace/sentinel/src/tui/bootstrap.py` — `ensure_service`, `_spawn_serve`
+- `/workspace/sentinel/.agents/plans/interactive-tui/track-1-auto-launch.md` — §Gotchas

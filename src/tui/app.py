@@ -8,8 +8,13 @@ call the existing Click command callbacks.
 
 from __future__ import annotations
 
+import sys
+from typing import Optional
+
+import click
 from textual.app import App
 
+from src.tui.bootstrap import ServiceHandle, ensure_service
 from src.tui.screens.home import HomeScreen
 
 
@@ -29,6 +34,10 @@ class SentinelApp(App[None]):
         ("ctrl+c", "tui_quit", "Quit"),
     ]
 
+    # Attached by ``run()`` after ``ensure_service`` succeeds. Track 3 reads
+    # this to configure the HTTP client; screens today ignore it.
+    service: Optional[ServiceHandle] = None
+
     def on_mount(self) -> None:
         self.push_screen(HomeScreen())
 
@@ -45,5 +54,23 @@ def run() -> None:
     whose bytes (≥ 0x80 once the click is past column ~95) aren't valid
     UTF-8, which crashes Textual's input-decoder thread. Keyboard-only
     sidesteps the protocol mismatch entirely.
+
+    Before mounting the UI we ensure the Command Center service is up and
+    discoverable (see :mod:`src.tui.bootstrap`). A spawn failure here exits
+    with code 3 — matching the ``_remote_execute`` convention in cli.py for
+    "service unreachable" — rather than launching a TUI that can't talk to
+    anything.
     """
-    SentinelApp().run(mouse=False)
+    try:
+        handle = ensure_service()
+    except (RuntimeError, TimeoutError) as exc:
+        click.echo(
+            f"Failed to start Sentinel service: {exc}\n"
+            "Try `sentinel serve` manually to see the error.",
+            err=True,
+        )
+        sys.exit(3)
+
+    app = SentinelApp()
+    app.service = handle
+    app.run(mouse=False)

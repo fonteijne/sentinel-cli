@@ -2582,10 +2582,13 @@ def serve(
 ) -> None:
     """Start the Sentinel HTTP API."""
     # Imports kept local so CLI startup isn't penalised by FastAPI/uvicorn.
+    import socket
+
     import uvicorn
 
     from src.service.app import create_app
     from src.service.auth import load_or_create_token
+    from src.service.discovery import remove_discovery
 
     cfg = get_config()
     bind_host = host or cfg.get("service.bind_address", "127.0.0.1")
@@ -2601,6 +2604,17 @@ def serve(
             "Use 127.0.0.1 or the docker network IP."
         )
 
+    # --port 0 means "pick an ephemeral port". Pre-resolve it so we can stash
+    # the concrete port on app.state for the discovery writer. Yes, there is
+    # a race window between close() and uvicorn's subsequent bind — acceptable
+    # per the Track 1 plan (gotchas section). Pinned non-zero ports are passed
+    # through unchanged; collisions surface via uvicorn's normal EADDRINUSE.
+    if bind_port == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((bind_host, 0))
+            bind_port = probe.getsockname()[1]
+        logger.info("serve: resolved ephemeral port -> %d", bind_port)
+
     token = load_or_create_token()
     if show_token_prefix:
         click.echo(
@@ -2608,10 +2622,29 @@ def serve(
             f"(full value in ~/.sentinel/service_token)"
         )
 
-    # Intentionally pass the app INSTANCE, not a factory string — Supervisor
-    # state (plan 04) and SQLite connections are per-process; single-process
-    # is a design constraint, not an oversight.
-    uvicorn.run(create_app(), host=bind_host, port=bind_port, log_config=None)
+    # Build the app explicitly so we can attach the pre-resolved port; the
+    # lifespan consumes app.state.discovery_port to write ~/.local/state/
+    # sentinel/service.json. Intentionally pass the app INSTANCE, not a
+    # factory string — Supervisor state (plan 04) and SQLite connections are
+    # per-process; single-process is a design constraint.
+    #
+    # NOTE: we deliberately do NOT acquire discovery_lock here. The lock is a
+    # spawn-decision mutex for the TUI preamble; holding it across the serve
+    # process lifetime would serialize all sentinel serve invocations forever.
+    # Single-instance correctness is enforced by port-level exclusion (two
+    # processes cannot bind the same port) — discovery is only used to FIND
+    # the running service, not to elect it.
+    app = create_app()
+    app.state.discovery_port = bind_port
+
+    try:
+        uvicorn.run(app, host=bind_host, port=bind_port, log_config=None)
+    finally:
+        # Belt-and-braces: the lifespan teardown removes the discovery file on
+        # clean shutdown, but if startup raised before reaching the yield (or
+        # uvicorn died hard), the file could survive. remove_discovery is
+        # idempotent and swallows FileNotFoundError, so this is always safe.
+        remove_discovery()
 
 
 @cli.command("interactive")
