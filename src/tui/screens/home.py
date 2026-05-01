@@ -29,8 +29,9 @@ logger = logging.getLogger(__name__)
 class HomeScreen(Screen[None]):
     """Single-screen launcher: project Select + action ListView + output log."""
 
+    # `q` is bound at App level so it works regardless of which widget has
+    # focus (and so Input widgets in modals can type 'q' without quitting).
     BINDINGS = [
-        ("q", "quit", "Quit"),
         ("r", "focus_actions", "Actions"),
         ("c", "clear_log", "Clear log"),
     ]
@@ -65,7 +66,7 @@ class HomeScreen(Screen[None]):
         super().__init__()
         self._projects: List[str] = []
         self._current_project: Optional[str] = None
-        self._running: bool = False
+        self._running_label: Optional[str] = None  # None ⇒ idle
 
     # ------------------------------------------------------------------ compose
 
@@ -144,8 +145,11 @@ class HomeScreen(Screen[None]):
 
     @on(ListView.Selected, "#actions")
     def _on_action_selected(self, event: ListView.Selected) -> None:
-        if self._running:
-            self._log("[busy] another action is running — wait for it to finish")
+        if self._running_label is not None:
+            self._log(
+                f"[busy] '{self._running_label}' is still running — "
+                f"wait for it to finish (or Ctrl-Q to quit)"
+            )
             return
 
         item_id = event.item.id or ""
@@ -176,11 +180,12 @@ class HomeScreen(Screen[None]):
     # --------------------------------------------------------------- dispatch
 
     def _dispatch(self, action: ActionDef, ticket_id: Optional[str]) -> None:
-        self._running = True
+        self._running_label = action.label
         self._log(
             f"\n>>> {action.label}"
             + (f"  ticket={ticket_id}" if ticket_id else "")
             + (f"  project={self._current_project}" if self._current_project else "")
+            + "  (running…)"
         )
         self._run_worker(action, ticket_id)
 
@@ -202,7 +207,7 @@ class HomeScreen(Screen[None]):
             app.call_from_thread(self._mark_idle)
 
     def _mark_idle(self) -> None:
-        self._running = False
+        self._running_label = None
 
     # --------------------------------------------------------------- utilities
 

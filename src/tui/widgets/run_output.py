@@ -7,9 +7,18 @@ Usage from a worker thread:
     with capture_stdout_to_log(app, log_widget):
         run_validate(None, None)
 
-The worker thread writes to ``sys.stdout`` as usual; each line is dispatched
-to the RichLog via ``app.call_from_thread`` so Textual's render loop sees a
-safe update on its own thread.
+Two capture paths matter:
+
+1. **Plain ``print`` / ``sys.stdout.write``**: we replace ``sys.stdout`` with
+   a forwarder; standard redirection catches it.
+2. **``click.echo``**: Click caches the text stream in
+   ``click.utils._default_text_stdout`` on first use, so replacing
+   ``sys.stdout`` after that cache is warm is a no-op. We monkey-patch
+   ``click.echo`` itself for the duration of the capture to always route
+   through the current ``sys.stdout`` — which is our forwarder.
+
+Each complete line is dispatched to the RichLog via ``app.call_from_thread``
+so Textual's render loop sees a safe update on its own thread.
 """
 
 from __future__ import annotations
@@ -17,7 +26,7 @@ from __future__ import annotations
 import contextlib
 import io
 import sys
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 if TYPE_CHECKING:
     from textual.app import App
@@ -61,14 +70,34 @@ class _LineForwarder(io.TextIOBase):
 
 @contextlib.contextmanager
 def capture_stdout_to_log(app: "App", log: "RichLog") -> Iterator[None]:
-    """Redirect stdout (and stderr) into ``log`` for the duration of the block."""
+    """Redirect stdout, stderr, and ``click.echo`` into ``log``."""
+    import click
+
     forwarder = _LineForwarder(app, log)
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout = forwarder
     sys.stderr = forwarder
+
+    original_echo = click.echo
+
+    def patched_echo(
+        message: Any = None,
+        file: Any = None,
+        nl: bool = True,
+        err: bool = False,
+        color: Any = None,
+    ) -> None:
+        # When Click picks its cached default stream it writes past our
+        # replaced sys.stdout. Force the current streams every call.
+        if file is None:
+            file = sys.stderr if err else sys.stdout
+        return original_echo(message, file=file, nl=nl, err=err, color=color)
+
+    click.echo = patched_echo  # type: ignore[assignment]
     try:
         yield
     finally:
+        click.echo = original_echo  # type: ignore[assignment]
         forwarder.flush()
         sys.stdout = old_stdout
         sys.stderr = old_stderr

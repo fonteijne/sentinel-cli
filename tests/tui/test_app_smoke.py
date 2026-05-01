@@ -51,3 +51,44 @@ async def test_ticket_prompt_cancels_on_escape() -> None:
         await pilot.pause()
 
     assert captured == [None]
+
+
+def test_capture_stdout_to_log_monkeypatches_click_echo() -> None:
+    """Regression: ``click.echo`` caches its stream at first use; plain
+    ``sys.stdout`` replacement misses it. The capture context must monkey-
+    patch ``click.echo`` so output from Click-decorated callbacks still
+    reaches our forwarder. Without this the launcher looked frozen during
+    any action — the Click command ran, but every ``click.echo`` wrote past
+    our replaced stdout straight to the cached original.
+
+    Tests the monkey-patch logic directly with a fake ``app`` + ``log`` to
+    avoid the ``call_from_thread`` marshaling (which expects a background
+    thread); production always runs capture from ``@work(thread=True)``.
+    """
+    import click
+    from src.tui.widgets.run_output import capture_stdout_to_log
+
+    # Warm Click's cache before capture, mimicking real-world use.
+    click.echo("warmup", err=True)
+
+    captured: list[str] = []
+
+    class _FakeLog:
+        def write(self, line: str) -> None:
+            captured.append(line)
+
+    class _FakeApp:
+        def call_from_thread(self, fn, *args, **kwargs):
+            # Same-thread variant: just run it.
+            fn(*args, **kwargs)
+
+    with capture_stdout_to_log(_FakeApp(), _FakeLog()):  # type: ignore[arg-type]
+        click.echo("hello from click.echo")
+        print("hello from print")
+
+    joined = "\n".join(captured)
+    assert "hello from click.echo" in joined, joined
+    assert "hello from print" in joined, joined
+
+    # Monkey-patch must be removed on exit.
+    assert click.echo.__module__ == "click.utils" or click.echo.__name__ == "echo"

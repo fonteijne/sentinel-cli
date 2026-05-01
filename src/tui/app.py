@@ -19,12 +19,22 @@ class SentinelApp(App[None]):
     TITLE = "Sentinel"
     SUB_TITLE = "interactive launcher"
 
+    # Bindings live on the App (not the home Screen) so the quit keys work
+    # regardless of which widget has focus — Screen-level `("q", "quit")`
+    # resolves `action_quit` on the Screen first, which doesn't define it,
+    # and the bubble to the App can be intercepted by focused widgets.
     BINDINGS = [
-        ("ctrl+c", "quit", "Quit"),
+        ("q", "tui_quit", "Quit"),
+        ("ctrl+q", "tui_quit", "Quit"),
+        ("ctrl+c", "tui_quit", "Quit"),
     ]
 
     def on_mount(self) -> None:
         self.push_screen(HomeScreen())
+
+    def action_tui_quit(self) -> None:
+        """Unconditional exit, bypassing any focused-widget interception."""
+        self.exit()
 
 
 def run() -> None:
