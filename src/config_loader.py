@@ -398,9 +398,16 @@ class ConfigLoader:
     def workspace_root(self) -> Path:
         """Get workspace root directory path.
 
-        Returns:
-            Path to workspace root
+        Resolution order:
+        1. ``WORKSPACE_ROOT`` env var — deployment-specific (Docker sets this
+           to ``/workspaces`` so worktrees land on the ``sentinel-workspaces``
+           named volume and survive container rebuilds).
+        2. ``workspace.root_dir`` in config — operator override.
+        3. ``~/sentinel-workspaces`` default — host-dev fallback.
         """
+        env_root = os.environ.get("WORKSPACE_ROOT")
+        if env_root:
+            return Path(env_root).expanduser()
         root_str = self.get("workspace.root_dir", "~/sentinel-workspaces")
         return Path(root_str).expanduser()
 
