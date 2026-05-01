@@ -212,13 +212,31 @@ def test_capture_stdout_to_log_monkeypatches_click_echo() -> None:
             # Same-thread variant: just run it.
             fn(*args, **kwargs)
 
+    import logging
+    import sys
+
+    test_logger = logging.getLogger("src.tui.capture_test")
+    test_logger.setLevel(logging.INFO)
+    test_logger.propagate = False
+    # Handler captures sys.stderr at construction, exactly like the real CLI.
+    h = logging.StreamHandler(sys.stderr)
+    h.setLevel(logging.INFO)
+    test_logger.addHandler(h)
+
     with capture_stdout_to_log(_FakeApp(), _FakeLog()):  # type: ignore[arg-type]
         click.echo("hello from click.echo")
         print("hello from print")
+        test_logger.info("hello from logging")
+
+    test_logger.removeHandler(h)
 
     joined = "\n".join(captured)
     assert "hello from click.echo" in joined, joined
     assert "hello from print" in joined, joined
+    # The key regression: logging handlers that cached sys.stderr at
+    # construction used to write past the forwarder straight to the tty,
+    # splashing timestamped INFO lines over the TUI.
+    assert "hello from logging" in joined, joined
 
     # Monkey-patch must be removed on exit.
     assert click.echo.__module__ == "click.utils" or click.echo.__name__ == "echo"

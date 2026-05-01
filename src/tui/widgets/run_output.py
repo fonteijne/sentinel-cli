@@ -102,14 +102,30 @@ class _LineForwarder(io.TextIOBase):
 
 @contextlib.contextmanager
 def capture_stdout_to_log(app: "App", log: "RichLog") -> Iterator[None]:
-    """Redirect stdout, stderr, and ``click.echo`` into ``log``."""
+    """Redirect stdout, stderr, ``click.echo``, and Python logging into ``log``.
+
+    Three independent channels the CLI uses to produce output; each caches
+    its destination differently, so each needs its own override:
+
+    * ``sys.stdout`` / ``sys.stderr`` — just replace the module attribute.
+    * ``click.echo`` — cached via ``click.utils._default_text_stdout``;
+      monkey-patch ``click.echo`` to always resolve the current ``sys``
+      streams.
+    * ``logging`` — every ``StreamHandler.stream`` references the
+      ``sys.stderr`` value at handler-creation time. We rewrite each
+      StreamHandler's ``.stream`` to our forwarder for the duration of
+      the capture and restore on exit. ``FileHandler`` is skipped — disk
+      logs should keep going to disk.
+    """
     import click
+    import logging
 
     forwarder = _LineForwarder(app, log)
     old_stdout, old_stderr = sys.stdout, sys.stderr
     sys.stdout = forwarder
     sys.stderr = forwarder
 
+    # click.echo
     original_echo = click.echo
 
     def patched_echo(
@@ -119,16 +135,29 @@ def capture_stdout_to_log(app: "App", log: "RichLog") -> Iterator[None]:
         err: bool = False,
         color: Any = None,
     ) -> None:
-        # When Click picks its cached default stream it writes past our
-        # replaced sys.stdout. Force the current streams every call.
         if file is None:
             file = sys.stderr if err else sys.stdout
         return original_echo(message, file=file, nl=nl, err=err, color=color)
 
     click.echo = patched_echo  # type: ignore[assignment]
+
+    # logging — redirect every live StreamHandler (skip FileHandlers).
+    saved_streams: list[tuple[logging.StreamHandler, Any]] = []
+    for lg in (logging.getLogger(),) + tuple(
+        logging.getLogger(name) for name in list(logging.Logger.manager.loggerDict)
+    ):
+        for h in getattr(lg, "handlers", []):
+            if isinstance(h, logging.StreamHandler) and not isinstance(
+                h, logging.FileHandler
+            ):
+                saved_streams.append((h, h.stream))
+                h.stream = forwarder
+
     try:
         yield
     finally:
+        for h, original_stream in saved_streams:
+            h.stream = original_stream
         click.echo = original_echo  # type: ignore[assignment]
         forwarder.flush()
         sys.stdout = old_stdout
