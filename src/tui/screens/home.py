@@ -38,6 +38,14 @@ class HomeScreen(Screen[None]):
     ]
 
     DEFAULT_CSS = """
+    /* Pin the Screen so a growing Log can never push the top-bar /
+       project-select out of view. Every direct child has an explicit
+       height — the Screen's default overflow: auto would otherwise
+       scroll the whole launcher when long output arrives. */
+    HomeScreen {
+        overflow: hidden;
+    }
+
     #top-bar {
         height: 3;
         padding: 0 1;
@@ -50,6 +58,7 @@ class HomeScreen(Screen[None]):
     #body {
         height: 1fr;
         width: 100%;
+        overflow: hidden;
     }
 
     #actions {
@@ -64,7 +73,10 @@ class HomeScreen(Screen[None]):
         height: 100%;
         border: round $primary;
         padding: 0 1;
-        overflow-x: auto;
+        /* Log manages its own vertical scroll; disable horizontal scroll
+           (long lines truncate on the right rather than widening the
+           column and squeezing the Actions pane). */
+        overflow-x: hidden;
         overflow-y: auto;
     }
     """
