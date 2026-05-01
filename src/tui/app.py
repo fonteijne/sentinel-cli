@@ -32,6 +32,10 @@ class SentinelApp(App[None]):
         ("q", "tui_quit", "Quit"),
         ("ctrl+q", "tui_quit", "Quit"),
         ("ctrl+c", "tui_quit", "Quit"),
+        # ``P`` (shifted) — the home screen already binds lowercase ``p``
+        # to focus the project dropdown. Using shift-P keeps the mnemonic
+        # and avoids the clash.
+        ("P", "open_processes", "Processes"),
     ]
 
     # Attached by ``run()`` after ``ensure_service`` succeeds. Track 3 reads
@@ -44,6 +48,41 @@ class SentinelApp(App[None]):
     def action_tui_quit(self) -> None:
         """Unconditional exit, bypassing any focused-widget interception."""
         self.exit()
+
+    def action_open_processes(self) -> None:
+        """Push the Processes dashboard.
+
+        The current project and service-client cache live on the home
+        screen; walk the screen stack to grab them. Token-missing follows
+        the same None-return contract as the home screen's own remote
+        actions — we log to the home log and abort.
+        """
+        home = self.screen
+        current_project = getattr(home, "_current_project", None)
+        # Prefer the cached client (built on first remote action) over
+        # re-constructing one; fall back to ``_get_service_client`` which
+        # returns None + logs on missing token.
+        client = getattr(home, "_service_client", None)
+        if client is None:
+            getter = getattr(home, "_get_service_client", None)
+            if getter is None:
+                return
+            client = getter()
+            if client is None:
+                return
+
+        # Late import to avoid a cycle (processes.py imports nothing app-
+        # level, but keeping this local is symmetric with home.py).
+        from src.tui.screens.processes import ProcessesScreen
+
+        attach_cb = getattr(home, "attach_existing", None)
+        self.push_screen(
+            ProcessesScreen(
+                current_project=current_project,
+                service_client=client,
+                attach_callback=attach_cb,
+            )
+        )
 
 
 def run() -> None:

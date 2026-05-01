@@ -297,6 +297,67 @@ class ServiceClient:
             "unexpected response", status=resp.status_code, detail=resp.text
         )
 
+    async def list_executions(
+        self,
+        *,
+        project: Optional[str] = None,
+        ticket_id: Optional[str] = None,
+        status: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: Optional[int] = None,
+        before: Optional[str] = None,
+    ) -> tuple[list["ExecutionOut"], Optional[str]]:
+        """GET /executions — paged listing filtered by project/status/kind.
+
+        Returns ``(items, next_cursor)``. ``items`` is a list of
+        :class:`ExecutionOut`; ``next_cursor`` is the ISO ``started_at`` of
+        the oldest row when the page was full, else ``None``.
+
+        Same connect/transport handling as :meth:`start`. Non-2xx responses
+        are classified through :meth:`_raise_for_status` — the read endpoint
+        shares the same 401/429/503 semantics.
+        """
+
+        params: dict[str, str] = {}
+        if project is not None:
+            params["project"] = project
+        if ticket_id is not None:
+            params["ticket_id"] = ticket_id
+        if status is not None:
+            params["status"] = status
+        if kind is not None:
+            params["kind"] = kind
+        if limit is not None:
+            params["limit"] = str(int(limit))
+        if before is not None:
+            params["before"] = before
+
+        try:
+            resp = await self._client.get(
+                f"{self._base_url}/executions", params=params
+            )
+        except httpx.ConnectError as exc:
+            raise ServiceUnreachable(
+                f"service unreachable at {self._base_url}: {exc}"
+            ) from exc
+        except httpx.TransportError as exc:
+            raise ServiceUnreachable(
+                f"transport error talking to {self._base_url}: {exc}"
+            ) from exc
+
+        if resp.status_code == 200:
+            data = resp.json()
+            rows = [
+                ExecutionOut.from_json(row) for row in data.get("items", [])
+            ]
+            cursor = data.get("next_cursor")
+            return rows, (cursor if isinstance(cursor, str) else None)
+        self._raise_for_status(resp)
+        # Unreachable — _raise_for_status always raises for non-2xx.
+        raise ServiceClientError(
+            "unexpected response", status=resp.status_code, detail=resp.text
+        )
+
     async def cancel(self, execution_id: str) -> None:
         """POST /executions/{id}/cancel — idempotent.
 

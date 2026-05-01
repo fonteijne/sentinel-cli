@@ -443,6 +443,61 @@ class HomeScreen(Screen[None]):
     def _mark_idle(self) -> None:
         self._running_label = None
 
+    # ------------------------------------------------------------ attach_existing
+
+    def attach_existing(self, execution) -> None:  # type: ignore[no-untyped-def]
+        """Attach the Output log to an already-running execution.
+
+        Called by :class:`~src.tui.screens.processes.ProcessesScreen` when
+        the operator picks a row and hits Enter. Mirrors the tail portion
+        of :meth:`_run_remote_worker` without the ``start()`` round trip —
+        the execution row already exists on the service.
+
+        Busy-guard: if another action is in flight (``_running_label`` is
+        set), we log a hint and return. The operator can clear the log
+        and retry once the current action finishes.
+        """
+        if self._running_label is not None:
+            self._log(
+                f"[busy] '{self._running_label}' is still running — "
+                "finish it before attaching to another run"
+            )
+            return
+        client = self._get_service_client()
+        if client is None:
+            return
+        self._attach_existing_worker(execution)
+
+    @work(exclusive=True, group="actions")
+    async def _attach_existing_worker(self, execution) -> None:  # type: ignore[no-untyped-def]
+        log = self.query_one("#output-log", Log)
+        client = self._service_client
+        if client is None:
+            log.write_line("[tui] internal error: no service client")
+            return
+
+        kind = execution.kind
+        ticket_id = execution.ticket_id
+        short_id = execution.id[:8]
+        self._log(
+            f"\n>>> Attach · {kind}  ticket={ticket_id}  id={short_id}  (running…)"
+        )
+        self._log(
+            f"[attach] tailing {short_id} ({kind}, {execution.status})"
+        )
+        self._running_label = f"Attach · {short_id}"
+        log.focus()
+        try:
+            status = await tail_execution(
+                self.app, log, client, execution.id
+            )
+            suffix = "[ok]" if status == "succeeded" else f"[{status or 'failed'}]"
+            log.write_line(f"<<< Attach · {short_id} {suffix}")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._mark_idle()
+
     # --------------------------------------------------------------- service client
 
     def _get_service_client(self):  # type: ignore[no-untyped-def]

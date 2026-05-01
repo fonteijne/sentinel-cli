@@ -291,6 +291,100 @@ async def test_start_connect_error_raises_unreachable() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# list_executions(...)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_list_executions_happy_path_passes_params_and_parses_items() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["query"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    _exec_row(id="a"),
+                    _exec_row(id="b", status="succeeded"),
+                ],
+                "next_cursor": "2026-01-01T11:00:00+00:00",
+            },
+        )
+
+    client = ServiceClient(
+        "http://localhost:8787",
+        "tok",
+        http_client=_make_http_client(handler),
+    )
+    try:
+        items, cursor = await client.list_executions(
+            project="PRJ", status="running", kind="plan", limit=50
+        )
+    finally:
+        await client.aclose()
+
+    assert seen["path"] == "/executions"
+    assert seen["query"]["project"] == "PRJ"
+    assert seen["query"]["status"] == "running"
+    assert seen["query"]["kind"] == "plan"
+    assert seen["query"]["limit"] == "50"
+    assert cursor == "2026-01-01T11:00:00+00:00"
+    assert len(items) == 2
+    assert isinstance(items[0], ExecutionOut)
+    assert items[0].id == "a"
+    assert items[1].status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_list_executions_no_params_returns_empty_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No query params should be sent when all kwargs are None.
+        assert dict(request.url.params) == {}
+        return httpx.Response(200, json={"items": [], "next_cursor": None})
+
+    client = ServiceClient(
+        "http://localhost:8787",
+        "tok",
+        http_client=_make_http_client(handler),
+    )
+    items, cursor = await client.list_executions()
+    assert items == []
+    assert cursor is None
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_executions_401_raises_unauthorized() -> None:
+    client = ServiceClient(
+        "http://localhost:8787",
+        "tok",
+        http_client=_make_http_client(
+            lambda _r: httpx.Response(401, json={"detail": "bad token"})
+        ),
+    )
+    with pytest.raises(ServiceUnauthorized):
+        await client.list_executions(project="PRJ")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_executions_connect_error_raises_unreachable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route", request=request)
+
+    client = ServiceClient(
+        "http://localhost:8787",
+        "tok",
+        http_client=_make_http_client(handler),
+    )
+    with pytest.raises(ServiceUnreachable):
+        await client.list_executions()
+    await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
 # cancel(...)
 # --------------------------------------------------------------------------- #
 
