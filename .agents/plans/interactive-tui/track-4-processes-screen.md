@@ -40,7 +40,7 @@ All queries hit `GET /executions` with different params — no new server endpoi
 ## Interactions
 
 - **Enter / attach**: switches the Output panel to tail the selected run (uses the same `tail_execution` method from track 3). Banner shown if the run was already in-flight from a previous session.
-- **`c` / cancel**: only enabled on rows with `status=running` or `status=pending`. Calls `POST /executions/{id}/cancel`. Optimistically updates the row to `cancelling` until the next poll confirms.
+- **`c` / cancel**: only enabled on rows with `status=running` or `status=queued`. Calls `POST /executions/{id}/cancel`. Optimistically updates the row to `cancelling` until the next poll confirms.
 - **`r` / refresh**: immediate re-fetch.
 - **Escape**: back to the home screen.
 

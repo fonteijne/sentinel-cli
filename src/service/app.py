@@ -119,7 +119,6 @@ def create_app() -> FastAPI:
             allow_headers=[
                 "authorization",
                 "content-type",
-                "idempotency-key",
             ],
         )
 

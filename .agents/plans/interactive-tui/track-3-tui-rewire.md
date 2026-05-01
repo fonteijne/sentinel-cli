@@ -16,7 +16,7 @@ New module, probably `src/tui/service_client.py` (or colocated under `src/tui/wi
 
 - Constructor takes `(base_url, token)` from the discovery helper (track 1).
 - Methods:
-  - `start(project, ticket_id, kind, options=None) -> StartResult` — POSTs `/executions`, returns a small dataclass `{execution_id, attached: bool, banner: Optional[str]}`.
+  - `start(project, ticket_id, kind, options=None) -> StartResult` — POSTs `/executions`, returns a small dataclass `{execution: ExecutionOut, attached: bool, banner: Optional[str]}`. Access the id as `result.execution.id`; the nested `ExecutionOut` gives callers the full row (status, started_at, kind, options) without a follow-up GET.
   - `cancel(execution_id) -> None`.
   - `tail(execution_id) -> AsyncIterator[str]` — opens the WebSocket at `/executions/{id}/stream?token=...` and yields frames as rendered text. Owned jointly with `cc-websocket-expert` for frame format.
 - Uses `httpx` for HTTP, `websockets` or `httpx-ws` for the stream — whichever the existing service code uses. Don't introduce a new dependency.

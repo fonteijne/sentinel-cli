@@ -117,8 +117,9 @@ Five phases, each independently mergeable and validated at its own gate. Phases 
 ║  POST /executions ──────► commands.start                                      ║
 ║                            repo.create(status=QUEUED)  ◄─── G-02 fixed        ║
 ║                            supervisor.spawn ─────────► worker._worker_main    ║
-║                             (202 ExecutionOut                                 ║
-║                              status=QUEUED)            set_status(RUNNING)    ║
+║                             (201 fresh / 200 attach                           ║
+║                              ExecutionStartResponse                           ║
+║                              execution.status=QUEUED)  set_status(RUNNING)    ║
 ║                                                         _resolve_method(kind) ║
 ║                                                                    │          ║
 ║                                                                    ▼          ║
@@ -180,7 +181,7 @@ Five phases, each independently mergeable and validated at its own gate. Phases 
 
 | Location                              | Before                                               | After                                               | User Impact                                      |
 | ------------------------------------- | ---------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------ |
-| `POST /executions` response           | `status=running` immediately                         | `status=queued`; worker transitions to `running`    | Dashboards distinguish "queued" from "running"   |
+| `POST /executions` response           | `status=running` immediately                         | `201/200` envelope with `execution.status=queued`; worker transitions to `running`; attach-or-start semantics per Track 2 | Dashboards distinguish "queued" from "running"; concurrent POSTs attach |
 | Event stream for a remote run         | 3 events (started, phase, completed)                 | 15–50+ events incl. tool.called, cost.accrued, agent.* | Timeline is useful                            |
 | Cancel of a remote run                | SIGTERM→SIGINT→SIGKILL, containers leak              | Cooperative exit at phase boundary + compose down   | Clean cancel; no orphaned containers             |
 | WS `/executions/{id}/stream`          | Unlimited connections per token                      | HTTP 403 close-code 1008 after 10 concurrent        | Misbehaving client can't brown out service       |
@@ -518,7 +519,7 @@ Tiny change, but reshapes reconciliation tests. Lands immediately after Phase 1 
 - **ACTION**: Change `create()` to insert with `ExecutionStatus.QUEUED.value` instead of `ExecutionStatus.RUNNING.value`.
 - **IMPLEMENT**: In `repository.py:118` and the INSERT on line 135, swap `ExecutionStatus.RUNNING` → `ExecutionStatus.QUEUED`. Also change the returned `Execution(... status=...)` on line ~137 to match.
 - **MIRROR**: `src/core/execution/repository.py:89-140` — only the status constant changes.
-- **GOTCHA**: The plan-04 API contract (`POST /executions` → 202 status=queued) now holds; the `ExecutionOut` returned by `commands.start` will show `status=queued` for the ~milliseconds between `repo.create` and the worker's `set_status(RUNNING)` call.
+- **GOTCHA**: Per Track 2's attach-or-start contract (`POST /executions` → `201` fresh / `200` attach, body is `ExecutionStartResponse` wrapping `execution: ExecutionOut`), `execution.status=queued` will be observable for the ~milliseconds between `repo.create` and the worker's `set_status(RUNNING)` call.
 - **VALIDATE**:
   - `pytest tests/core/test_execution_repository.py::test_create_defaults_to_queued`
   - `pytest tests/service/test_commands_routes.py::test_post_executions_returns_queued_initially` (new test)
@@ -799,7 +800,7 @@ curl -X POST localhost:8787/executions \
     -H "Content-Type: application/json" \
     -d '{"ticket_id":"SMOKE-1","project":"smoke","kind":"plan"}'
 
-# Should return 202 with status=queued (G-02)
+# Should return 201 (fresh) or 200 (attach) with execution.status=queued (G-02 + Track 2)
 # Watch the WS stream — should see agent.started, agent.message_sent, tool.called, etc.
 ```
 
@@ -818,7 +819,7 @@ docker ps --filter "name=appserver-smoke-" # Should be empty after ~30s
 
 - [ ] `POST /executions` + WS stream yields a full event timeline (≥ `agent.started`, `agent.message_sent`, ≥1× `tool.called`, ≥1× `cost.accrued`, `agent.response_received`, `agent.finished`, `execution.completed`) — **G-00, G-04 partial**.
 - [ ] After a cancelled or failed run, `docker ps --filter name=appserver-<project>-*` is empty within 60s of the terminal event — **G-01**.
-- [ ] `POST /executions` returns `{"status":"queued",...}` in the 202 body; WS stream's first frame's execution row has transitioned to `running` before `execution.started` is emitted — **G-02**.
+- [ ] `POST /executions` returns `201` on fresh start (or `200` on attach per Track 2), body `ExecutionStartResponse` with `execution.status=queued`; WS stream's first frame's execution row has transitioned to `running` before `execution.started` is emitted — **G-02**.
 - [ ] Cancelling a run that's mid-execution causes the orchestrator to exit at the next `set_phase` boundary (observable: no new `tool.called` events after the cancel) — **G-03**.
 - [ ] All 17 declared event types have ≥1 emit site. `cc-event-audit` reports no orphaned types (except the unresolved G-19 wire-string concern, which is not about emission) — **G-04**.
 - [ ] Triggering an Anthropic 429 (in test via SDK mock) produces exactly one `rate_limited` event on the stream — **G-05**.
@@ -852,7 +853,7 @@ docker ps --filter "name=appserver-smoke-" # Should be empty after ~30s
 | --------------------------------------------------------------------------------------------------------------- | ---------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Phase 1 regresses `sentinel plan` / `execute` / `debrief` CLI behaviour for non-remote users                     | MED        | HIGH    | Task 1.6 mirrors the existing Click bodies exactly; all three commands have integration tests; non-remote is the dominant dev path today                                                                                                 |
 | Phase 1 changes cost-accrual subscriber ordering and double-counts                                               | LOW        | HIGH    | The cost subscriber is registered in `Orchestrator.__init__` (one place). Tasks 1.2–1.4 do not add subscribers. Test: `test_execute_cost_cents_matches_sum_of_events`                                                                    |
-| G-02 status default breaks dashboards that already assume 202 = running                                          | LOW        | MEDIUM  | The gap analysis is explicit that plan 04's API contract says `status=queued`; any dashboard consuming the broken behaviour is itself wrong. Run smoke test in sentinel-dev before deploy.                                                |
+| G-02 status default breaks dashboards that already assume 202 = running                                          | LOW        | MEDIUM  | Track 2 supersedes the 202 contract with `201` fresh / `200` attach, both carrying `execution.status=queued`. Any dashboard consuming the broken behaviour is itself wrong. Run smoke test in sentinel-dev before deploy.                  |
 | `register_compose_project` called in the orchestrator but the worker row isn't yet in `workers` (race)           | LOW        | MEDIUM  | `workers` row is INSERTed in `supervisor.spawn` BEFORE `proc.start()`. By the time `Orchestrator.execute` runs inside the worker, the row exists. Task 1.4 asserts this ordering with a test.                                            |
 | WS semaphore bug causes permanent starvation (release not called)                                                | LOW        | HIGH    | Task 5.4 uses the generator/finally pattern, identical to the HTTP `require_token_and_write_slot` rate-slot pattern. Test `test_ws_connection_cap_releases_on_disconnect` covers clean + dirty disconnect.                              |
 | Emitting 6 new event types causes `events` table growth to exceed plan assumptions                               | LOW        | LOW     | Plan 01 already sized the table for this traffic. Retention/sweep is residual R-14, out of scope.                                                                                                                                         |
