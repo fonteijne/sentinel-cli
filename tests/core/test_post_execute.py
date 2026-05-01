@@ -66,6 +66,7 @@ def test_run_post_execute_happy_path(monkeypatch, fake_clients, tmp_path):
         jira_factory=lambda: jira,
         config_factory=lambda: config,
         branch_name_factory=lambda t: "feature/PROJ-1",
+        probe_func=lambda h: True,
     )
 
     assert outcome.pushed is True
@@ -114,6 +115,7 @@ def test_run_post_execute_push_failure_skips_mr_and_jira(
         jira_factory=lambda: jira,
         config_factory=lambda: config,
         branch_name_factory=lambda t: "feature/PROJ-1",
+        probe_func=lambda h: True,
     )
 
     assert outcome.pushed is False
@@ -148,6 +150,7 @@ def test_run_post_execute_jira_failure_does_not_mask_decision_log(
         jira_factory=lambda: jira,
         config_factory=lambda: config,
         branch_name_factory=lambda t: "feature/PROJ-1",
+        probe_func=lambda h: True,
     )
 
     assert outcome.pushed
@@ -187,6 +190,7 @@ def test_run_post_execute_with_drupal_findings(
         jira_factory=lambda: jira,
         config_factory=lambda: config,
         branch_name_factory=lambda t: "feature/PROJ-1",
+        probe_func=lambda h: True,
     )
 
     assert outcome.drupal_findings_posted is True
@@ -231,6 +235,7 @@ def test_run_post_execute_revise_uses_revision_log_and_skips_mark_ready(
         jira_factory=lambda: jira,
         config_factory=lambda: config,
         branch_name_factory=lambda t: "feature/PROJ-1",
+        probe_func=lambda h: True,
     )
 
     assert outcome.pushed
@@ -241,6 +246,162 @@ def test_run_post_execute_revise_uses_revision_log_and_skips_mark_ready(
     assert "Revision Complete" in body and "**Discussions analyzed:** 3" in body
     # No Jira completion comment on the revise flow.
     jira.add_comment.assert_not_called()
+
+
+def test_run_post_execute_probe_fails_writes_marker_skips_side_effects(
+    monkeypatch, fake_clients, tmp_path
+):
+    """When probe fails the push is deferred and MR/Jira steps are skipped."""
+    gitlab, jira, config = fake_clients
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q"], cwd=wt, check=True)
+
+    push_calls = []
+
+    def _record_push(*args, **kwargs):
+        push_calls.append((args, kwargs))
+        return {"pushed": True, "branch": "x", "error": None,
+                "rejected_diverged": False}
+
+    monkeypatch.setattr(pe, "push_branch", _record_push)
+
+    outcome = pe.run_post_execute_side_effects(
+        ticket_id="PROJ-9",
+        project="proj",
+        worktree_path=wt,
+        iteration=1,
+        dev_result={"tasks_completed": 1, "tasks_failed": 0},
+        sec_result={"approved": True, "findings": []},
+        drupal_findings=None,
+        drupal_attempts=None,
+        force_push=False,
+        gitlab_factory=lambda: gitlab,
+        jira_factory=lambda: jira,
+        config_factory=lambda: config,
+        branch_name_factory=lambda t: "feature/PROJ-9",
+        probe_func=lambda h: False,
+    )
+
+    assert outcome.push_deferred is True
+    assert outcome.pushed is False
+    assert outcome.deferred_marker is not None
+    assert outcome.deferred_marker.last_error_kind == "probe_failed"
+    assert "git.push_deferred" in outcome.artifacts
+    assert push_calls == [], "push_branch must not be called when probe fails"
+
+    gitlab.list_merge_requests.assert_not_called()
+    gitlab.mark_as_ready.assert_not_called()
+    gitlab.add_merge_request_comment.assert_not_called()
+    jira.add_comment.assert_not_called()
+
+    # Marker file was written into .git of the worktree.
+    from src.core.execution.push_deferral import (
+        MARKER_FILENAME,
+        read_pending_marker,
+    )
+    assert (wt / ".git" / MARKER_FILENAME).exists()
+    data = read_pending_marker(wt)
+    assert data is not None
+    assert data["ticket_id"] == "PROJ-9"
+    assert data["last_error_kind"] == "probe_failed"
+
+
+def test_run_post_execute_push_fails_writes_marker(
+    monkeypatch, fake_clients, tmp_path
+):
+    """When probe succeeds but push fails (non-diverged) we also defer."""
+    gitlab, jira, config = fake_clients
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q"], cwd=wt, check=True)
+
+    monkeypatch.setattr(
+        pe, "push_branch",
+        _stub_push(success=False, error="Could not resolve host: gitlab",
+                   diverged=False),
+    )
+
+    outcome = pe.run_post_execute_side_effects(
+        ticket_id="PROJ-9",
+        project="proj",
+        worktree_path=wt,
+        iteration=1,
+        dev_result={"tasks_completed": 1, "tasks_failed": 0},
+        sec_result={"approved": True, "findings": []},
+        drupal_findings=None,
+        drupal_attempts=None,
+        force_push=False,
+        gitlab_factory=lambda: gitlab,
+        jira_factory=lambda: jira,
+        config_factory=lambda: config,
+        branch_name_factory=lambda t: "feature/PROJ-9",
+        probe_func=lambda h: True,
+    )
+
+    assert outcome.push_deferred is True
+    assert outcome.pushed is False
+    assert outcome.deferred_marker is not None
+    assert outcome.deferred_marker.last_error_kind == "push_failed"
+    assert "git.push_deferred" in outcome.artifacts
+    assert "git.push_failed" not in outcome.artifacts
+
+    gitlab.list_merge_requests.assert_not_called()
+    gitlab.add_merge_request_comment.assert_not_called()
+    jira.add_comment.assert_not_called()
+
+    from src.core.execution.push_deferral import read_pending_marker
+    data = read_pending_marker(wt)
+    assert data is not None
+    assert data["last_error_kind"] == "push_failed"
+
+
+def test_run_post_execute_happy_path_clears_preexisting_marker(
+    monkeypatch, fake_clients, tmp_path
+):
+    """A successful push must delete any stale marker from earlier attempts."""
+    gitlab, jira, config = fake_clients
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    import subprocess as _sp
+    _sp.run(["git", "init", "-q"], cwd=wt, check=True)
+
+    from src.core.execution.push_deferral import (
+        read_pending_marker,
+        write_pending_marker,
+    )
+    write_pending_marker(
+        wt, ticket_id="PROJ-1", project_key="proj",
+        branch="feature/PROJ-1", commit_sha="c",
+        error="old", error_kind="probe_failed",
+        gitlab_host="gitlab.example.com",
+    )
+    assert read_pending_marker(wt) is not None
+
+    monkeypatch.setattr(pe, "push_branch", _stub_push(success=True))
+
+    outcome = pe.run_post_execute_side_effects(
+        ticket_id="PROJ-1",
+        project="proj",
+        worktree_path=wt,
+        iteration=1,
+        dev_result={"tasks_completed": 1, "tasks_failed": 0},
+        sec_result={"approved": True, "findings": []},
+        drupal_findings=None,
+        drupal_attempts=None,
+        force_push=False,
+        gitlab_factory=lambda: gitlab,
+        jira_factory=lambda: jira,
+        config_factory=lambda: config,
+        branch_name_factory=lambda t: "feature/PROJ-1",
+        probe_func=lambda h: True,
+    )
+
+    assert outcome.pushed is True
+    assert outcome.push_deferred is False
+    assert read_pending_marker(wt) is None
 
 
 def test_format_decision_log_truncates_long_finding_lists():

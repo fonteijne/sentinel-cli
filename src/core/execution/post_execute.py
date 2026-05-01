@@ -23,6 +23,11 @@ Design notes:
   fakes without monkey-patching imports.
 * No ``click.echo`` here — presentation is the CLI's responsibility,
   observed via the event bus / returned markers.
+* Push is deferred via :mod:`src.core.execution.push_deferral` when the
+  GitLab host is unreachable or the push itself fails. In that case a
+  marker file is written inside the worktree's ``.git`` directory,
+  ``push_deferred`` is set to True on the outcome, and MR/Jira steps are
+  skipped — they are retried out-of-band by ``sentinel push-pending``.
 """
 
 from __future__ import annotations
@@ -33,6 +38,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from src.core.execution.push_deferral import (
+    PendingMarker,
+    clear_pending_marker,
+    extract_gitlab_host,
+    probe_gitlab_host,
+    write_pending_marker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +67,8 @@ class PostExecuteOutcome:
     pushed: bool = False
     push_branch: Optional[str] = None
     push_error: Optional[str] = None
+    push_deferred: bool = False
+    deferred_marker: Optional[PendingMarker] = None
     mr_iid: Optional[int] = None
     mr_web_url: Optional[str] = None
     mr_marked_ready: bool = False
@@ -308,6 +323,7 @@ def run_post_execute_side_effects(
     jira_factory: Optional[Any] = None,
     config_factory: Optional[Any] = None,
     branch_name_factory: Optional[Any] = None,
+    probe_func: Optional[Any] = None,
 ) -> PostExecuteOutcome:
     """Run push → MR-ready → decision log → drupal-findings → Jira notify.
 
@@ -326,28 +342,89 @@ def run_post_execute_side_effects(
 
     outcome = PostExecuteOutcome()
 
-    # 1. push
+    # Resolve project config / gitlab host up front so we can probe before
+    # attempting the push. Failures here are non-fatal — we fall back to a
+    # blind push attempt.
+    config = (config_factory or get_config)()
+    try:
+        project_config = config.get_project_config(project)
+    except Exception:  # pragma: no cover - defensive
+        project_config = {}
+    git_url = project_config.get("git_url", "") if project_config else ""
+    gitlab_host = extract_gitlab_host(git_url) or ""
+
+    branch_resolver = branch_name_factory or get_branch_name
+    try:
+        source_branch = branch_resolver(ticket_id)
+    except Exception:  # pragma: no cover - defensive
+        source_branch = ""
+
+    commit_sha = _resolve_head_sha(worktree_path)
+
+    # 1. push — with VPN-aware deferral.
+    probe = probe_func or probe_gitlab_host
+    if gitlab_host and not probe(gitlab_host):
+        err = f"probe failed: {gitlab_host}:443 unreachable"
+        logger.warning(
+            "post_execute: deferring push for %s — %s", ticket_id, err
+        )
+        marker = write_pending_marker(
+            worktree_path,
+            ticket_id=ticket_id,
+            project_key=project,
+            branch=source_branch,
+            commit_sha=commit_sha,
+            error=err,
+            error_kind="probe_failed",
+            gitlab_host=gitlab_host,
+        )
+        outcome.push_branch = source_branch or None
+        outcome.push_error = err
+        outcome.push_deferred = True
+        outcome.deferred_marker = marker
+        outcome.add("git.push_deferred")
+        return outcome
+
     push_info = push_branch(worktree_path, force=force_push)
     outcome.push_branch = push_info["branch"]
     if push_info["pushed"]:
         outcome.pushed = True
         outcome.add("git.pushed")
+        # Successful push clears any stale marker from earlier attempts.
+        clear_pending_marker(worktree_path)
     else:
-        outcome.push_error = push_info["error"]
+        err = push_info["error"] or "unknown push failure"
+        outcome.push_error = err
         outcome.extra["push_rejected_diverged"] = push_info["rejected_diverged"]
-        outcome.add("git.push_failed")
-        # Without a successful push the MR/Jira steps are meaningless.
+        # Diverged histories are a real conflict, not a transient VPN issue —
+        # fall through as a hard failure so the user resolves it manually.
+        if push_info["rejected_diverged"]:
+            outcome.add("git.push_failed")
+            return outcome
+        logger.warning(
+            "post_execute: deferring push for %s — %s", ticket_id, err
+        )
+        marker = write_pending_marker(
+            worktree_path,
+            ticket_id=ticket_id,
+            project_key=project,
+            branch=push_info["branch"] or source_branch,
+            commit_sha=commit_sha,
+            error=err,
+            error_kind="push_failed",
+            gitlab_host=gitlab_host,
+        )
+        outcome.push_deferred = True
+        outcome.deferred_marker = marker
+        outcome.add("git.push_deferred")
         return outcome
 
     # 2. MR locate + mark ready + decision log + drupal findings comment
+    gitlab: Any = None
+    project_path = ""
     try:
         gitlab = (gitlab_factory or GitLabClient)()
-        config = (config_factory or get_config)()
-        project_config = config.get_project_config(project)
-        git_url = project_config.get("git_url", "")
         project_path = GitLabClient.extract_project_path(git_url)
-        branch_resolver = branch_name_factory or get_branch_name
-        source_branch = branch_resolver(ticket_id)
         mr = locate_merge_request(
             gitlab_client=gitlab, project_path=project_path,
             source_branch=source_branch,
@@ -439,3 +516,19 @@ def run_post_execute_side_effects(
             )
 
     return outcome
+
+
+def _resolve_head_sha(worktree_path: Path) -> str:
+    """Best-effort HEAD sha for a worktree. Empty string on failure."""
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+    except Exception:  # pragma: no cover - defensive
+        pass
+    return ""
