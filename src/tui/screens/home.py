@@ -32,6 +32,7 @@ class HomeScreen(Screen[None]):
     # `q` is bound at App level so it works regardless of which widget has
     # focus (and so Input widgets in modals can type 'q' without quitting).
     BINDINGS = [
+        ("p", "focus_project", "Project"),
         ("r", "focus_actions", "Actions"),
         ("c", "clear_log", "Clear log"),
     ]
@@ -98,8 +99,15 @@ class HomeScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#actions", ListView).focus()
         self._load_projects()
+        # Land focus on the Project dropdown if nothing is picked yet so the
+        # first Tab/Enter press does what a new user expects. If a project
+        # is already selected (e.g. after returning to this screen), focus
+        # the action list so they can get to work.
+        if self._current_project is None:
+            self.query_one("#project-select", Select).focus()
+        else:
+            self.query_one("#actions", ListView).focus()
 
     # ------------------------------------------------------------------ data
 
@@ -132,6 +140,9 @@ class HomeScreen(Screen[None]):
 
     def action_focus_actions(self) -> None:
         self.query_one("#actions", ListView).focus()
+
+    def action_focus_project(self) -> None:
+        self.query_one("#project-select", Select).focus()
 
     def action_clear_log(self) -> None:
         self.query_one("#output-log", RichLog).clear()
