@@ -4,7 +4,7 @@ Plan 05 owns the final factory composition. The shape is:
 
 * ``/health`` — unauthenticated, for container health probes and future
   docker-compose healthchecks.
-* Read router — bearer auth, no rate limit. A dashboard polling GET
+* Read router — bearer auth, no rate limit. An interactive CLI polling GET
   endpoints regularly is expected to exceed 30/minute; read is cheap.
 * Write router — bearer auth + per-token concurrent/minute rate limit +
   audit log on every call. This is where state changes (start, cancel,

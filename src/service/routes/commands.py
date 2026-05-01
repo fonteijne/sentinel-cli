@@ -97,7 +97,7 @@ def _build_options_error_detail(
     model into an explanatory 422 detail.
 
     The historical message was the raw ``str(exc)`` — a multi-line dump of
-    pydantic internals which surfaced verbatim in the dashboard. Operators
+    pydantic internals which surfaced verbatim to clients. Operators
     couldn't tell at a glance *which* fields were wrong or what was allowed
     instead, so they ended up reading the source. This helper keeps the
     machine-readable ``errors`` list (so future tooling can drill in) while

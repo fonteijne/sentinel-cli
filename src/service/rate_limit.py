@@ -112,10 +112,10 @@ class WsConnectionLimiter:
     """Per-token concurrent WebSocket connection cap.
 
     WS connections are long-lived, so a sliding-window rate limit would do
-    the wrong thing: a legitimate dashboard that holds 10 streams open for
-    an hour would burn through the minute budget on connect and get locked
-    out for the rest of the hour. Instead we count currently-open sockets
-    per token and refuse the handshake when the count is at cap.
+    the wrong thing: a legitimate client that holds 10 streams open for an
+    hour would burn through the minute budget on connect and get locked out
+    for the rest of the hour. Instead we count currently-open sockets per
+    token and refuse the handshake when the count is at cap.
 
     Non-blocking admission: ``acquire`` returns ``False`` immediately when
     at cap rather than waiting — the caller's job is to close the handshake

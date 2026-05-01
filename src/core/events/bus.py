@@ -49,7 +49,7 @@ class EventBus:
         """Persist ``event`` to the DB, then dispatch to subscribers.
 
         Subscriber exceptions are logged and swallowed — a misbehaving
-        dashboard cannot be allowed to crash a run.
+        subscriber cannot be allowed to crash a run.
         """
         payload = self._encode_payload(event)
 

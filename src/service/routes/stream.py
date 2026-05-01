@@ -28,7 +28,7 @@ POLL_INTERVAL_S = 0.2
 HEARTBEAT_INTERVAL_S = 30.0
 SEND_TIMEOUT_S = 30.0
 
-# Terminal event type → dashboard-friendly status string.
+# Terminal event type → client-friendly status string.
 # MUST match the ExecutionStatus enum values, not the raw type suffix —
 # `execution.completed` maps to `succeeded`, NOT `completed`.
 _END_STATUS = {
