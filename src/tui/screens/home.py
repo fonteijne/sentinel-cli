@@ -315,6 +315,9 @@ class HomeScreen(Screen[None]):
             + (f"  project={self._current_project}" if self._current_project else "")
             + "  (running…)"
         )
+        # Shift focus to the Output panel so the operator can scroll through
+        # the stream while it lands. `r` or Tab returns to Actions afterwards.
+        self.query_one("#output-log", Log).focus()
         self._run_worker(action, ticket_id)
 
     @work(thread=True, exclusive=True, group="actions")
