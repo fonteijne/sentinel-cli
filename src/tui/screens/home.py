@@ -15,7 +15,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
-    RichLog,
+    Log,
     Select,
 )
 
@@ -47,19 +47,25 @@ class HomeScreen(Screen[None]):
         width: 60;
     }
 
+    #body {
+        height: 1fr;
+        width: 100%;
+    }
+
     #actions {
         width: 50;
+        height: 100%;
         border: round $accent;
         padding: 0 1;
     }
 
     #output-log {
+        width: 1fr;
+        height: 100%;
         border: round $primary;
         padding: 0 1;
-    }
-
-    #body {
-        height: 1fr;
+        overflow-x: auto;
+        overflow-y: auto;
     }
     """
 
@@ -89,12 +95,10 @@ class HomeScreen(Screen[None]):
                 ],
                 id="actions",
             )
-            yield RichLog(
+            yield Log(
                 id="output-log",
-                highlight=True,
-                markup=False,
-                wrap=True,
                 max_lines=5000,
+                auto_scroll=True,
             )
         yield Footer()
 
@@ -127,14 +131,16 @@ class HomeScreen(Screen[None]):
         self._projects = [k for k, _ in options]
         sel = self.query_one("#project-select", Select)
         sel.set_options(options)
-        log = self.query_one("#output-log", RichLog)
+        log = self.query_one("#output-log", Log)
         if not options:
-            log.write(
+            log.write_line(
                 "[warn] no projects configured — run `sentinel projects add` "
                 "or edit config/config.yaml before using plan/execute/debrief/status."
             )
         else:
-            log.write(f"Loaded {len(options)} project(s): {', '.join(self._projects)}")
+            log.write_line(
+                f"Loaded {len(options)} project(s): {', '.join(self._projects)}"
+            )
 
     # ------------------------------------------------------------------ actions
 
@@ -145,7 +151,7 @@ class HomeScreen(Screen[None]):
         self.query_one("#project-select", Select).focus()
 
     def action_clear_log(self) -> None:
-        self.query_one("#output-log", RichLog).clear()
+        self.query_one("#output-log", Log).clear()
 
     # --------------------------------------------------------------- handlers
 
@@ -202,7 +208,7 @@ class HomeScreen(Screen[None]):
 
     @work(thread=True, exclusive=True, group="actions")
     def _run_worker(self, action: ActionDef, ticket_id: Optional[str]) -> None:
-        log = self.query_one("#output-log", RichLog)
+        log = self.query_one("#output-log", Log)
         app = self.app
         success = False
         try:
@@ -210,11 +216,12 @@ class HomeScreen(Screen[None]):
                 success = action.runner(ticket_id=ticket_id, project=self._current_project)
         except Exception as exc:  # noqa: BLE001
             app.call_from_thread(
-                log.write, f"[tui] {action.key} raised: {type(exc).__name__}: {exc}"
+                log.write_line,
+                f"[tui] {action.key} raised: {type(exc).__name__}: {exc}",
             )
         finally:
             suffix = "[ok]" if success else "[failed]"
-            app.call_from_thread(log.write, f"<<< {action.label} {suffix}")
+            app.call_from_thread(log.write_line, f"<<< {action.label} {suffix}")
             app.call_from_thread(self._mark_idle)
 
     def _mark_idle(self) -> None:
@@ -223,4 +230,4 @@ class HomeScreen(Screen[None]):
     # --------------------------------------------------------------- utilities
 
     def _log(self, line: str) -> None:
-        self.query_one("#output-log", RichLog).write(line)
+        self.query_one("#output-log", Log).write_line(line)

@@ -74,7 +74,7 @@ def test_capture_stdout_to_log_monkeypatches_click_echo() -> None:
     captured: list[str] = []
 
     class _FakeLog:
-        def write(self, line: str) -> None:
+        def write_line(self, line: str) -> None:
             captured.append(line)
 
     class _FakeApp:

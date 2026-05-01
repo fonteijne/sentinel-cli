@@ -60,8 +60,9 @@ class _LineForwarder(io.TextIOBase):
 
     def _emit(self, line: str) -> None:
         # call_from_thread marshals the write onto Textual's event loop.
+        # Log.write_line appends the trailing newline; we stripped it above.
         try:
-            self._app.call_from_thread(self._log.write, line)
+            self._app.call_from_thread(self._log.write_line, line)
         except Exception:
             # App may have exited between write and emit. Swallow — the
             # stream contract is best-effort.
