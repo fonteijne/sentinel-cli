@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import List, Optional, Tuple
 
@@ -21,7 +22,7 @@ from textual.widgets import (
 
 from src.tui.actions import ACTIONS, ActionDef
 from src.tui.screens.ticket import TicketPromptScreen
-from src.tui.widgets.run_output import capture_stdout_to_log
+from src.tui.widgets.run_output import capture_stdout_to_log, tail_execution
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,9 @@ class HomeScreen(Screen[None]):
         self._projects: List[str] = []
         self._current_project: Optional[str] = None
         self._running_label: Optional[str] = None  # None ⇒ idle
+        # Lazy: constructed on first remote action. See
+        # ``_get_service_client`` / ``on_unmount``.
+        self._service_client = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ compose
 
@@ -324,16 +328,49 @@ class HomeScreen(Screen[None]):
         # Shift focus to the Output panel so the operator can scroll through
         # the stream while it lands. `r` or Tab returns to Actions afterwards.
         self.query_one("#output-log", Log).focus()
-        self._run_worker(action, ticket_id)
+
+        if action.kind == "remote":
+            # Pre-flight the token discovery before spawning a worker so the
+            # error message surfaces synchronously (and we don't leave the
+            # running-label stuck if the token is missing).
+            client = self._get_service_client()
+            if client is None:
+                self._mark_idle()
+                return
+            if action.remote_kind is None or ticket_id is None:
+                # Guard — every remote action in ACTIONS sets both. Kept so
+                # ``mypy --strict`` style refactors don't tunnel a bug past.
+                self._log(f"[tui] {action.key}: missing remote_kind or ticket_id")
+                self._mark_idle()
+                return
+            self._run_remote_worker(action, ticket_id)
+        else:
+            self._run_local_worker(action, ticket_id)
 
     @work(thread=True, exclusive=True, group="actions")
-    def _run_worker(self, action: ActionDef, ticket_id: Optional[str]) -> None:
+    def _run_local_worker(
+        self, action: ActionDef, ticket_id: Optional[str]
+    ) -> None:
+        """In-process runner for validate / status / drain.
+
+        Runs on a thread worker and uses fd-level capture to relay
+        stdout/stderr into the Log widget. Writes to the widget cross
+        thread boundaries via ``app.call_from_thread``.
+        """
         log = self.query_one("#output-log", Log)
         app = self.app
         success = False
+        runner = action.runner
+        if runner is None:
+            app.call_from_thread(
+                log.write_line,
+                f"[tui] local action '{action.key}' has no runner",
+            )
+            app.call_from_thread(self._mark_idle)
+            return
         try:
             with capture_stdout_to_log(app, log):
-                success = action.runner(ticket_id=ticket_id, project=self._current_project)
+                success = runner(ticket_id=ticket_id, project=self._current_project)
         except Exception as exc:  # noqa: BLE001
             app.call_from_thread(
                 log.write_line,
@@ -344,8 +381,119 @@ class HomeScreen(Screen[None]):
             app.call_from_thread(log.write_line, f"<<< {action.label} {suffix}")
             app.call_from_thread(self._mark_idle)
 
+    @work(exclusive=True, group="actions")
+    async def _run_remote_worker(
+        self, action: ActionDef, ticket_id: str
+    ) -> None:
+        """Async runner for plan / execute / debrief.
+
+        POSTs /executions, streams the resulting WS. On
+        :class:`asyncio.CancelledError` (TUI quit), propagates without
+        cancelling the service-side execution — quit-safety.
+        """
+        log = self.query_one("#output-log", Log)
+        client = self._service_client
+        if client is None:
+            # Re-check defensively; _dispatch already preflighted.
+            log.write_line("[tui] internal error: no service client")
+            self._mark_idle()
+            return
+
+        # Late import keeps the home module importable without httpx /
+        # websockets deps in environments that only exercise smoke tests.
+        from src.tui.service_client import (
+            ExecutionAlreadyTerminal,
+            ServiceClientError,
+        )
+
+        assert action.remote_kind is not None  # noqa: S101 — guarded in _dispatch
+        try:
+            try:
+                result = await client.start(
+                    project=self._current_project or "",
+                    ticket_id=ticket_id,
+                    kind=action.remote_kind,
+                )
+            except ExecutionAlreadyTerminal as exc:
+                log.write_line(f"[tui] {action.key}: {exc}")
+                return
+            except ServiceClientError as exc:
+                log.write_line(
+                    f"[tui] {action.key} failed to start: {type(exc).__name__}: {exc}"
+                )
+                return
+
+            execution_id = result.execution.id
+            if result.attached and result.banner:
+                # Render verbatim — server-formatted attach banner.
+                log.write_line(result.banner)
+            self._running_label = f"{action.label} · {execution_id[:8]}"
+
+            status = await tail_execution(self.app, log, client, execution_id)
+            suffix = "[ok]" if status == "succeeded" else f"[{status or 'failed'}]"
+            log.write_line(f"<<< {action.label} {suffix}")
+        except asyncio.CancelledError:
+            # Quit path — Textual cancels the async worker on app exit. We
+            # deliberately do NOT call client.cancel(): the plan's §5
+            # quit-safety requires the service-side work to keep running.
+            raise
+        finally:
+            self._mark_idle()
+
     def _mark_idle(self) -> None:
         self._running_label = None
+
+    # --------------------------------------------------------------- service client
+
+    def _get_service_client(self):  # type: ignore[no-untyped-def]
+        """Return the cached :class:`ServiceClient`, constructing on first use.
+
+        Token discovery reuses the CLI helpers
+        (:func:`src.cli._service_base_url`, :func:`src.cli._load_service_token`)
+        so we never duplicate env-var / token-file logic. Missing token
+        logs a visible error and returns ``None`` — the caller must abort.
+        """
+        if self._service_client is not None:
+            return self._service_client
+
+        from src.cli import _load_service_token, _service_base_url
+        from src.tui.service_client import ServiceClient
+
+        token = _load_service_token()
+        if not token:
+            self._log(
+                "[tui] no service token found — run `sentinel serve` to "
+                "bootstrap it, then retry"
+            )
+            return None
+        base_url = _service_base_url()
+        try:
+            self._service_client = ServiceClient(base_url=base_url, token=token)
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                f"[tui] could not build service client: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        return self._service_client
+
+    def on_unmount(self) -> None:
+        """Best-effort cleanup of the async HTTP client on screen teardown."""
+        client = self._service_client
+        if client is None:
+            return
+        self._service_client = None
+        try:
+            # Schedule ``aclose`` on the running loop; unmount is sync so we
+            # can't await. ``get_running_loop`` avoids the Py3.12+ deprecation
+            # on ``get_event_loop`` when no loop is current.
+            import asyncio as _asyncio
+
+            _asyncio.get_running_loop().create_task(client.aclose())
+        except RuntimeError:
+            # No running loop — unmount outside the app lifecycle (e.g. a
+            # synchronous teardown path). Process exit will close sockets.
+            pass
 
     # --------------------------------------------------------------- utilities
 

@@ -1,34 +1,57 @@
-"""Thin wrappers that invoke existing Click command callbacks from the TUI.
+"""TUI action registry — local in-process runs + remote service calls.
 
-Every action here calls into ``src.cli`` — no workflow logic lives in this
-module. The wrappers:
+Two kinds of actions live here:
 
-* forward kwargs to the Click command's ``.callback`` (the plain function
-  wrapped by ``@cli.command``),
-* catch ``SystemExit`` so a CLI-style ``sys.exit(1)`` on failure doesn't
-  kill the Textual app,
-* return a boolean success flag so the caller can colour the result.
+* **local** (``validate``, ``status``, ``drain``) — run the existing Click
+  command callbacks in-process. Fast, read-only, don't need the service.
+  ``runner`` is a synchronous ``Callable[..., bool]`` invoked inside
+  :func:`src.tui.widgets.run_output.capture_stdout_to_log` so fd-level
+  stdout/stderr lands in the Output panel.
 
-Stdout capture happens upstream in the caller (see ``src.tui.app``): the
-caller replaces ``sys.stdout`` with a pipe that forwards lines into a
-``RichLog`` widget before invoking an action.
+* **remote** (``plan``, ``execute``, ``debrief``) — dispatch to the
+  Command Center service via :mod:`src.tui.service_client`. The home
+  screen POSTs ``/executions``, tails the WebSocket stream, and renders
+  frames into the Output panel. Quitting the TUI leaves the worker
+  running on the service side.
+
+``ActionDef.kind`` is the discriminator. Remote actions carry a
+``remote_kind`` matching the service's ``ExecutionKind`` enum
+(``plan`` / ``execute`` / ``debrief``) and have ``runner=None`` — the
+home screen calls ``service_client.start(...)`` directly.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 
 @dataclass(frozen=True)
 class ActionDef:
-    """Metadata about a TUI action."""
+    """Metadata about a TUI action.
+
+    Attributes:
+        key: Stable identifier — also used as ``#action-{key}`` in the
+            ListView and for registry lookups.
+        label: Human-readable label shown in the action list.
+        needs_ticket: Whether this action requires a ticket id
+            (prompt the user if so).
+        needs_project: Whether a project must be picked first.
+        kind: ``"local"`` runs in-process; ``"remote"`` dispatches to
+            the Command Center service.
+        runner: Sync callable for local actions. ``None`` for remote
+            actions (the home screen calls the service client instead).
+        remote_kind: For remote actions, the ``ExecutionKind`` to send
+            to ``POST /executions``. ``None`` for local actions.
+    """
 
     key: str
     label: str
     needs_ticket: bool
     needs_project: bool
-    runner: Callable[..., bool]
+    kind: Literal["local", "remote"] = "local"
+    runner: Optional[Callable[..., bool]] = None
+    remote_kind: Optional[str] = None
 
 
 def _run_cli_callback(command_name: str, **kwargs: object) -> bool:
@@ -60,13 +83,8 @@ def _run_cli_callback(command_name: str, **kwargs: object) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Action runners
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-# Action runners — uniform signature so the dispatcher can pass both args
-# regardless of what each action actually consumes.
+# Local action runners — uniform signature so the dispatcher can pass both
+# args regardless of what each action actually consumes.
 # --------------------------------------------------------------------------- #
 
 
@@ -82,60 +100,62 @@ def run_drain(ticket_id: Optional[str], project: Optional[str]) -> bool:
     return _run_cli_callback("push-pending", quiet=False)
 
 
-def run_plan(ticket_id: Optional[str], project: Optional[str]) -> bool:
-    if not ticket_id:
-        print("[tui] plan requires a ticket id")
-        return False
-    return _run_cli_callback(
-        "plan",
-        ticket_id=ticket_id,
-        project=project,
-        revise=False,
-        force=False,
-        prompt=None,
-    )
-
-
-def run_execute(ticket_id: Optional[str], project: Optional[str]) -> bool:
-    if not ticket_id:
-        print("[tui] execute requires a ticket id")
-        return False
-    return _run_cli_callback(
-        "execute",
-        ticket_id=ticket_id,
-        project=project,
-        max_iterations=5,
-        force=False,
-        revise=False,
-        no_env=False,
-        prompt=None,
-        remote=False,
-        follow=False,
-        idempotency_key=None,
-    )
-
-
-def run_debrief(ticket_id: Optional[str], project: Optional[str]) -> bool:
-    if not ticket_id:
-        print("[tui] debrief requires a ticket id")
-        return False
-    return _run_cli_callback(
-        "debrief",
-        ticket_id=ticket_id,
-        project=project,
-        prompt=None,
-    )
-
-
 # --------------------------------------------------------------------------- #
-# Action registry — drives the home screen's action list
+# Action registry — drives the home screen's action list.
+#
+# Order matters: tests/tui/test_app_smoke.py::test_app_mounts_and_shows_actions
+# asserts the ids on the ListView match ``{f"action-{a.key}" for a in ACTIONS}``
+# (via set equality, so order is only load-bearing for UX). Keep plan /
+# execute / debrief at the top where the operator expects them.
 # --------------------------------------------------------------------------- #
 
 ACTIONS: tuple[ActionDef, ...] = (
-    ActionDef("plan", "Plan a ticket", needs_ticket=True, needs_project=True, runner=run_plan),
-    ActionDef("execute", "Execute a plan", needs_ticket=True, needs_project=True, runner=run_execute),
-    ActionDef("debrief", "Debrief a ticket", needs_ticket=True, needs_project=True, runner=run_debrief),
-    ActionDef("status", "Status (worktrees + deferred pushes)", needs_ticket=False, needs_project=True, runner=run_status),
-    ActionDef("drain", "Drain deferred pushes", needs_ticket=False, needs_project=False, runner=run_drain),
-    ActionDef("validate", "Validate credentials", needs_ticket=False, needs_project=False, runner=run_validate),
+    ActionDef(
+        key="plan",
+        label="Plan a ticket",
+        needs_ticket=True,
+        needs_project=True,
+        kind="remote",
+        remote_kind="plan",
+    ),
+    ActionDef(
+        key="execute",
+        label="Execute a plan",
+        needs_ticket=True,
+        needs_project=True,
+        kind="remote",
+        remote_kind="execute",
+    ),
+    ActionDef(
+        key="debrief",
+        label="Debrief a ticket",
+        needs_ticket=True,
+        needs_project=True,
+        kind="remote",
+        remote_kind="debrief",
+    ),
+    ActionDef(
+        key="status",
+        label="Status (worktrees + deferred pushes)",
+        needs_ticket=False,
+        needs_project=True,
+        kind="local",
+        runner=run_status,
+    ),
+    ActionDef(
+        key="drain",
+        label="Drain deferred pushes",
+        needs_ticket=False,
+        needs_project=False,
+        kind="local",
+        runner=run_drain,
+    ),
+    ActionDef(
+        key="validate",
+        label="Validate credentials",
+        needs_ticket=False,
+        needs_project=False,
+        kind="local",
+        runner=run_validate,
+    ),
 )
