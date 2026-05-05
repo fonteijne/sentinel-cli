@@ -94,8 +94,8 @@ Taxonomized by noise/automatability, with explicit mapping to where each already
 | **Drupal Reviewer findings** (11 dimensions) | `drupal_reviewer.py` | Medium | Fully | High |
 | **GitLab MR discussion comments** (unresolved) | `revise_plan()`, `_detect_plan_state()` | **High** (free-form human text) | Semi — triage helper needed | Medium, punchy when caught |
 | **Jira new comments** | `investigate_comments()` | High | Semi | Medium |
-| **MR merge vs revert / cherry-pick back out** | Not captured | Low once captured | Needs webhook | **High** — ground-truth success signal |
-| **Post-merge CI failure on `main`** | Not captured | Low | Needs webhook | **High** — regression detector |
+| **MR merge vs revert / cherry-pick back out** | Not captured | Low once captured | Pull-on-demand via GitLab API | **High** — ground-truth success signal |
+| **Post-merge CI failure on `main`** | Not captured | Low | Pull-on-demand via GitLab pipelines API | **High** — regression detector |
 | **Agent self-critique ("am I happy with this plan?")** | Not implemented | **Very high** — ungrounded | Easy to build, dangerous to trust | **Low** per Self-Refine evidence ([arXiv 2303.17651](https://arxiv.org/abs/2303.17651); [Multi-Agent Reflexion 2025](https://arxiv.org/html/2512.20845v1)) |
 | **Cost/latency per run** | `executions.cost_cents`, `CostAccrued` event | Low | Fully | Medium — budget/SLA signal, not a correctness signal |
 | **Token-count overruns, max_turns hits** | `AgentMessageSent.prompt_chars`, max_turns | Low | Fully | Medium — a staleness/drift early warning |
@@ -415,7 +415,7 @@ Concrete tasks, in order.
 
 ### Phase 3 — Cautious autonomy (only if justified) (4+ weeks)
 
-14. **Task: Merge/revert webhook.** Consume GitLab merge + cherry-pick webhooks; tag the originating `execution_id` as `success | rolled_back`. This is the ground-truth learning signal.
+14. **Task: Pull-on-demand merge/revert outcomes.** Sentinel has no inbound network path — webhooks aren't usable. Instead, at the start of every `sentinel plan` / `sentinel execute` invocation for a given project, query the GitLab MR and pipelines APIs for activity since the project's last sync watermark and tag prior `execution_id`s as `success | rolled_back | regressed`. Also expose a `sentinel outcomes sync [--project X] [--since DATE] [--all]` CLI command for explicit backfill after long gaps. Watermark lives on a new `project_sync_state(project, last_synced_at, last_seen_mr_iid)` table to avoid re-paginating GitLab on every run. This is the ground-truth learning signal, delivered lazily but reliably.
 15. **Task: Post-merge CI regression ingestion.** Consume GitLab pipeline failures on `main` tied to a recently-merged MR; tag the `execution_id`.
 16. **Task: Confidence-weighted postmortem reranker.** Use `success | rolled_back` outcomes to upweight/downweight postmortems. Still human-gated at promotion.
 17. **Task: Skill library as subagents.** Promote the top recurring postmortem fixes to subagent slash-commands under `commands/drupal_developer/` (e.g., `fix-hook-update-signature`). Voyager-style, but human-curated ([Voyager](https://voyager.minedojo.org/)).
@@ -470,12 +470,13 @@ Condensed from §8 with rationale, gates, and rollback.
 
 ### Phase 3 — "Cautious autonomy" (weeks 8+)
 
-- **Why last.** Ground-truth signals (merge vs revert, post-merge CI) require webhooks and production data that only accrue after Phase 1+2 ship. Per Karpathy, this is where the leash gets longer, not looser ([Karpathy's Leash](https://www.ai21.com/blog/karpathys-leash/)).
-- **Deliverables.** Webhook ingestion; outcome-weighted postmortems; Voyager-style subagent skill promotions; optional Letta integration (only if justified).
-- **Data structures.** `executions.outcome` enum (`success | rolled_back | regressed`); `postmortems.outcome_weight`.
+- **Why last.** Ground-truth signals (merge vs revert, post-merge CI) need real production data that only accrues after Phase 1+2 ship. Per Karpathy, this is where the leash gets longer, not looser ([Karpathy's Leash](https://www.ai21.com/blog/karpathys-leash/)).
+- **Infrastructure note.** Sentinel runs on the user's machine with no inbound network path; webhooks are not viable. All outcome ingestion is **pull-on-demand** from the GitLab REST API during regular `sentinel` invocations, plus an explicit `sentinel outcomes sync` CLI for backfill. This is a feature, not a workaround: the pattern matches existing polling behavior in `_detect_plan_state()` (`src/agents/plan_generator.py:1139-1237`) and `get_merge_request_discussions()` (`src/gitlab_client.py:285-378`).
+- **Deliverables.** Pull-on-demand outcome ingestion + sync CLI; outcome-weighted postmortems; Voyager-style subagent skill promotions; optional Letta integration (only if justified).
+- **Data structures.** `executions.outcome` enum (`success | rolled_back | regressed`); `postmortems.outcome_weight`; new `project_sync_state(project, last_synced_at, last_seen_mr_iid)` table for watermarking.
 - **Prompt changes.** Subagent skill descriptions; planner learns to delegate to them.
 - **Evaluation.** Revert rate; regression rate; time-to-merge; skill-use frequency.
-- **Rollback.** Disable webhook subscriber; subagent skills are just markdown files and can be deleted.
+- **Rollback.** Feature flag `OUTCOME_SYNC_ENABLED=false` stops the pull at invocation time; `sentinel outcomes sync` becomes a no-op; subagent skills are just markdown files and can be deleted. Watermark table is preserved so re-enabling picks up where it left off.
 - **Explicit "don't do this yet" list.** No fine-tuning; no vector DB unless filesystem+SQLite measurably insufficient; no autonomous overlay edits.
 
 ---
