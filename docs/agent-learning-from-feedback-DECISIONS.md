@@ -117,3 +117,29 @@ Append-only log. Each entry resolves an open question from the handover §5 or a
 **Implementation notes.**
 - The `sentinel outcomes sync [--project X] [--since DATE] [--all]` CLI (design §10 task 14) is already in scope — fresh installations use `--all` or `--since` to backfill rather than inheriting another instance's watermark.
 - Schema stays as specified in the design: no `installation_id` column. The DB file itself identifies the installation.
+
+---
+
+## D7 — On cap-out, the MR stays (or reverts to) draft; never un-draft incomplete work
+
+**Date:** 2026-05-05
+**Resolves:** Ambiguity in design §5.1 Loop E ("un-un-draft so humans see it" — double negative, unclear intent).
+**Status:** Accepted
+
+**Context.** When Loop A caps out at N=3 (D1), the implementation is known-broken. The original design-doc wording for the escalation step was ambiguous about the MR's draft status. One reading said "un-draft" (mark ready for review), the other said "re-draft" (revert to draft). Shipping the wrong reading would page reviewers on every cap-out and train them to ignore the signal.
+
+**Decision.** On cap-out, the MR is in draft state when the escalation finishes. Concretely:
+- If the MR is already a draft, leave it alone.
+- If a prior successful phase un-drafted it, revert it to draft before posting the escalation comment.
+- Never un-draft on cap-out, even partially, even as a "hint."
+
+The escalation surface is the "Sentinel paused here" comment plus assignee notification — not MR visibility state.
+
+**Rationale.** Reviewer attention is a finite resource and a recurring theme in the risk register (handover §10). Un-drafting known-broken work would signal "ready for review" when the code doesn't work. Over time this erodes trust in Sentinel's draft-status signal — reviewers would learn to distrust it and either check every draft (wasted effort) or ignore all un-drafts (missed completions). Neither is acceptable. Keeping draft state truthful — *un-drafted only when the work is ready* — is the only stable equilibrium.
+
+**Revisit condition.** If a future workflow intentionally uses un-drafted-but-known-incomplete MRs as a coordination signal (e.g., "assign to reviewer for design feedback before implementation is done"), revisit. That's a different UX than "cap-out" and deserves its own ADR, not a carve-out here.
+
+**Implementation notes.**
+- `src/core/execution/post_execute.py` already has an un-draft path on the happy flow (handover §9 pointer). The escalation path adds a symmetric "ensure-draft" step guarded on cap-out.
+- The `sentinel-verifier-loop-expert` agent's spec already says "emit, do NOT burn more tokens." The `DeveloperCappedOut` subscriber owns the draft-reassertion logic, not the loop itself.
+- Tests (owned by `sentinel-test-harness-expert`): on cap-out fixture, assert the MR's draft status is `true` after escalation regardless of its state before.

@@ -213,7 +213,7 @@ If the Security or Drupal Reviewer veto rate exceeds a threshold in one run, esc
 A nightly/weekly job queries `agent_results` for failure patterns, groups by `(stack_type, agent, failure_signature)`, and files a **human-review PR** proposing an overlay edit. This is SPL with a review gate.
 
 **Loop E — Escalation (when verifier-retry caps out).**
-Three consecutive failures → stop, write postmortem, post "Sentinel paused here" comment on the MR, un-un-draft so humans see it. Do not burn more tokens.
+Three consecutive failures → stop, write postmortem, ensure the MR is in draft state (revert to draft if a prior phase un-drafted it), post "Sentinel paused here" comment, notify the assignee. Do not burn more tokens. See Decisions §D7 — never un-draft on cap-out; the implementation is known-broken and reviewer attention is a finite resource.
 
 ### 5.2 Synchronous vs asynchronous
 
