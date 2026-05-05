@@ -24,6 +24,9 @@ from src.agents.security_reviewer import SecurityReviewerAgent
 from src.agents.drupal_reviewer import DrupalReviewerAgent
 from src.ticket_context import TicketContextBuilder
 from src.utils.adf_parser import parse_adf_to_text
+from src.core.events import EventBus, SentinelEvent
+from src.core.execution import ExecutionKind, ExecutionRepository, Orchestrator
+from src.core.persistence import connect as _db_connect, ensure_initialized as _db_ensure
 
 
 # Setup logging
@@ -49,6 +52,211 @@ def _get_version() -> str:
         pass
     from importlib.metadata import version
     return version("sentinel")
+
+
+def _log_subscriber(event: SentinelEvent) -> None:
+    """Minimal human-readable stdout line per event for interactive runs."""
+    t = event.type
+    agent = event.agent or ""
+    if t == "execution.started":
+        logger.debug(f"[exec] started id={event.execution_id}")
+    elif t == "phase.changed":
+        logger.info(f"[phase] {getattr(event, 'phase', '')}")
+    elif t == "execution.completed":
+        logger.debug(
+            f"[exec] completed status={getattr(event, 'status', '')} "
+            f"cost_cents={getattr(event, 'cost_cents', 0)}"
+        )
+    elif t == "execution.failed":
+        logger.warning(f"[exec] failed error={getattr(event, 'error', '')}")
+    elif t == "rate_limited":
+        logger.warning(
+            f"[rate-limit] {agent} retry_after_s={getattr(event, 'retry_after_s', '?')}"
+        )
+
+
+_VPN_CAPTIVE_PORTAL_HOST = "auth.hosted-tools.com"
+
+
+def _is_vpn_captive_portal_error(exc: BaseException) -> bool:
+    """Detect the GlobalProtect captive-portal hijack pattern.
+
+    When the GlobalProtect VPN is off, Jira/GitLab API requests get redirected
+    to ``https://auth.hosted-tools.com/?req=...`` and come back 403. We look for
+    that host in the final URL, the redirect chain, the response body, and the
+    exception message — any hit is enough.
+    """
+    marker = _VPN_CAPTIVE_PORTAL_HOST
+    if marker in str(exc):
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return False
+    try:
+        if marker in str(getattr(resp, "url", "")):
+            return True
+        for hop in getattr(resp, "history", None) or []:
+            if marker in str(getattr(hop, "url", "")):
+                return True
+            loc = ""
+            try:
+                loc = hop.headers.get("Location", "") or ""
+            except Exception:
+                pass
+            if marker in loc:
+                return True
+        body = ""
+        try:
+            body = (resp.text or "")[:2000]
+        except Exception:
+            pass
+        if marker in body:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _service_base_url() -> str:
+    return os.environ.get("SENTINEL_SERVICE_URL", "http://127.0.0.1:8787")
+
+
+def _load_service_token() -> Optional[str]:
+    """Read bearer from env var first, then ``~/.sentinel/service_token``."""
+    tok = os.environ.get("SENTINEL_SERVICE_TOKEN")
+    if tok:
+        return tok.strip()
+    tok_path = Path.home() / ".sentinel" / "service_token"
+    if tok_path.exists():
+        try:
+            return tok_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None
+    return None
+
+
+def _remote_execute(
+    *,
+    ticket_id: str,
+    project: str,
+    options: dict,
+    follow: bool,
+    idempotency_key: Optional[str],
+) -> None:
+    """POST /executions to the Command Center service, optionally tail events.
+
+    Exit codes:
+        0 — run reached a terminal state (or request accepted and not following).
+        1 — run reached a terminal *failed* state while following.
+        3 — service unreachable.
+        4 — invalid token.
+        5 — rate-limited.
+    """
+    import json
+
+    import requests
+
+    base = _service_base_url().rstrip("/")
+    token = _load_service_token()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+
+    body = {
+        "ticket_id": ticket_id,
+        "project": project,
+        "kind": "execute",
+        "options": {k: v for k, v in options.items() if v is not None},
+    }
+
+    try:
+        resp = requests.post(
+            f"{base}/executions", json=body, headers=headers, timeout=10
+        )
+    except requests.exceptions.ConnectionError:
+        click.echo(
+            f"❌ service not running at {base} — start it with `sentinel serve`",
+            err=True,
+        )
+        sys.exit(3)
+
+    if resp.status_code == 401:
+        click.echo("❌ invalid token at ~/.sentinel/service_token", err=True)
+        sys.exit(4)
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After", "?")
+        click.echo(
+            f"❌ rate limit reached; retry after {retry_after}s", err=True
+        )
+        sys.exit(5)
+    if not resp.ok:
+        click.echo(
+            f"❌ POST /executions failed: {resp.status_code} {resp.text}",
+            err=True,
+        )
+        sys.exit(1)
+
+    execution = resp.json()
+    execution_id = execution["id"]
+    click.echo(f"✅ started remote execution {execution_id} (status={execution['status']})")
+
+    if not follow:
+        return
+
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except ImportError:
+        click.echo(
+            "❌ `websockets` package required for --follow "
+            "(pip install websockets)",
+            err=True,
+        )
+        sys.exit(1)
+
+    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+    url = f"{ws_base}/executions/{execution_id}/stream?since_seq=0"
+    if token:
+        url = f"{url}&token={token}"
+
+    try:
+        with ws_connect(url, open_timeout=10) as ws:
+            for message in ws:
+                try:
+                    frame = json.loads(message)
+                except Exception:
+                    click.echo(message)
+                    continue
+                t = frame.get("type", "?")
+                seq = frame.get("seq", "-")
+                click.echo(f"[{seq:>4}] {t} {frame}")
+                if t in ("execution.completed", "execution.failed", "execution.cancelled"):
+                    if t == "execution.failed":
+                        sys.exit(1)
+                    return
+    except Exception as exc:
+        click.echo(f"❌ stream error: {exc}", err=True)
+        sys.exit(1)
+
+
+def _open_command_center():
+    """Build a fresh (conn, repo, bus, orchestrator) tuple for a CLI command.
+
+    Callers MUST close ``conn`` in a finally block when the command ends.
+    """
+    _db_ensure()
+    conn = _db_connect()
+    repo = ExecutionRepository(conn)
+    bus = EventBus(conn)
+    orchestrator = Orchestrator(
+        repo=repo,
+        bus=bus,
+        session_tracker=SessionTracker(),
+        config=get_config(),
+    )
+    bus.subscribe(_log_subscriber)
+    return conn, repo, bus, orchestrator
 
 
 @click.group()
@@ -111,27 +319,44 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False, fo
         if project is None:
             project = ticket_id.split("-")[0]
 
-        # Initialize managers
-        worktree_mgr = WorktreeManager()
-        jira_client = get_jira_client()
+        conn, repo, bus, orchestrator = _open_command_center()
+    except Exception as e:
+        logger.error(f"Plan command setup failed: {e}", exc_info=True)
+        click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
 
-        click.echo(f"📋 Planning ticket: {ticket_id}")
-        click.echo(f"🏗️  Project: {project}")
+    try:
+        with orchestrator.run(
+            ticket_id=ticket_id,
+            project=project,
+            kind=ExecutionKind.PLAN,
+            options={"force": force, "prompt": prompt},
+        ) as execution:
+            # Initialize managers
+            worktree_mgr = WorktreeManager()
+            jira_client = get_jira_client()
 
-        # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
-        click.echo("\n1️⃣  Fetching Jira ticket...")
-        ticket_data = jira_client.get_ticket(ticket_id)
-        click.echo(f"   ✓ {ticket_data['summary']}")
+            click.echo(f"📋 Planning ticket: {ticket_id}")
+            click.echo(f"🏗️  Project: {project}")
 
-        # Step 2: Create git worktree (only after ticket is validated)
-        click.echo("\n2️⃣  Creating git worktree...")
-        worktree_path = worktree_mgr.create_worktree(ticket_id, project)
-        click.echo(f"   ✓ {worktree_path}")
+            # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
+            click.echo("\n1️⃣  Fetching Jira ticket...")
+            ticket_data = jira_client.get_ticket(ticket_id)
+            click.echo(f"   ✓ {ticket_data['summary']}")
 
-        # Step 3: Run unified plan workflow
-        click.echo("\n3️⃣  Generating implementation plan...")
-        plan_agent = PlanGeneratorAgent()
-        result = plan_agent.run(ticket_id=ticket_id, worktree_path=worktree_path, force=force, user_prompt=prompt)
+            # Step 2: Create git worktree (only after ticket is validated)
+            orchestrator.set_phase(execution.id, "worktree")
+            click.echo("\n2️⃣  Creating git worktree...")
+            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
+            click.echo(f"   ✓ {worktree_path}")
+
+            # Step 3: Run unified plan workflow
+            orchestrator.set_phase(execution.id, "planning")
+            click.echo("\n3️⃣  Generating implementation plan...")
+            plan_agent = PlanGeneratorAgent()
+            plan_agent.attach_events(bus, execution.id)
+            result = plan_agent.run(ticket_id=ticket_id, worktree_path=worktree_path, force=force, user_prompt=prompt)
+            orchestrator.record_agent_result(execution.id, plan_agent.agent_name, result)
 
         action = result.get("action")
 
@@ -179,6 +404,11 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False, fo
         logger.error(f"Plan command failed: {e}", exc_info=True)
         click.echo(f"\n❌ Error: {e}", err=True)
         sys.exit(1)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @cli.command()
@@ -212,25 +442,70 @@ def debrief(ticket_id: str, project: Optional[str] = None, prompt: Optional[str]
         # Extract project key from ticket ID if not provided
         if project is None:
             project = ticket_id.split("-")[0]
+        conn, repo, bus, orchestrator = _open_command_center()
+    except Exception as e:
+        logger.error(f"Debrief command setup failed: {e}", exc_info=True)
+        click.echo(f"\n\u274c Error: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        from src.core.execution.options import (
+            DebriefOptions,
+            to_metadata_options,
+        )
+        from src.core.execution.workflows import (
+            NoOpExecutionError,
+            WorkflowCancelled,
+            WorkflowError,
+            run_debrief,
+        )
+
+        try:
+            debrief_options = DebriefOptions(prompt=prompt)
+        except Exception as exc:
+            click.echo(f"\n\u274c Invalid options: {exc}", err=True)
+            sys.exit(1)
 
         click.echo(f"\U0001f4ac Functional Debrief: {ticket_id}")
         click.echo(f"\U0001f3d7\ufe0f  Project: {project}")
 
-        # Step 1: Create git worktree for codebase access
-        worktree_path = None
-        try:
-            worktree_mgr = WorktreeManager()
-            click.echo("\n1\ufe0f\u20e3  Creating git worktree...")
-            worktree_path = worktree_mgr.create_worktree(ticket_id, project)
-            click.echo(f"   \u2713 {worktree_path}")
-        except Exception as e:
-            click.echo(f"   \u26a0\ufe0f  No codebase access: {e}")
-            click.echo("   Continuing with text-only analysis...")
+        with orchestrator.run(
+            ticket_id=ticket_id,
+            project=project,
+            kind=ExecutionKind.DEBRIEF,
+            options=to_metadata_options(debrief_options),
+        ) as execution:
+            try:
+                wf_result = run_debrief(
+                    orchestrator,
+                    ticket_id=ticket_id,
+                    project=project,
+                    options=debrief_options,
+                    execution_id=execution.id,
+                )
+                wf_result.assert_real_work()
+            except WorkflowCancelled as exc:
+                click.echo(f"\n\u26d4 Cancelled: {exc}", err=True)
+                sys.exit(1)
+            except (WorkflowError, NoOpExecutionError) as exc:
+                click.echo(f"\n\u274c {exc}", err=True)
+                sys.exit(1)
 
-        # Step 2: Run debrief agent
-        click.echo("\n2\ufe0f\u20e3  Analyzing ticket...")
-        agent = FunctionalDebriefAgent()
-        result = agent.run(ticket_id=ticket_id, project=project, worktree_path=worktree_path, user_prompt=prompt)
+        result = wf_result.agent_results.get("functional_debrief", {})
+        if "git.worktree_skipped" in wf_result.artifacts:
+            click.echo(
+                "   \u26a0\ufe0f  No codebase access \u2014 text-only analysis"
+            )
+        if "debrief.follow_up_created" in wf_result.artifacts:
+            click.echo(
+                f"   \u2713 Created follow-up ticket "
+                f"{wf_result.extra.get('follow_up_created_ticket', '?')}"
+            )
+        if "debrief.follow_up_linked" in wf_result.artifacts:
+            click.echo(
+                f"   \u2713 Linked follow-up ticket "
+                f"{wf_result.extra.get('follow_up_linked_ticket', '?')}"
+            )
 
         action = result.get("action")
         iteration_count = result.get("iteration_count", 1)
@@ -278,6 +553,11 @@ def debrief(ticket_id: str, project: Optional[str] = None, prompt: Optional[str]
         logger.error(f"Debrief command failed: {e}", exc_info=True)
         click.echo(f"\n\u274c Error: {e}", err=True)
         sys.exit(1)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _format_decision_log(ticket_id: str, iteration: int, dev_result: dict, sec_result: dict) -> str:
@@ -475,7 +755,34 @@ def _format_drupal_findings_comment(
     default=None,
     help="Additional instruction to inject into the developer agent session.",
 )
-def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False, no_env: bool = False, prompt: Optional[str] = None) -> None:
+@click.option(
+    "--remote",
+    is_flag=True,
+    help="Start the execution on the Command Center service (POST /executions) "
+    "instead of running in-process. Survives CLI exit.",
+)
+@click.option(
+    "--follow",
+    is_flag=True,
+    help="With --remote: stream live events from the service until the run ends.",
+)
+@click.option(
+    "--idempotency-key",
+    default=None,
+    help="With --remote: Idempotency-Key header value for POST /executions.",
+)
+def execute(
+    ticket_id: str,
+    project: Optional[str] = None,
+    max_iterations: int = 5,
+    force: bool = False,
+    revise: bool = False,
+    no_env: bool = False,
+    prompt: Optional[str] = None,
+    remote: bool = False,
+    follow: bool = False,
+    idempotency_key: Optional[str] = None,
+) -> None:
     """Execute implementation plan for a Jira ticket.
 
     Reads the plan, implements features using TDD, and iterates with security review
@@ -490,523 +797,170 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         force: Force-push to remote if branch has diverged
         revise: Revise existing implementation based on MR feedback
     """
+    # Extract project key from ticket ID if not provided
+    if project is None:
+        project = ticket_id.split("-")[0]
+
+    if remote:
+        _remote_execute(
+            ticket_id=ticket_id,
+            project=project,
+            options={
+                "revise": revise,
+                "force": force,
+                "no_env": no_env,
+                "max_iterations": max_iterations,
+                "prompt": prompt,
+            },
+            follow=follow,
+            idempotency_key=idempotency_key,
+        )
+        return
+
+    # Auto-drain any previously-deferred pushes before starting new work.
+    # Best-effort: never block execute on this.
     try:
-        # Extract project key from ticket ID if not provided
-        if project is None:
-            project = ticket_id.split("-")[0]
+        from src.core.execution.push_deferral import drain_pending
+        cfg = get_config()
+        report = drain_pending(cfg.workspace_root, logger=logger, quiet=True)
+        if report.drained:
+            click.echo(
+                f"↻ Drained {len(report.drained)} previously-deferred push(es)."
+            )
+        if report.still_pending:
+            click.echo(
+                f"⚠ {len(report.still_pending)} deferred push(es) still pending "
+                f"— run 'sentinel push-pending' to retry."
+            )
+    except Exception as exc:
+        logger.warning("auto-drain failed (continuing): %s", exc)
 
-        # Initialize managers
-        worktree_mgr = WorktreeManager()
+    try:
+        conn, repo, bus, orchestrator = _open_command_center()
+    except Exception as e:
+        logger.error(f"Execute command setup failed: {e}", exc_info=True)
+        click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
 
-        # Get worktree path
-        worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
-        if not worktree_path:
-            click.echo(f"\n❌ Worktree not found for {ticket_id}", err=True)
-            click.echo("   Run 'sentinel plan' first to create the worktree")
-            sys.exit(1)
-
-        # Run revision workflow if --revise flag is set
-        if revise:
-            click.echo(f"🔄 Revising implementation for: {ticket_id}")
-            click.echo(f"🏗️  Project: {project}")
-
-            click.echo("\n1️⃣  Fetching MR feedback...")
-
-            # Select developer agent based on project stack type
-            config = get_config()
-            project_config = config.get_project_config(project)
-            stack_type = project_config.get("stack_type", "")
-
-            if stack_type and stack_type.startswith("drupal"):
-                developer = DrupalDeveloperAgent()
-            else:
-                developer = PythonDeveloperAgent()
-
-            # Set up container environment for test execution
-            env_mgr = EnvironmentManager()
-            env_info = None
-            if not no_env:
-                try:
-                    env_info = env_mgr.setup(worktree_path, ticket_id)
-                    if env_info and env_info.active:
-                        developer.set_environment(env_mgr, ticket_id)
-                        click.echo(f"   ✓ Container environment started: {', '.join(env_info.services)}")
-                except RuntimeError as e:
-                    logger.warning(f"Container setup failed during revision: {e}")
-                    click.echo(f"   ⚠️  Container setup failed: {e} (tests will run on host)")
-
-            try:
-                result = developer.run_revision(ticket_id=ticket_id, worktree_path=worktree_path, user_prompt=prompt)
-
-                if result.get("feedback_count", 0) == 0:
-                    click.echo("   ℹ No unresolved discussions found")
-                    click.echo(f"\n✅ Nothing to revise for {ticket_id}")
-                    return
-
-                click.echo(f"   ✓ Found {result['feedback_count']} unresolved discussion(s)")
-
-                click.echo("\n2️⃣  Implementing fixes based on feedback...")
-                click.echo(f"   ✓ {result.get('tasks_completed', 0)} task(s) completed")
-                if result.get("tasks_failed", 0) > 0:
-                    click.echo(f"   ⚠ {result['tasks_failed']} task(s) failed")
-
-                click.echo("\n3️⃣  Updating MR...")
-                if result.get("changes_committed"):
-                    click.echo("   ✓ Revised implementation committed")
-                else:
-                    click.echo("   ℹ No code changes made")
-
-                responses_posted = result.get("responses_posted", 0)
-                click.echo(f"   ✓ Posted {responses_posted} response(s) to discussions")
-
-                test_results = result.get("test_results", {})
-                if test_results.get("success"):
-                    click.echo("   ✓ All tests passing")
-                else:
-                    click.echo("   ⚠️  Some tests failing - review needed")
-
-                # Config validation result
-                config_result = result.get("config_validation", {})
-                if config_result.get("output") and config_result.get("success"):
-                    click.echo("   🔧 Config validation passed")
-                elif not config_result.get("success", True):
-                    click.echo("   🔧 Config validation FAILED (after fix attempts)")
-                    config_output = config_result.get("output", "")
-                    if config_output:
-                        click.echo(f"      {config_output[:500]}")
-                    click.echo(
-                        "\n❌ Config still broken after fix attempts — not pushing",
-                        err=True,
-                    )
-                    sys.exit(1)
-
-                # Drupal-specific review for Drupal stacks (revise flow)
-                drupal_findings_to_post = None
-                if stack_type and stack_type.startswith("drupal"):
-                    ticket_description = _fetch_ticket_description(ticket_id)
-                    for drupal_attempt in range(1, max_iterations + 1):
-                        click.echo(f"\n   🔍 Drupal: Reviewing revised code (attempt {drupal_attempt}/{max_iterations})...")
-                        drupal_reviewer = DrupalReviewerAgent()
-                        drupal_result = drupal_reviewer.run(
-                            worktree_path=worktree_path,
-                            ticket_id=ticket_id,
-                            ticket_description=ticket_description,
-                        )
-
-                        if drupal_result["approved"]:
-                            click.echo("      ✅ Drupal review PASSED")
-                            break
-                        else:
-                            issues_count = len(drupal_result.get("findings", []))
-                            click.echo(f"      ⚠️  Found {issues_count} Drupal issues")
-                            for line in drupal_result.get("feedback", []):
-                                click.echo(f"      {line}")
-
-                            if drupal_attempt < max_iterations:
-                                click.echo("      ↻  Developer will address Drupal findings...")
-                                fix_prompt = "Fix the following Drupal review findings:\n" + "\n".join(
-                                    drupal_result.get("feedback", [])
-                                )
-                                developer.run_revision(
-                                    ticket_id=ticket_id,
-                                    worktree_path=worktree_path,
-                                    user_prompt=fix_prompt,
-                                )
-                            else:
-                                click.echo("\n⚠️  Drupal review has unresolved findings — will post to MR for human review")
-                                drupal_findings_to_post = drupal_result
-
-                # Push changes to remote
-                click.echo("\n4️⃣  Pushing changes to remote...")
-                try:
-                    import subprocess
-
-                    # Get current branch name
-                    branch_result = subprocess.run(
-                        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                        cwd=worktree_path,
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    )
-                    branch_name = branch_result.stdout.strip()
-
-                    # Build push command
-                    push_cmd = ["git", "push", "-u", "origin", branch_name]
-                    if force:
-                        push_cmd.insert(2, "--force")
-                        click.echo("   ⚠️  Force-pushing (may overwrite remote commits)")
-
-                    # Attempt push
-                    push_result = subprocess.run(
-                        push_cmd,
-                        cwd=worktree_path,
-                        capture_output=True,
-                        text=True,
-                    )
-
-                    if push_result.returncode == 0:
-                        click.echo(f"   ✓ Pushed to origin/{branch_name}")
-
-                        # Post revision log comment to MR
-                        try:
-                            from src.gitlab_client import GitLabClient
-
-                            gitlab = GitLabClient()
-                            config = get_config()
-                            project_config = config.get_project_config(project)
-                            git_url = project_config.get("git_url", "")
-                            project_path = GitLabClient.extract_project_path(git_url)
-                            source_branch = get_branch_name(ticket_id)
-                            mrs = gitlab.list_merge_requests(
-                                project_id=project_path,
-                                source_branch=source_branch,
-                            )
-
-                            if mrs:
-                                mr_iid = mrs[0]["iid"]
-                                revision_log = _format_revision_log(
-                                    ticket_id=ticket_id,
-                                    result=result,
-                                )
-                                gitlab.add_merge_request_comment(
-                                    project_id=project_path,
-                                    mr_iid=mr_iid,
-                                    body=revision_log,
-                                )
-                                click.echo("   ✓ Revision log posted to MR")
-
-                                if drupal_findings_to_post:
-                                    drupal_comment = _format_drupal_findings_comment(
-                                        ticket_id=ticket_id,
-                                        drupal_result=drupal_findings_to_post,
-                                        attempts=max_iterations,
-                                    )
-                                    gitlab.add_merge_request_comment(
-                                        project_id=project_path,
-                                        mr_iid=mr_iid,
-                                        body=drupal_comment,
-                                    )
-                                    click.echo("   ✓ Drupal findings posted to MR for human review")
-                        except Exception as e:
-                            logger.warning(f"Failed to post revision log comment: {e}")
-
-                    else:
-                        error_output = push_result.stderr
-                        if "non-fast-forward" in error_output or "rejected" in error_output:
-                            click.echo("   ⚠️  Push rejected: remote branch has diverged")
-                            click.echo("   💡 Use --force flag to force-push and overwrite remote")
-                            click.echo(f"      Example: sentinel execute {ticket_id} --revise --force")
-                        else:
-                            click.echo(f"   ⚠️  Push failed: {error_output}")
-
-                except Exception as e:
-                    logger.warning(f"Failed to push changes: {e}")
-                    click.echo(f"   ⚠️  Push failed: {e}")
-                    click.echo("   💡 You may need to push manually from the worktree")
-
-                click.echo(f"\n✅ Implementation revision complete for {ticket_id}")
-                click.echo(f"   MR: {result['mr_url']}")
-                click.echo("   Next: Review the updated implementation and address any remaining feedback")
-
-            finally:
-                # Teardown container environment
-                if env_info and env_info.active:
-                    try:
-                        env_mgr.teardown(ticket_id)
-                    except Exception as e:
-                        logger.warning(f"Container teardown failed: {e}")
-
-            return
-
-        # Normal execution workflow (not --revise)
-        click.echo(f"⚙️  Executing ticket: {ticket_id}")
-        click.echo(f"🏗️  Project: {project}")
-        click.echo(f"🔄 Max iterations: {max_iterations}")
-
-        # Initialize container environment (auto-detects from project contents)
-        env_mgr = EnvironmentManager()
-        env_info = None
-
-        if no_env:
-            click.echo("\n1️⃣  Skipping container environment (--no-env)")
-        else:
-            click.echo("\n1️⃣  Setting up environment...")
-            try:
-                env_info = env_mgr.setup(worktree_path, ticket_id)
-                if env_info.active:
-                    click.echo(f"   ✓ Container environment started: {', '.join(env_info.services)}")
-                    if env_info.tooling:
-                        click.echo(f"   ✓ Available tooling: {', '.join(env_info.tooling.keys())}")
-                else:
-                    click.echo("   ✓ No container environment needed")
-            except RuntimeError as e:
-                click.echo(f"\n❌ Container setup failed: {e}", err=True)
-                click.echo(f"   Project requires a container environment (.lando.yml detected)")
-                click.echo(f"   Fix the issue above and retry, or use --no-env to skip containers")
-                sys.exit(1)
+    try:
+        from src.core.execution.options import (
+            ExecuteOptions,
+            to_metadata_options,
+        )
+        from src.core.execution.workflows import (
+            NoOpExecutionError,
+            WorkflowCancelled,
+            WorkflowError,
+            run_execute,
+            run_revise,
+        )
 
         try:
-            # Find plan file
-            plan_file = worktree_path / ".agents" / "plans" / f"{ticket_id}.md"
-            if not plan_file.exists():
-                click.echo(f"\n❌ Plan file not found: {plan_file}", err=True)
-                click.echo("   Run 'sentinel plan' first to generate the plan")
+            execute_options = ExecuteOptions(
+                revise=revise,
+                force=force,
+                no_env=no_env,
+                max_iterations=max_iterations,
+                prompt=prompt,
+            )
+        except Exception as exc:
+            click.echo(f"\n❌ Invalid options: {exc}", err=True)
+            sys.exit(1)
+
+        click.echo(
+            f"⚙️  {'Revising' if revise else 'Executing'} ticket: {ticket_id}"
+        )
+        click.echo(f"🏗️  Project: {project}")
+        if not revise:
+            click.echo(f"🔄 Max iterations: {max_iterations}")
+
+        with orchestrator.run(
+            ticket_id=ticket_id,
+            project=project,
+            kind=ExecutionKind.EXECUTE,
+            options=to_metadata_options(execute_options),
+        ) as execution:
+            runner = run_revise if revise else run_execute
+            try:
+                wf_result = runner(
+                    orchestrator,
+                    ticket_id=ticket_id,
+                    project=project,
+                    options=execute_options,
+                    execution_id=execution.id,
+                )
+                wf_result.assert_real_work()
+            except WorkflowCancelled as exc:
+                click.echo(f"\n⛔ Cancelled: {exc}", err=True)
+                sys.exit(1)
+            except (WorkflowError, NoOpExecutionError) as exc:
+                click.echo(f"\n❌ {exc}", err=True)
                 sys.exit(1)
 
-            # Execute implementation with developer and security review loop
-            click.echo("\n3️⃣  Executing implementation...")
-
-            # Select developer agent based on project stack type
-            config = get_config()
-            project_config = config.get_project_config(project)
-            stack_type = project_config.get("stack_type", "")
-
-            if stack_type and stack_type.startswith("drupal"):
-                developer = DrupalDeveloperAgent()
-                click.echo(f"   Using Drupal developer agent (stack: {stack_type})")
-            else:
-                developer = PythonDeveloperAgent()
-                if stack_type:
-                    click.echo(f"   Using Python developer agent (stack: {stack_type})")
-
-            # Wire container environment to developer agent for test execution
-            if env_info and env_info.active:
-                developer.set_environment(env_mgr, ticket_id)
-
-            security = SecurityReviewerAgent()
-            drupal_findings_to_post = None
-
-            for iteration in range(1, max_iterations + 1):
-                click.echo(f"\n   Iteration {iteration}/{max_iterations}")
-
-                # Developer implements features
-                click.echo("   🔨 Developer: Implementing features...")
-                dev_result = developer.run(plan_file=plan_file, worktree_path=worktree_path, user_prompt=prompt)
-                click.echo(f"      ✓ {dev_result['tasks_completed']} tasks completed")
-                if dev_result['tasks_failed'] > 0:
-                    click.echo(f"      ⚠ {dev_result['tasks_failed']} tasks failed")
-
-                # Gate: abort if no tasks succeeded — nothing to review or push
-                if dev_result['tasks_completed'] == 0:
-                    click.echo(f"\n❌ All {dev_result['tasks_failed']} tasks failed — nothing to review or push", err=True)
-                    click.echo("   Check the developer agent logs above for failure details")
-                    sys.exit(1)
-
-                # Config validation gate (e.g. Drupal config sync)
-                config_result = dev_result.get("config_validation", {})
-                if config_result.get("output") and config_result.get("success"):
-                    click.echo("   🔧 Config: Validation passed")
-                elif not config_result.get("success", True):
-                    click.echo("   🔧 Config: Validation FAILED")
-                    # Show first 500 chars of output for visibility
-                    config_output = config_result.get("output", "")
-                    if config_output:
-                        click.echo(f"      {config_output[:500]}")
-                    if iteration < max_iterations:
-                        click.echo("      ↻  Developer will address config issues...")
-                        continue
-                    else:
-                        click.echo("\n❌ Config validation failed after max iterations", err=True)
-                        click.echo("   Config dependencies are broken — manual fix required")
-                        sys.exit(1)
-
-                # Security reviews the implementation
-                click.echo("   🔒 Security: Reviewing code...")
-                sec_result = security.run(worktree_path=worktree_path, ticket_id=ticket_id)
-
-                if sec_result["approved"]:
-                    click.echo("      ✅ Security review PASSED")
-
-                    # Drupal-specific review for Drupal stacks
-                    if stack_type and stack_type.startswith("drupal"):
-                        click.echo("   🔍 Drupal: Reviewing code quality...")
-                        drupal_reviewer = DrupalReviewerAgent()
-                        drupal_result = drupal_reviewer.run(
-                            worktree_path=worktree_path,
-                            ticket_id=ticket_id,
-                            ticket_description=_fetch_ticket_description(ticket_id),
-                        )
-
-                        if drupal_result["approved"]:
-                            click.echo("      ✅ Drupal review PASSED")
-                            break
-                        else:
-                            issues_count = len(drupal_result.get("findings", []))
-                            click.echo(f"      ⚠️  Found {issues_count} Drupal issues")
-                            for line in drupal_result.get("feedback", []):
-                                click.echo(f"      {line}")
-
-                            if iteration < max_iterations:
-                                click.echo("      ↻  Developer will address Drupal findings...")
-                                fix_prompt = "Fix the following Drupal review findings:\n" + "\n".join(
-                                    drupal_result.get("feedback", [])
-                                )
-                                developer.run_revision(
-                                    ticket_id=ticket_id,
-                                    worktree_path=worktree_path,
-                                    user_prompt=fix_prompt,
-                                )
-                                continue
-                            else:
-                                click.echo("\n⚠️  Drupal review has unresolved findings — will post to MR for human review")
-                                drupal_findings_to_post = drupal_result
-                                break
-                    else:
-                        break
-                else:
-                    issues_count = len(sec_result.get("findings", []))
-                    click.echo(f"      ⚠️  Found {issues_count} security issues")
-
-                    if iteration < max_iterations:
-                        click.echo("      ↻  Developer will address feedback...")
-                    else:
-                        click.echo("\n❌ Max iterations reached without approval", err=True)
-                        click.echo("   Manual review required. Check security findings.")
-                        sys.exit(1)
-
-            # Push changes to remote
-            click.echo("\n4️⃣  Pushing changes to remote...")
-            try:
-                import subprocess
-
-                # Get current branch name
-                branch_result = subprocess.run(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                branch_name = branch_result.stdout.strip()
-
-                # Build push command
-                push_cmd = ["git", "push", "-u", "origin", branch_name]
-                if force:
-                    push_cmd.insert(2, "--force")
-                    click.echo("   ⚠️  Force-pushing (may overwrite remote commits)")
-
-                # Attempt push
-                push_result = subprocess.run(
-                    push_cmd,
-                    cwd=worktree_path,
-                    capture_output=True,
-                    text=True,
+        # Presentation summary based on the workflow markers.
+        artifacts = set(wf_result.artifacts)
+        if revise:
+            if "revise.no_feedback" in artifacts:
+                click.echo("   ℹ No unresolved discussions found")
+                click.echo(f"\n✅ Nothing to revise for {ticket_id}")
+                return
+            click.echo("\n✅ Revision complete")
+        else:
+            iterations = wf_result.extra.get("iterations")
+            if iterations is not None:
+                click.echo(
+                    f"\n✅ Security approved after {iterations} iteration(s)"
                 )
 
-                if push_result.returncode == 0:
-                    click.echo(f"   ✓ Pushed to origin/{branch_name}")
+        if "git.pushed" in artifacts:
+            click.echo("   ✓ Pushed to remote")
+        if "gitlab.mr_ready" in artifacts:
+            click.echo("   ✓ MR marked as ready for review")
+        if "gitlab.decision_log_posted" in artifacts:
+            click.echo("   ✓ Decision log posted to MR")
+        if "gitlab.drupal_findings_posted" in artifacts:
+            click.echo("   ⚠️  Drupal findings posted to MR for human review")
+        if "jira.completion_comment_posted" in artifacts:
+            click.echo("   ✓ Jira notification posted")
 
-                    mr_web_url = None
+        if wf_result.extra.get("push_deferred"):
+            marker = wf_result.extra.get("deferred_marker")
+            m_branch = getattr(marker, "branch", "") or "(unknown)"
+            m_wt = getattr(marker, "worktree_path", "") or "(unknown)"
+            click.echo(
+                "\n═══════════════════════════════════════════════════════════════\n"
+                "⚠️  PUSH DEFERRED — GitLab unreachable\n"
+                f"   Ticket: {ticket_id}   Branch: {m_branch}\n"
+                f"   Worktree: {m_wt}\n"
+                "   Implementation is committed locally and safe.\n"
+                "   Retry with: sentinel push-pending\n"
+                "═══════════════════════════════════════════════════════════════"
+            )
+            click.echo(
+                "   ℹ MR mark-ready, Jira notify and decision-log comment "
+                "were skipped and may need manual follow-up."
+            )
+            return
 
-                    # Mark MR as ready for review (remove draft status)
-                    try:
-                        from src.gitlab_client import GitLabClient
+        mr_url = wf_result.extra.get("mr_url")
+        if mr_url:
+            click.echo(f"\n✅ Workflow complete for {ticket_id}")
+            click.echo(f"   MR: {mr_url}")
+        else:
+            click.echo(f"\n✅ Workflow complete for {ticket_id}")
 
-                        gitlab = GitLabClient()
-                        config = get_config()
-                        project_config = config.get_project_config(project)
-                        git_url = project_config.get("git_url", "")
-
-                        # Extract project path from git URL
-                        project_path = GitLabClient.extract_project_path(git_url)
-
-                        # Find the MR for this branch
-                        source_branch = get_branch_name(ticket_id)
-                        mrs = gitlab.list_merge_requests(
-                            project_id=project_path,
-                            source_branch=source_branch,
-                        )
-
-                        if mrs:
-                            mr_iid = mrs[0]["iid"]
-                            mr_web_url = mrs[0].get("web_url")
-                            gitlab.mark_as_ready(project_id=project_path, mr_iid=mr_iid)
-                            click.echo("   ✓ MR marked as ready for review")
-                            
-                            # Post decision log comment to MR
-                            try:
-                                decision_log = _format_decision_log(
-                                    ticket_id=ticket_id,
-                                    iteration=iteration,
-                                    dev_result=dev_result,
-                                    sec_result=sec_result,
-                                )
-                                
-                                gitlab.add_merge_request_comment(
-                                    project_id=project_path,
-                                    mr_iid=mr_iid,
-                                    body=decision_log,
-                                )
-                                click.echo("   ✓ Decision log posted to MR")
-
-                                if drupal_findings_to_post:
-                                    drupal_comment = _format_drupal_findings_comment(
-                                        ticket_id=ticket_id,
-                                        drupal_result=drupal_findings_to_post,
-                                        attempts=max_iterations,
-                                    )
-                                    gitlab.add_merge_request_comment(
-                                        project_id=project_path,
-                                        mr_iid=mr_iid,
-                                        body=drupal_comment,
-                                    )
-                                    click.echo("   ✓ Drupal findings posted to MR for human review")
-                            except Exception as e:
-                                logger.warning(f"Failed to post decision log comment: {e}")
-                                # Non-fatal error - execution continues
-
-                    except Exception as e:
-                        logger.warning(f"Failed to mark MR as ready: {e}")
-                        # Non-fatal - just log and continue
-
-                    # Notify Jira that execution is complete
-                    try:
-                        jira_client = get_jira_client()
-                        comment = (
-                            f"Sentinel has completed execution for {ticket_id}. "
-                            "Code is ready for developer review."
-                        )
-                        jira_client.add_comment(
-                            ticket_id,
-                            comment,
-                            link_text="View Merge Request" if mr_web_url else None,
-                            link_url=mr_web_url,
-                        )
-                        click.echo("   ✓ Jira notification posted")
-                    except Exception as e:
-                        logger.warning(f"Failed to post Jira notification: {e}")
-
-                else:
-                    error_output = push_result.stderr
-                    if "non-fast-forward" in error_output or "rejected" in error_output:
-                        click.echo("   ⚠️  Push rejected: remote branch has diverged")
-                        click.echo("   💡 Use --force flag to force-push and overwrite remote")
-                        click.echo(f"      Example: sentinel execute {ticket_id} --force")
-                    else:
-                        click.echo(f"   ⚠️  Push failed: {error_output}")
-
-            except Exception as e:
-                logger.warning(f"Failed to push changes: {e}")
-                click.echo(f"   ⚠️  Push failed: {e}")
-                click.echo("   💡 You may need to push manually from the worktree")
-
-            click.echo(f"\n✅ Execute workflow complete for {ticket_id}")
-            click.echo("   Code is ready for human review in the MR")
-
-        finally:
-            # Always clean up container environment
-            if env_info and env_info.active:
-                click.echo("\n🧹 Cleaning up container environment...")
-                if env_mgr.teardown(ticket_id):
-                    click.echo("   ✓ Containers stopped and removed")
-                else:
-                    click.echo("   ⚠️  Container cleanup may be incomplete")
-
+    except SystemExit:
+        raise
     except Exception as e:
         logger.error(f"Execute command failed: {e}", exc_info=True)
         click.echo(f"\n❌ Error: {e}", err=True)
         sys.exit(1)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 
 def _teardown_containers(
@@ -1300,6 +1254,44 @@ def status(project: Optional[str] = None) -> None:
                     click.echo(f"     ... and {len(worktrees) - 5} more")
             else:
                 click.echo("   No active worktrees")
+
+        # Pending pushes section — deferred by VPN drops / transient errors.
+        try:
+            from src.core.execution.push_deferral import enumerate_pending
+            pending = enumerate_pending(config.workspace_root)
+        except Exception as exc:
+            logger.warning("status: enumerate_pending failed: %s", exc)
+            pending = []
+
+        click.echo("\n📤 Pending pushes")
+        if not pending:
+            click.echo("   ✓ None")
+        else:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            for m in pending:
+                age = ""
+                try:
+                    first = datetime.strptime(
+                        m.first_deferred_at, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc)
+                    delta = now - first
+                    hours = int(delta.total_seconds() // 3600)
+                    if hours >= 1:
+                        age = f"{hours}h"
+                    else:
+                        age = f"{int(delta.total_seconds() // 60)}m"
+                except Exception:
+                    age = "?"
+                err = (m.last_error or "")[:80]
+                click.echo(
+                    f"   ⚠️  {m.ticket_id}  branch={m.branch}  "
+                    f"age={age}  attempts={m.attempts}  "
+                    f"kind={m.last_error_kind}"
+                )
+                if err:
+                    click.echo(f"       last_error: {err}")
+            click.echo("   Run 'sentinel push-pending' to retry.")
 
     except Exception as e:
         logger.error(f"Status command failed: {e}", exc_info=True)
@@ -2556,6 +2548,161 @@ def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) 
     except Exception as e:
         logger.error(f"Projects profile failed: {e}", exc_info=True)
         click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.option(
+    "--host",
+    default=None,
+    help="Bind address; defaults to service.bind_address config or 127.0.0.1",
+)
+@click.option(
+    "--port",
+    default=None,
+    type=int,
+    help="Port; defaults to service.port config or 8787",
+)
+@click.option(
+    "--show-token-prefix",
+    is_flag=True,
+    help="Print the first 6 chars of the service token on startup. "
+    "Opt-in so CI scrollback doesn't accidentally capture it.",
+)
+@click.option(
+    "--i-know-what-im-doing",
+    is_flag=True,
+    hidden=True,
+)
+def serve(
+    host: Optional[str],
+    port: Optional[int],
+    show_token_prefix: bool,
+    i_know_what_im_doing: bool,
+) -> None:
+    """Start the Sentinel HTTP API."""
+    # Imports kept local so CLI startup isn't penalised by FastAPI/uvicorn.
+    import socket
+
+    import uvicorn
+
+    from src.service.app import create_app
+    from src.service.auth import load_or_create_token
+    from src.service.discovery import remove_discovery
+
+    cfg = get_config()
+    bind_host = host or cfg.get("service.bind_address", "127.0.0.1")
+    bind_port = port if port is not None else int(cfg.get("service.port", 8787))
+
+    # Refuse to bind 0.0.0.0 / :: without the escape hatch. A casual user who
+    # typed `sentinel serve --host 0.0.0.0` on a laptop just exposed execution
+    # control to their whole network; the guard exists so that requires an
+    # explicit opt-in flag.
+    if bind_host in ("0.0.0.0", "::") and not i_know_what_im_doing:
+        raise click.ClickException(
+            f"Refusing to bind {bind_host} without --i-know-what-im-doing. "
+            "Use 127.0.0.1 or the docker network IP."
+        )
+
+    # --port 0 means "pick an ephemeral port". Pre-resolve it so we can stash
+    # the concrete port on app.state for the discovery writer. Yes, there is
+    # a race window between close() and uvicorn's subsequent bind — acceptable
+    # per the Track 1 plan (gotchas section). Pinned non-zero ports are passed
+    # through unchanged; collisions surface via uvicorn's normal EADDRINUSE.
+    if bind_port == 0:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((bind_host, 0))
+            bind_port = probe.getsockname()[1]
+        logger.info("serve: resolved ephemeral port -> %d", bind_port)
+
+    token = load_or_create_token()
+    if show_token_prefix:
+        click.echo(
+            f"Token: {token[:6]}... "
+            f"(full value in ~/.sentinel/service_token)"
+        )
+
+    # Build the app explicitly so we can attach the pre-resolved port; the
+    # lifespan consumes app.state.discovery_port to write ~/.local/state/
+    # sentinel/service.json. Intentionally pass the app INSTANCE, not a
+    # factory string — Supervisor state (plan 04) and SQLite connections are
+    # per-process; single-process is a design constraint.
+    #
+    # NOTE: we deliberately do NOT acquire discovery_lock here. The lock is a
+    # spawn-decision mutex for the TUI preamble; holding it across the serve
+    # process lifetime would serialize all sentinel serve invocations forever.
+    # Single-instance correctness is enforced by port-level exclusion (two
+    # processes cannot bind the same port) — discovery is only used to FIND
+    # the running service, not to elect it.
+    app = create_app()
+    app.state.discovery_port = bind_port
+
+    try:
+        uvicorn.run(app, host=bind_host, port=bind_port, log_config=None)
+    finally:
+        # Belt-and-braces: the lifespan teardown removes the discovery file on
+        # clean shutdown, but if startup raised before reaching the yield (or
+        # uvicorn died hard), the file could survive. remove_discovery is
+        # idempotent and swallows FileNotFoundError, so this is always safe.
+        remove_discovery()
+
+
+@cli.command("interactive")
+def interactive() -> None:
+    """Launch the interactive TUI launcher."""
+    from src.tui.app import run as run_tui
+
+    run_tui()
+
+
+@cli.command("i", hidden=True)
+def interactive_alias() -> None:
+    """Alias for ``sentinel interactive``."""
+    from src.tui.app import run as run_tui
+
+    run_tui()
+
+
+@cli.command("push-pending")
+@click.option(
+    "--quiet", is_flag=True,
+    help="Suppress per-item output; only print the summary.",
+)
+def push_pending(quiet: bool) -> None:
+    """Retry any deferred pushes whose worktrees have pending markers."""
+    try:
+        from src.core.execution.push_deferral import drain_pending
+
+        cfg = get_config()
+        report = drain_pending(cfg.workspace_root, logger=logger, quiet=quiet)
+    except Exception as e:
+        logger.error(f"push-pending failed: {e}", exc_info=True)
+        click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
+
+    if not quiet:
+        for m in report.drained:
+            click.echo(f"   ✓ {m.ticket_id}  pushed {m.branch}")
+        for m in report.still_pending:
+            click.echo(
+                f"   ⚠️  {m.ticket_id}  still pending "
+                f"(attempts={m.attempts}, kind={m.last_error_kind})"
+            )
+        for m, err in report.errors:
+            click.echo(f"   ❌ {m.ticket_id}  error: {err}")
+
+    click.echo(
+        f"\n📤 push-pending: drained={len(report.drained)} "
+        f"still_pending={len(report.still_pending)} "
+        f"errors={len(report.errors)}"
+    )
+    if report.drained:
+        click.echo(
+            "   ℹ MR mark-ready, Jira notify and decision-log comment from "
+            "the original execute run were skipped — those may need manual "
+            "follow-up."
+        )
+    if report.still_pending or report.errors:
         sys.exit(1)
 
 

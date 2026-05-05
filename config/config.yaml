@@ -121,6 +121,22 @@ jira:
   comment_visibility_role: Employees
 confidence:
   default_threshold: 95
+service:
+  # Bind address for `sentinel serve`. 0.0.0.0 requires --i-know-what-im-doing.
+  bind_address: "127.0.0.1"
+  port: 8787
+  # Expose FastAPI /docs + /redoc + /openapi.json. Off by default so the
+  # schema doesn't leak in prod. Env SENTINEL_ENABLE_DOCS=true overrides
+  # (dev compose sets this automatically; prod compose leaves it false).
+  enable_docs: false
+  # CORS allowlist for third-party HTTP clients (leave empty for CLI-only use).
+  # Must NOT contain "*" — browsers reject "*" + allow_credentials=true, and
+  # the factory refuses it.
+  cors_origins: []
+  rate_limits:
+    # Per-token caps applied to write endpoints only (POST /executions*).
+    max_concurrent: 3
+    max_per_minute: 30
 logging:
   level: INFO
   format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

@@ -145,13 +145,37 @@ class TestConfigLoader:
 
         assert agent_config == {}
 
-    def test_workspace_root(self, sample_config):
-        """Test workspace root property."""
+    def test_workspace_root(self, sample_config, monkeypatch):
+        """Test workspace root property falls back to config default."""
+        monkeypatch.delenv("WORKSPACE_ROOT", raising=False)
         loader = ConfigLoader(sample_config)
         root = loader.workspace_root
 
         assert isinstance(root, Path)
         assert "sentinel-workspaces" in str(root)
+
+    def test_workspace_root_honours_env_var(self, sample_config, monkeypatch):
+        """WORKSPACE_ROOT env var must take priority over config.
+
+        Regression guard: docker-compose sets WORKSPACE_ROOT=/workspaces so
+        worktrees land on the `sentinel-workspaces` named volume and survive
+        container rebuilds. Previously the env var was ignored and worktrees
+        went to ~/sentinel-workspaces inside the container — i.e. the
+        writable image layer — and were wiped on every rebuild.
+        """
+        monkeypatch.setenv("WORKSPACE_ROOT", "/workspaces")
+        loader = ConfigLoader(sample_config)
+        assert loader.workspace_root == Path("/workspaces")
+
+    def test_workspace_root_env_var_overrides_config(
+        self, sample_config, monkeypatch, tmp_path
+    ):
+        """Env var wins even when config explicitly sets workspace.root_dir."""
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "env-root"))
+        loader = ConfigLoader(sample_config)
+        # sample_config has workspace.root_dir set (see fixture); env var
+        # should still win.
+        assert loader.workspace_root == tmp_path / "env-root"
 
     def test_plans_dir(self, sample_config):
         """Test plans directory property."""

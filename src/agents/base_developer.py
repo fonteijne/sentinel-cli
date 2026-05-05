@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import re
+import shlex
 import subprocess
 from abc import abstractmethod
 from pathlib import Path
@@ -187,6 +189,44 @@ class BaseDeveloperAgent(ImplementationAgent):
             )
         return valid
 
+    def _parse_bash_deletions(self, command: str) -> List[str]:
+        """Extract file paths from `rm` / `git rm` invocations in a Bash command.
+
+        Splits on shell separators (``&&``, ``||``, ``;``, newlines) and uses
+        shlex to tokenise each sub-command. Only direct invocations are picked
+        up; commands nested inside ``$(...)`` or pipelines are ignored.
+        """
+        deleted: List[str] = []
+        if not command:
+            return deleted
+        sub_commands = re.split(r"&&|\|\||;|\n", command)
+        for sub in sub_commands:
+            sub = sub.strip()
+            if not sub:
+                continue
+            try:
+                tokens = shlex.split(sub)
+            except ValueError:
+                continue
+            if not tokens:
+                continue
+            i = 0
+            while i < len(tokens) and "=" in tokens[i].split("/", 1)[0] and not tokens[i].startswith("-"):
+                i += 1
+            if i >= len(tokens):
+                continue
+            cmd = tokens[i]
+            args = tokens[i + 1:]
+            if cmd == "git" and args and args[0] == "rm":
+                args = args[1:]
+            elif cmd != "rm":
+                continue
+            for arg in args:
+                if arg == "--" or arg.startswith("-"):
+                    continue
+                deleted.append(arg)
+        return deleted
+
     # ------------------------------------------------------------------
     # Shared orchestration methods
     # ------------------------------------------------------------------
@@ -342,17 +382,24 @@ Return the task list now, one task per line:"""
 
             files_created = []
             files_modified = []
+            files_deleted: List[str] = []
 
             for tool_use in result.get("tool_uses", []):
                 tool_name = tool_use.get("tool")
+                tool_input = tool_use.get("input", {}) or {}
                 if tool_name == "Write":
-                    files_created.append(tool_use.get("input", {}).get("file_path", ""))
+                    files_created.append(tool_input.get("file_path", ""))
                 elif tool_name == "Edit":
-                    files_modified.append(tool_use.get("input", {}).get("file_path", ""))
+                    files_modified.append(tool_input.get("file_path", ""))
+                elif tool_name == "Bash":
+                    files_deleted.extend(
+                        self._parse_bash_deletions(tool_input.get("command", "") or "")
+                    )
 
             # Filter out junk documentation files the LLM may have created
             files_created = self._filter_output_files(files_created)
             files_modified = self._filter_output_files(files_modified)
+            files_deleted = [f for f in files_deleted if f]
 
             test_results = self.run_tests(worktree_path)
 
@@ -379,6 +426,7 @@ Return the task list now, one task per line:"""
                 "success": True,
                 "files_created": [f for f in files_created if f],
                 "files_modified": [f for f in files_modified if f],
+                "files_deleted": files_deleted,
                 "test_results": test_results,
                 "commit_message": commit_message,
                 "agent_response": result.get("content", ""),
@@ -628,6 +676,57 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
             logger.error(f"Git commit failed: {e}")
             raise
 
+    def commit_deletions(
+        self,
+        message: str,
+        files: List[str],
+        worktree_path: Path,
+    ) -> None:
+        """Stage and commit file deletions performed by the agent.
+
+        Files are already removed from the working tree by the agent's
+        ``rm``/``git rm`` invocation; this method stages those removals
+        and creates a separate commit so they reach the remote.
+        """
+        logger.info(f"Committing deletions: {message}")
+
+        try:
+            for file in files:
+                subprocess.run(
+                    ["git", "rm", "-f", "--ignore-unmatch", "--", file],
+                    cwd=worktree_path,
+                    check=False,
+                )
+
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            if not staged.stdout.strip():
+                logger.warning(
+                    "No deletions staged (paths were not tracked?); skipping commit"
+                )
+                return
+
+            commit_msg = f"""{message}
+
+Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
+
+            subprocess.run(
+                ["git", "commit", "-m", commit_msg],
+                cwd=worktree_path,
+                check=True,
+            )
+
+            logger.info("Deletions committed successfully")
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Git commit (deletions) failed: {e}")
+            raise
+
     def run(  # type: ignore[override]
         self,
         plan_file: Path,
@@ -684,6 +783,15 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
                         self.commit_changes(
                             message=impl_result.get("commit_message", f"feat: {task}"),
                             files=all_files,
+                            worktree_path=worktree_path,
+                        )
+
+                    deleted_files = impl_result.get("files_deleted", [])
+                    if deleted_files:
+                        task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
+                        self.commit_deletions(
+                            message=f"chore: remove files ({task_summary})",
+                            files=deleted_files,
                             worktree_path=worktree_path,
                         )
 
@@ -922,12 +1030,22 @@ Classify into ONE of these categories:
                             impl_result.get("files_created", []) +
                             impl_result.get("files_modified", [])
                         )
+                        deleted_files = impl_result.get("files_deleted", [])
                         all_changed_files.extend(changed_files)
+                        all_changed_files.extend(deleted_files)
 
                         if changed_files:
                             self.commit_changes(
                                 message=impl_result.get("commit_message", f"fix: {task[:72]}"),
                                 files=changed_files,
+                                worktree_path=worktree_path,
+                            )
+
+                        if deleted_files:
+                            task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
+                            self.commit_deletions(
+                                message=f"chore: remove files ({task_summary})",
+                                files=deleted_files,
                                 worktree_path=worktree_path,
                             )
 
