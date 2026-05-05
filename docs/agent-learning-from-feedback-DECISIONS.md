@@ -143,3 +143,38 @@ The escalation surface is the "Sentinel paused here" comment plus assignee notif
 - `src/core/execution/post_execute.py` already has an un-draft path on the happy flow (handover §9 pointer). The escalation path adds a symmetric "ensure-draft" step guarded on cap-out.
 - The `sentinel-verifier-loop-expert` agent's spec already says "emit, do NOT burn more tokens." The `DeveloperCappedOut` subscriber owns the draft-reassertion logic, not the loop itself.
 - Tests (owned by `sentinel-test-harness-expert`): on cap-out fixture, assert the MR's draft status is `true` after escalation regardless of its state before.
+
+---
+
+## D8 — MR comments: none on Loop A retries; one per Loop C reviewer handoff
+
+**Date:** 2026-05-05
+**Resolves:** MR-comment volume policy (not previously in the design doc).
+**Status:** Accepted
+
+**Context.** The question came up whether to post progress comments on the MR for each Loop A retry (e.g. "attempt 2 of 3: still red on test_foo"). A parallel question applies to Loop C — when a reviewer veto escalates back to the planner or developer, does that generate a comment?
+
+The two loops have very different economics:
+
+| | Loop A (verifier retry) | Loop C (reviewer handoff) |
+|---|---|---|
+| Frequency | Fires on most executions | Fires only on reviewer vetoes |
+| Resolution rate | Usually self-resolves by attempt 2–3 | Represents a real inflection; always meaningful |
+| Comment volume | 1–3 per execution × every execution | 0–2 per execution, only when something went wrong |
+| Reader value | Low — "tests are still failing" is low-signal | High — "reviewer said X, now planner re-runs" is the decision |
+
+**Decision.**
+- **Loop A retries emit no MR comments.** The retries are internal state. Only the terminal signals are visible: the cap-out escalation (D7 / design §5.1 Loop E) on failure, or the successful MR push on pass.
+- **Loop C reviewer handoffs emit one concise MR comment per handoff.** Format: one line, imperative, naming the reviewer, the finding class (not the full finding text), and the next actor. Example: *"Drupal Reviewer found 2 blockers (service-injection, missing hook). Re-running Planner."*
+
+**Rationale.** Same principle as D7: reviewer attention is finite, and bot comments that reviewers learn to filter out erode the signal of bot comments that *should* interrupt them. Loop A would be low-signal on most executions — tests that fail then pass on retry don't need a human. Loop C is always meaningful because the reviewer agent has already decided the work is blocked.
+
+**Revisit conditions.**
+- If Loop A failures turn out to be hard to debug without a per-retry trace, consider adding a **single edit-in-place comment** (one comment per execution, updated on each retry) rather than per-retry new comments. This was considered and deferred; it has the live-trace value without the notification spam.
+- If Loop C comments themselves become noisy (e.g. re-runs happen often enough that a single MR accumulates 5+ handoff comments), consider collapsing into a single update-in-place comment for Loop C as well.
+
+**Implementation notes.**
+- Loop C is Phase 2 (design §8 task 12); this ADR is forward-looking and binds that work.
+- The subscriber posting the Loop C comment lives alongside existing post-exec hooks in `src/core/execution/post_execute.py` (handover §9 pointer), subscribing to whatever event marks a reviewer handoff (likely a new `ReviewerHandoffTriggered` — integrator territory).
+- Comment format is a one-line template; the distilled finding class comes from the reviewer's output schema, not free-form text. No paraphrasing of the reviewer's original comment (consistent with Decision 10).
+- Tests (`sentinel-test-harness-expert`): integration test asserts zero MR comments on a Loop A cap-avoidance fixture (retries then passes); and exactly one comment per handoff on a Loop C fixture.

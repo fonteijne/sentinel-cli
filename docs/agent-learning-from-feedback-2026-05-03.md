@@ -207,7 +207,7 @@ This is the one-file change called out in §1.
 `ConfidenceEvaluator` + `_detect_plan_state` + `revise_plan` is already Loop A for the plan phase. The only improvement: on threshold miss, auto-run `investigate_comments()` against the evaluator's `questions[]` instead of stopping.
 
 **Loop C — Reviewer-driven re-plan (CROSS-AGENT, currently missing).**
-If the Security or Drupal Reviewer veto rate exceeds a threshold in one run, escalate back to the planner instead of the developer — i.e., the plan was wrong, not the implementation. Signal: `agent_results` where `agent='security_reviewer' and severity='blocker' and count > N`.
+If the Security or Drupal Reviewer veto rate exceeds a threshold in one run, escalate back to the planner instead of the developer — i.e., the plan was wrong, not the implementation. Signal: `agent_results` where `agent='security_reviewer' and severity='blocker' and count > N`. Each handoff posts one concise MR comment naming reviewer, finding class, and next actor (see Decisions §D8). Loop A retries, by contrast, emit no MR comments.
 
 **Loop D — Cross-task heuristic extraction (ASYNC, weekly).**
 A nightly/weekly job queries `agent_results` for failure patterns, groups by `(stack_type, agent, failure_signature)`, and files a **human-review PR** proposing an overlay edit. This is SPL with a review gate.
