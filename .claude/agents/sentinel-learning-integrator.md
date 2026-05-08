@@ -20,8 +20,8 @@ Before any work, load:
 |---|---|
 | `src/prompt_loader.py` (25–61) | Rule-injection hook at prompt composition. Reads from snapshot, never live table. |
 | `src/cli.py` | `sentinel rules {show,list,search,active-at,supersede,revoke}` (Phase 2); `sentinel outcomes sync` (Phase 3). Phase 1 may add `sentinel postmortems list`. |
-| `src/core/events/types.py` (25–200) | New event types: `DeveloperCappedOut`, `PostmortemRecorded`, `FeedbackObservationRecorded`, `FeedbackRulePromoted`, `FeedbackContradictionDetected`, `FeedbackMergeProposed`, `FeedbackRuleRevoked`, `PromptBudgetExceeded`, `RuleInjected`. |
-| `src/core/execution/post_execute.py` | Hook point for feedback ingestion trigger (Phase 2); do not implement distillation here — dispatch to the distiller module. |
+| `src/core/events/types.py` (25–200) | New event types: `DeveloperCappedOut` (Phase 1), `PostmortemRecorded` (Phase 1), `FeedbackObservationRecorded`, `FeedbackRulePromoted`, `FeedbackContradictionDetected`, `FeedbackMergeProposed`, `FeedbackRuleRevoked`, `PromptBudgetExceeded`, `RuleInjected`. |
+| `src/core/execution/post_execute.py` | **Phase 1:** `DeveloperCappedOut` subscriber that re-asserts MR draft state (D7) and posts the "Sentinel paused here" comment. Idempotent — must tolerate replay. **Phase 2:** Feedback-ingestion trigger; dispatch to the distiller module, do not implement distillation here. |
 | Orchestrator seams in `src/core/execution/` | Invoke points for Karpathy Loop A wrapper. Loop body itself lives in the verifier-loop-expert's code. |
 
 ## Files you DO NOT touch

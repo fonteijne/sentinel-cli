@@ -101,9 +101,9 @@ The design conversation agreed on a 5-agent Phase 1 roster. Not yet written to a
 
 The reviewer agent is expensive if invoked per-commit. Invocation policy:
 
-- Before merging any PR touching `src/core/events/types.py`, `src/core/persistence/migrations/`, `src/prompt_loader.py`, `src/agents/base_developer.py`, or the design doc itself.
+- Before merging any PR touching `src/core/events/types.py`, `src/core/persistence/migrations/`, `src/prompt_loader.py`, `src/agents/base_developer.py`, `src/core/execution/post_execute.py`, or the design doc itself.
 - Before declaring a phase complete.
-- Never for cosmetic or test-only changes.
+- Never for cosmetic-only changes. Test-only changes are skipped UNLESS the test is closing a Phase 1 exit-criterion box (e.g. the `DeveloperCappedOut` subscriber test) — those go through review.
 
 ## 7. Phase 1 exit criteria (copy from §10 of the design doc)
 
@@ -112,13 +112,13 @@ The reviewer agent checks these before blessing "Phase 1 done, Phase 2 may start
 - [ ] `base_developer.run_tests()` returns `{passed, test_results, structured_errors[]}` (not just stdout).
 - [ ] Developer Karpathy loop retries with structured feedback, caps at N=3; test exists.
 - [ ] PHPStan + composer-validate verifier wired; test exists.
-- [ ] `DeveloperCappedOut` event in `src/core/events/types.py`; subscriber posts MR comment; test exists.
+- [ ] `DeveloperCappedOut` event in `src/core/events/types.py` (integrator); `post_execute.py` subscriber posts MR comment + re-asserts draft (integrator, D7); test exists.
 - [ ] Migration `003_postmortems.sql` applied; schema matches §6.2 of the design doc.
 - [ ] Postmortem row inserted on capped execution; test exists.
-- [ ] Loop A observed over ≥ 20 real executions with no runaway cost.
-- [ ] Cap-hit rate and first-pass verifier-pass rate logged in telemetry.
+- [ ] **(Operational gate — not an implementation task.)** Loop A observed over ≥ 20 real executions with no runaway cost. Verified by manual SQL against `events` (count `TestResultRecorded` per execution; flag any execution whose token usage exceeds 2× median).
+- [ ] **(Operational gate — not an implementation task.)** Cap-hit rate and first-pass verifier-pass rate computable from raw events. No rollup dashboard for Phase 1; reviewer runs the SQL at gate time. Phase 2 may add aggregation if needed.
 
-**Only when every box ticks does the Phase 2 agent roster get created.**
+**Only when every box ticks does the Phase 2 agent roster get created.** Implementation tasks (boxes 1–6) are owned by the Phase 1 agents; operational gates (boxes 7–8) are owned by the reviewer at gate time.
 
 ## 8. Next actions — prioritized for the next session
 

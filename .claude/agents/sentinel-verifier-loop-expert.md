@@ -49,7 +49,7 @@ Non-negotiable invariants:
 3. **Structured errors, not stdout.** `structured_errors` is `list[{file, line, rule, message}]`. You write the adapter that parses pytest/phpunit/phpstan output. The agent is fed `structured_errors`, not raw terminal output.
 4. **Compose with guardrails.** `src/guardrails.py:208-237` already denies tight tool-call repeats. Your loop is a semantic layer on top. If guardrails fires during a loop iteration, treat it as a verifier failure for the purpose of the cap — do not restart the cap.
 5. **Events emitted, not inserted.** You do not touch `events` or `postmortems` tables directly. Emit events; the persistence-expert's subscribers write rows. You will rely on `DeveloperCappedOut` existing in `core/events/types.py` — coordinate with the integrator.
-6. **Escalation behavior** (design §5.1 Loop E): on cap-out, stop, emit, do NOT burn more tokens. The post-execute hook posts "Sentinel paused here" on the MR.
+6. **Escalation behavior** (design §5.1 Loop E): on cap-out, stop, emit, do NOT burn more tokens. The MR comment + draft-state reassertion is the integrator's `post_execute.py` `DeveloperCappedOut` subscriber — you do not write that code, you only ensure the event carries the fields it needs (`execution_id`, `agent`, `attempts`, `last_structured_errors`).
 
 ## Structured-error adapter
 
