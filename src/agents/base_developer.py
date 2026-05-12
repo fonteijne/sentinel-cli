@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 from abc import abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -44,7 +45,105 @@ def _verifier_loop_enabled() -> bool:
 
 
 class DeveloperCappedOutException(Exception):
-    """Raised when the verifier-retry loop hits MAX_ATTEMPTS without converging."""
+    """Raised when the verifier-retry loop hits MAX_ATTEMPTS without converging.
+
+    Carries the last batch of structured errors so callers (e.g. the iteration
+    loop) can accumulate them into a ``RegressionContext`` for the next
+    iteration's developer prompts.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        structured_errors: Optional[List[StructuredError]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.structured_errors: List[StructuredError] = list(structured_errors or [])
+
+
+class DeveloperTaskFailedException(Exception):
+    """Raised by the single-shot path when tests fail post-implementation.
+
+    Carries the structured errors parsed from the failing test run so the
+    caller can fold them into the cross-iteration regression context.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        structured_errors: Optional[List[StructuredError]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.structured_errors: List[StructuredError] = list(structured_errors or [])
+
+
+@dataclass
+class RegressionContext:
+    """Test failures that survived the prior iteration of an execution.
+
+    Injected into every task prompt in the next iteration as additional
+    acceptance criteria. Ephemeral — never persisted, never crosses
+    execution boundaries.
+    """
+
+    iteration_n: int
+    errors: List[StructuredError] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.errors
+
+
+def _dedupe_structured_errors(
+    errors: List[StructuredError],
+) -> List[StructuredError]:
+    """Collapse duplicate structured errors by (file, line, rule, message).
+
+    The same test failing in three task runs within an iteration shouldn't
+    appear three times in the next iteration's prompt. Order of first
+    appearance is preserved.
+    """
+    seen: set[tuple[str, int, str, str]] = set()
+    out: List[StructuredError] = []
+    for err in errors:
+        key = (
+            str(err.get("file") or ""),
+            int(err.get("line") or 0),
+            str(err.get("rule") or ""),
+            str(err.get("message") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(err)
+    return out
+
+
+def _render_regression_section(ctx: Optional[RegressionContext]) -> str:
+    """Render a regression context as a markdown block ready to prepend to
+    a developer task prompt. ``None`` or empty context returns ``''``.
+    """
+    if ctx is None or ctx.is_empty():
+        return ""
+    lines = [
+        "## Prior Iteration Regressions",
+        "",
+        (
+            f"The previous iteration ({ctx.iteration_n}) left "
+            f"{len(ctx.errors)} test(s) failing. Treat fixing them as "
+            f"additional acceptance criteria for your task — your work "
+            f"isn't done until your task passes **and** these are green:"
+        ),
+        "",
+    ]
+    for err in ctx.errors:
+        file_part = err.get("file") or "<unknown>"
+        line_part = err.get("line") or 0
+        rule_part = err.get("rule") or "unknown"
+        msg_part = (err.get("message") or "").strip()
+        lines.append(
+            f"- `{file_part}:{line_part}` [{rule_part}] {msg_part}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 class BaseDeveloperAgent(ImplementationAgent):
@@ -402,6 +501,7 @@ Return the task list now, one task per line:"""
         worktree_path: Path,
         commit_prefix: str = "feat",
         user_prompt: str | None = None,
+        regressions: Optional[RegressionContext] = None,
     ) -> Dict[str, Any]:
         """Implement a feature following TDD approach.
 
@@ -417,6 +517,10 @@ Return the task list now, one task per line:"""
             context: Implementation context
             worktree_path: Path to git worktree
             commit_prefix: Git commit prefix (feat, fix, etc.)
+            regressions: Optional structured failures from the prior
+                iteration of the enclosing execution. When non-empty, a
+                "## Prior Iteration Regressions" section is prepended to
+                the task prompt as additional acceptance criteria.
 
         Returns:
             Dictionary with success, files_created, files_modified,
@@ -431,10 +535,12 @@ Return the task list now, one task per line:"""
             return self._implement_feature_single_shot(
                 task, context, worktree_path, commit_prefix, user_prompt,
                 pretask_sha=pretask_sha,
+                regressions=regressions,
             )
         return self._implement_feature_with_loop(
             task, context, worktree_path, commit_prefix, user_prompt,
             pretask_sha=pretask_sha,
+            regressions=regressions,
         )
 
     def _implement_feature_single_shot(
@@ -445,6 +551,7 @@ Return the task list now, one task per line:"""
         commit_prefix: str = "feat",
         user_prompt: str | None = None,
         pretask_sha: Optional[str] = None,
+        regressions: Optional[RegressionContext] = None,
     ) -> Dict[str, Any]:
         """Legacy single-shot TDD path (preserved verbatim from pre-Phase-1).
 
@@ -478,6 +585,7 @@ Return the task list now, one task per line:"""
 
         # Build stack-specific TDD prompt
         tdd_prompt = self._build_tdd_prompt(task, context, worktree_path)
+        tdd_prompt = self._prepend_regression_section(tdd_prompt, regressions)
         tdd_prompt = self._append_operator_prompt(tdd_prompt, user_prompt)
 
         # Execute TDD workflow using Agent SDK
@@ -510,9 +618,14 @@ Return the task list now, one task per line:"""
                     "Tests failed after TDD implementation: %s",
                     test_results.get("test_results"),
                 )
-                raise RuntimeError(
-                    f"TDD cycle completed but tests are failing: "
-                    f"{test_results.get('test_results')}"
+                raise DeveloperTaskFailedException(
+                    (
+                        f"TDD cycle completed but tests are failing: "
+                        f"{test_results.get('test_results')}"
+                    ),
+                    structured_errors=list(
+                        test_results.get("structured_errors") or []
+                    ),
                 )
 
             task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
@@ -549,6 +662,7 @@ Return the task list now, one task per line:"""
         commit_prefix: str = "feat",
         user_prompt: str | None = None,
         pretask_sha: Optional[str] = None,
+        regressions: Optional[RegressionContext] = None,
     ) -> Dict[str, Any]:
         """Loop A — capped verifier-retry loop (design §5.1).
 
@@ -584,6 +698,7 @@ Return the task list now, one task per line:"""
             raise
 
         tdd_prompt = self._build_tdd_prompt(task, context, worktree_path)
+        tdd_prompt = self._prepend_regression_section(tdd_prompt, regressions)
         tdd_prompt = self._append_operator_prompt(tdd_prompt, user_prompt)
 
         files_created: List[str] = []
@@ -692,7 +807,8 @@ Return the task list now, one task per line:"""
             self.agent_name, MAX_ATTEMPTS, task,
         )
         raise DeveloperCappedOutException(
-            f"Capped at {MAX_ATTEMPTS} attempts for task: {task}"
+            f"Capped at {MAX_ATTEMPTS} attempts for task: {task}",
+            structured_errors=list(last_errors),
         )
 
     def _build_refine_prompt(
@@ -728,6 +844,17 @@ Return the task list now, one task per line:"""
             "code, do not refactor, and do not hypothesize beyond what the "
             "errors above show. Use Edit/Write tools to apply the fix."
         )
+
+    def _prepend_regression_section(
+        self, prompt: str, regressions: Optional[RegressionContext]
+    ) -> str:
+        """Prepend the rendered ``## Prior Iteration Regressions`` block to
+        a developer task prompt. Empty/None context is a no-op.
+        """
+        block = _render_regression_section(regressions)
+        if not block:
+            return prompt
+        return f"{block}\n{prompt}"
 
     def write_tests(self, implementation: str, test_path: Path) -> str:
         """Write tests for an implementation.
@@ -1219,6 +1346,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         plan_file: Path,
         worktree_path: Path,
         user_prompt: str | None = None,
+        regressions: Optional[RegressionContext] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Run the complete implementation workflow.
@@ -1226,6 +1354,14 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         Args:
             plan_file: Path to implementation plan
             worktree_path: Path to git worktree
+            regressions: Optional structured failures from the prior
+                iteration. When non-empty, each task's developer prompt
+                is prefixed with a "## Prior Iteration Regressions"
+                section. The returned dict also includes
+                ``regression_errors`` — the union of structured errors
+                from any tasks that failed in *this* iteration, ready
+                for the caller to fold into the next iteration's
+                ``RegressionContext``.
             **kwargs: Additional parameters
 
         Returns:
@@ -1284,10 +1420,15 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
 
         # Implement each task
         results = []
+        regression_errors: List[StructuredError] = []
         for task in tasks:
             try:
                 task_with_context = task + attachment_context if attachment_context else task
-                impl_result = self.implement_feature(task_with_context, {}, worktree_path, user_prompt=user_prompt)
+                impl_result = self.implement_feature(
+                    task_with_context, {}, worktree_path,
+                    user_prompt=user_prompt,
+                    regressions=regressions,
+                )
 
                 if impl_result.get("success"):
                     all_files = (
@@ -1304,7 +1445,17 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
                 results.append({"task": task, "success": True, "details": impl_result})
             except Exception as e:
                 logger.error(f"Failed to implement task '{task}': {e}")
-                results.append({"task": task, "success": False, "error": str(e)})
+                # Capture any structured errors carried on the exception so
+                # the iteration loop can inject them as additional acceptance
+                # criteria into the next iteration's task prompts.
+                task_errors = list(getattr(e, "structured_errors", []) or [])
+                regression_errors.extend(task_errors)
+                results.append({
+                    "task": task,
+                    "success": False,
+                    "error": str(e),
+                    "structured_errors": task_errors,
+                })
 
         # Run all tests
         test_results = self.run_tests(worktree_path)
@@ -1361,6 +1512,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
             "test_results": test_results,
             "config_validation": config_validation,
             "results": results,
+            "regression_errors": _dedupe_structured_errors(regression_errors),
         }
 
     def run_revision(  # type: ignore[override]
