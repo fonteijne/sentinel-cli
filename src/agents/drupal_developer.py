@@ -5,10 +5,28 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.agents._structured_errors import (
+    StructuredError,
+    parse_composer_validate,
+    parse_phpstan_json,
+    parse_phpunit_junit,
+)
 from src.agents.base_developer import BaseDeveloperAgent
 
 
 logger = logging.getLogger(__name__)
+
+
+# Path the PHPUnit run writes its JUnit XML to. Inside the container the file
+# lives under /tmp/ — best-effort to read it back; if unreachable we fall back
+# to ``[]`` and rely on static-check signal for the loop to converge.
+_PHPUNIT_JUNIT_PATH = "/tmp/phpunit-junit.xml"
+
+
+# Matches cweagans/composer-patches' "Cannot apply patch <desc> (<path>)!" line.
+# We capture the path inside the parens — that's the file we re-run with
+# ``patch --dry-run`` to surface the rejected hunk.
+_PATCH_FAIL_RE = re.compile(r"Cannot apply patch[^()\n]*\(([^)\n]+)\)")
 
 
 class DrupalDeveloperAgent(BaseDeveloperAgent):
@@ -172,22 +190,94 @@ Execute this TDD cycle now. Use Read/Write/Edit tools for files and Bash for run
 
         logger.info("Running Drupal config sync validation (drush site:install)")
 
-        # Ensure composer deps + scaffold files are installed
-        self._ensure_composer_deps()
+        # Ensure composer deps + scaffold files are installed.
+        # If composer install fails permanently (3 attempts), abort BEFORE
+        # running drush — otherwise the broken vendor/ tree produces
+        # misleading downstream errors (e.g. "module X requires module Y"
+        # when the real cause is a failed patch or blocked plugin).
+        composer_result = self._ensure_composer_deps()
+        if composer_result is not None and composer_result.returncode != 0:
+            composer_output = (
+                (composer_result.stdout or "") + (composer_result.stderr or "")
+            )
+            logger.error(
+                "composer install failed before config validation could run — "
+                "aborting. Most common causes: a failing cweagans/composer-patches "
+                "patch, or a Composer plugin blocked by allow-plugins config."
+            )
+            patch_diagnostics = self._diagnose_failed_patches(composer_output)
+            return {
+                "success": False,
+                "output": (
+                    "composer install failed after 3 attempts; cannot validate "
+                    "config sync. The downstream drush site:install was skipped "
+                    "because a half-installed vendor/ tree produces misleading "
+                    "'missing module' errors that obscure the real cause.\n\n"
+                    "--- composer install output (last attempt) ---\n"
+                    + composer_output
+                    + patch_diagnostics
+                ),
+                "return_code": composer_result.returncode,
+            }
 
         # Run drush site:install matching DHL's CI pipeline.
         # Uses sh -c for env var expansion; defaults match typical Lando setup.
+        #
+        # The wipe is three-pronged because two earlier single-prong
+        # attempts each missed a class of stale state:
+        #
+        #   1. DB at SQL level (DROP DATABASE / CREATE DATABASE) — drops
+        #      every table atomically. Replaces ``drush sql:drop -y || true``
+        #      which used to fail silently on a half-written settings.php
+        #      and let site:install hit its own atomic DROP TABLE that
+        #      breaks on any missing table.
+        #   2. settings.php — left over from a previous iteration's install,
+        #      it pins the connection drush uses for the *bootstrap probe*
+        #      (which decides "is this site already installed?"). If that
+        #      probe runs against a connection different from the one we
+        #      just wiped (e.g. project's .lando.yml uses a non-default DB
+        #      name), the probe sees the old install and throws
+        #      ``AlreadyInstalledException``. Removing it forces drush to
+        #      regenerate from ``--db-url`` so probe and wipe target the
+        #      same DB.
+        #   3. sites/default/files/php — Drupal's compiled-container cache.
+        #      Survives DB wipes; can hold class definitions that reference
+        #      schema versions matching the prior install, contributing to
+        #      false "already installed" detections.
+        #
+        # The DB service is on host ``database`` with root password ``root``
+        # (set in lando_translator's mysql/mariadb block).
+        db_url = (
+            '"${DB_DRIVER:-mysql}://${MYSQL_USER:-drupal}:'
+            '${MYSQL_PASSWORD:-drupal}@${DB_HOST:-database}/'
+            '${MYSQL_DATABASE:-drupal}"'
+        )
         result = self._env_manager.exec(
             ticket_id=self._env_ticket_id,
             service="appserver",
             command=[
                 "sh", "-c",
+                # SQL-level wipe. && (not ;) so a connection failure here
+                # short-circuits the whole step — site:install would fail
+                # less informatively against an unreachable DB. 2>&1 on the
+                # mysql call so any connection / privilege error reaches
+                # the caller's stderr (the parser otherwise sees the
+                # downstream AlreadyInstalled error and misattributes).
+                'DB_NAME="${MYSQL_DATABASE:-drupal}"; '
+                'DB_HOST_VAL="${DB_HOST:-database}"; '
+                'mysql -h "$DB_HOST_VAL" -uroot -proot 2>&1 -e '
+                '"DROP DATABASE IF EXISTS \\`$DB_NAME\\`; '
+                'CREATE DATABASE \\`$DB_NAME\\`;" && '
+                # Force regeneration from --db-url. Without this, drush's
+                # bootstrap probe reads the old settings.php and may target
+                # a DB other than the one we just cleared.
+                'rm -f sites/default/settings.php sites/default/services.yml && '
+                # Drupal's compiled-container cache can survive DB wipes
+                # and contribute to "already installed" detections; nuke it.
+                'rm -rf sites/default/files/php && '
                 "PHP_OPTIONS='-d memory_limit=-1' "
                 "php -d memory_limit=-1 ../vendor/bin/drush --verbose site:install minimal "
-                "--config-dir=../config/sync -y "
-                '--db-url="${DB_DRIVER:-mysql}://${MYSQL_USER:-drupal}:'
-                '${MYSQL_PASSWORD:-drupal}@${DB_HOST:-database}/'
-                '${MYSQL_DATABASE:-drupal}" '
+                f"--config-dir=../config/sync -y --db-url={db_url} "
                 "--account-name=root --account-pass=rootpass",
             ],
             workdir="/app/web",
@@ -212,13 +302,212 @@ Execute this TDD cycle now. Use Read/Write/Edit tools for files and Bash for run
             **({"environment_issue": True} if env_issue else {}),
         }
 
-    def _get_test_command(self) -> List[str]:
+    def _diagnose_failed_patches(self, composer_output: str) -> str:
+        """Re-run failed patches with ``patch --dry-run`` to surface rejected hunks.
+
+        cweagans/composer-patches reports only ``Cannot apply patch X (Y)!`` and
+        swallows the GNU ``patch`` output that names the file/hunk/line that
+        actually rejected. We re-run each failed patch ourselves so the abort
+        message includes the specific rejection.
+
+        Target dir guess uses the convention ``patches/contrib/<module>/...``
+        → ``web/modules/contrib/<module>``. When that doesn't match the
+        project layout we fall back to a hint instead of a real diagnosis,
+        rather than guessing wrong and confusing the reader.
+
+        Returns a formatted block to append to the abort message, or an
+        empty string when nothing further can be determined (no patch line
+        matched, or no environment to exec into).
+        """
+        if not self._env_manager or not self._env_ticket_id:
+            return ""
+
+        # dict.fromkeys preserves first-seen order while deduping repeated paths
+        # across composer's multiple retry blocks.
+        patch_paths = list(dict.fromkeys(_PATCH_FAIL_RE.findall(composer_output)))
+        if not patch_paths:
+            return ""
+
+        sections: List[str] = []
+        for raw_path in patch_paths:
+            norm = raw_path.lstrip("./").strip()
+            parts = norm.split("/")
+            target_dir: Optional[str] = None
+            if len(parts) >= 3 and parts[0] == "patches" and parts[1] == "contrib":
+                target_dir = f"web/modules/contrib/{parts[2]}"
+
+            if target_dir is None:
+                sections.append(
+                    f"--- {raw_path} ---\n"
+                    "Could not auto-detect target install dir from patch path "
+                    "(expected layout: patches/contrib/<module>/...).\n"
+                    "Run manually inside appserver: composer install -vvv"
+                )
+                continue
+
+            dry = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=[
+                    "sh",
+                    "-c",
+                    # head -120 caps output so a wildly drifted patch doesn't
+                    # bloat the abort message; the first few rejected hunks
+                    # are always the most useful signal.
+                    f"patch -p1 --dry-run -i /app/{norm} -d /app/{target_dir} 2>&1 "
+                    "| head -120",
+                ],
+                workdir="/app",
+            )
+            sections.append(
+                f"--- {raw_path} (target: {target_dir}) ---\n"
+                + ((dry.stdout or "") + (dry.stderr or "")).strip()
+            )
+
+        if not sections:
+            return ""
+        return (
+            "\n\n--- patch dry-run diagnostics ---\n\n"
+            + "\n\n".join(sections)
+            + "\n"
+        )
+
+    def _get_test_command(self, paths: Optional[List[str]] = None) -> List[str]:
         """Return PHPUnit command for Drupal projects.
 
-        Returns:
-            PHPUnit command list
+        When ``paths`` is non-empty, runs phpunit against just those
+        files/dirs — the changed-files scope, derived from the pre-task
+        SHA in ``BaseDeveloperAgent._derive_changed_test_paths``. This
+        keeps the verifier from blaming the current task for *prior*
+        tasks' broken tests.
+
+        When ``paths`` is ``None`` or empty, falls back to
+        ``web/modules/custom`` so implementation-only tasks (no test
+        files touched) still get a verifier signal. The broad scope
+        avoids ``--testsuite=unit`` for two reasons:
+
+          1. The developer agent only modifies code under
+             ``web/modules/custom`` — that's where its tests land, and
+             that's what the verifier should grade.
+          2. Running the full ``unit`` testsuite sweeps in contrib tests
+             whose autoload depends on modules the project doesn't
+             require (e.g. honeypot's tests reference ``drupal/rules``
+             classes; if rules isn't installed, PHPUnit dies before
+             running anything). That kills every task's verifier with
+             an error that has nothing to do with the developer's work.
+             Scoping to custom sidesteps the entire pollution problem.
+
+        Includes ``--log-junit`` so a structured error report is produced
+        alongside the human-readable output. The verifier loop reads this
+        file in ``_parse_test_output``.
         """
-        return ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+        cmd = ["vendor/bin/phpunit"]
+        cmd += list(paths) if paths else ["web/modules/custom"]
+        cmd += ["--no-coverage", f"--log-junit={_PHPUNIT_JUNIT_PATH}"]
+        return cmd
+
+    def _parse_test_output(
+        self, raw: str, return_code: int
+    ) -> List[StructuredError]:
+        """Parse PHPUnit output into structured errors.
+
+        We prefer the JUnit XML written by ``--log-junit``. When tests run on
+        the host the file is local and reachable; when tests run inside the
+        appserver container the host has no shared /tmp, so we return ``[]``
+        and let the static-check verifier (PHPStan + composer validate)
+        carry the structured signal for the refine prompt. This is an
+        acknowledged Phase 1 trade — Loop A still terminates correctly
+        because the cap is hard.
+        """
+        try:
+            xml_path = Path(_PHPUNIT_JUNIT_PATH)
+            if xml_path.exists():
+                return parse_phpunit_junit(xml_path.read_text())
+            logger.debug(
+                "PHPUnit JUnit XML not accessible at %s — returning [] for parser",
+                xml_path,
+            )
+        except OSError as e:
+            logger.debug("Could not read PHPUnit JUnit XML: %s", e)
+        return []
+
+    def run_static_checks(self, worktree_path: Path) -> Dict[str, Any]:
+        """Run PHPStan + composer validate inside the appserver container.
+
+        Mirrors ``validate_config``: when no container is attached we skip
+        gracefully (passed=True, structured_errors=[]). This treats a missing
+        environment as an env issue, not a code failure — Loop A only fails
+        when a verifier produces real errors.
+
+        Returns:
+            Dictionary matching ``run_tests`` shape (passed, test_results,
+            structured_errors, return_code).
+        """
+        if not self._env_manager or not self._env_ticket_id:
+            logger.warning("No container environment — skipping static checks")
+            return {
+                "passed": True,
+                "test_results": "Skipped (no container environment)",
+                "structured_errors": [],
+                "return_code": 0,
+            }
+
+        # Ensure composer deps + scaffold files are installed (PHPStan and
+        # composer validate both need vendor/).
+        self._ensure_composer_deps()
+
+        try:
+            phpstan = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=[
+                    "vendor/bin/phpstan",
+                    "analyse",
+                    "--error-format=json",
+                    "--no-progress",
+                    "web/modules/custom",
+                ],
+                workdir="/app",
+            )
+            composer = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=[
+                    "composer",
+                    "validate",
+                    "--strict",
+                    "--no-check-all",
+                ],
+                workdir="/app",
+            )
+        except Exception as e:
+            logger.error("Static check execution failed: %s", e)
+            return {
+                "passed": False,
+                "test_results": str(e),
+                "structured_errors": [],
+                "return_code": -1,
+            }
+
+        phpstan_errors = parse_phpstan_json(phpstan.stdout)
+        composer_errors = parse_composer_validate(
+            (composer.stdout or "") + (composer.stderr or "")
+        )
+
+        passed = (phpstan.returncode == 0) and (composer.returncode == 0)
+        combined_output = (
+            (phpstan.stdout or "")
+            + (phpstan.stderr or "")
+            + (composer.stdout or "")
+            + (composer.stderr or "")
+        )
+
+        return {
+            "passed": passed,
+            "test_results": combined_output,
+            "structured_errors": phpstan_errors + composer_errors,
+            "return_code": 0 if passed else 1,
+        }
 
     def _get_test_stub(self) -> str:
         """Return Drupal PHPUnit test stub.
