@@ -491,6 +491,103 @@ class TestContainerAwareTests:
         # Only 2 exec calls — no test execution attempted
         assert mock_env_mgr.exec.call_count == 2
 
+    def test_parse_test_output_reads_junit_from_container(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Env attached: _parse_test_output execs `cat` and parses XML."""
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "static_check_output"
+            / "phpunit_junit_fail.xml"
+        )
+        xml_content = fixture_path.read_text()
+
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.return_value = Mock(
+            success=True,
+            stdout=xml_content,
+            stderr="",
+            returncode=0,
+        )
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        errors = agent._parse_test_output(raw="ignored", return_code=1)
+
+        mock_env_mgr.exec.assert_called_once_with(
+            ticket_id="TEST-123",
+            service="appserver",
+            command=["cat", "/tmp/phpunit-junit.xml"],
+            workdir="/app",
+        )
+        # Fixture has 2 failures + 1 error => 3 structured entries.
+        assert len(errors) == 3
+        for entry in errors:
+            assert entry["file"]
+            assert entry["rule"]
+            assert entry["message"]
+            assert isinstance(entry["line"], int)
+
+    def test_parse_test_output_returns_empty_when_container_file_missing(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Env attached, JUnit XML missing in container: returns []."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.return_value = Mock(
+            success=False,
+            stdout="",
+            stderr="cat: /tmp/phpunit-junit.xml: No such file",
+            returncode=1,
+        )
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        errors = agent._parse_test_output(raw="", return_code=1)
+
+        assert errors == []
+        assert mock_env_mgr.exec.call_count == 1
+
+    def test_parse_test_output_returns_empty_when_exec_raises(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Env attached, exec raises RuntimeError: returns [] (no leak)."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.side_effect = RuntimeError(
+            "No active environment for TEST-123"
+        )
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        errors = agent._parse_test_output(raw="", return_code=1)
+
+        assert errors == []
+
+    def test_parse_test_output_falls_back_to_host_path_without_env(
+        self, mock_config, mock_agent_sdk, mock_prompt, tmp_path, monkeypatch
+    ):
+        """No env attached, host file exists: existing host-path read works."""
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "static_check_output"
+            / "phpunit_junit_fail.xml"
+        )
+        host_xml = tmp_path / "phpunit.xml"
+        host_xml.write_text(fixture_path.read_text())
+
+        monkeypatch.setattr(
+            "src.agents.drupal_developer._PHPUNIT_JUNIT_PATH",
+            str(host_xml),
+        )
+
+        agent = DrupalDeveloperAgent()
+        # No set_environment call — host fallback path.
+
+        errors = agent._parse_test_output(raw="", return_code=1)
+
+        assert len(errors) == 3
+
     # NOTE: previous test ``test_run_tests_strips_testsuite_when_suite_undefined``
     # was retired alongside switching the Drupal test command from
     # ``--testsuite=unit`` to a path-based scope (``web/modules/custom``).

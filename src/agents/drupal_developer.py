@@ -411,14 +411,45 @@ Execute this TDD cycle now. Use Read/Write/Edit tools for files and Bash for run
     ) -> List[StructuredError]:
         """Parse PHPUnit output into structured errors.
 
-        We prefer the JUnit XML written by ``--log-junit``. When tests run on
-        the host the file is local and reachable; when tests run inside the
-        appserver container the host has no shared /tmp, so we return ``[]``
-        and let the static-check verifier (PHPStan + composer validate)
-        carry the structured signal for the refine prompt. This is an
-        acknowledged Phase 1 trade — Loop A still terminates correctly
-        because the cap is hard.
+        We prefer the JUnit XML written by ``--log-junit``. Two cases:
+
+        * **Container path (env attached).** PHPUnit ran inside the
+          appserver container via ``EnvironmentManager.exec``, so the JUnit
+          XML lives at ``_PHPUNIT_JUNIT_PATH`` *inside* that container.
+          ``/app`` in the appserver is a *named Docker volume* (seeded
+          one-way from the worktree at setup), and ``/tmp`` isn't shared
+          either, so the host cannot path-read either location. We pull
+          the bytes back with ``exec(["cat", _PHPUNIT_JUNIT_PATH])`` and
+          feed them to ``parse_phpunit_junit``. If ``cat`` fails (file
+          missing, exec raises) we return ``[]`` so the verifier loop
+          gracefully degrades to static-check signal alone.
+        * **Host path (no env).** Tests ran on the host — ``--log-junit``
+          wrote to the host's filesystem and the existing
+          ``Path(...).exists()``/``read_text()`` block applies.
         """
+        if self._env_manager and self._env_ticket_id:
+            try:
+                result = self._env_manager.exec(
+                    ticket_id=self._env_ticket_id,
+                    service="appserver",
+                    command=["cat", _PHPUNIT_JUNIT_PATH],
+                    workdir="/app",
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not exec cat for PHPUnit JUnit XML: %s", e
+                )
+                return []
+            if result.returncode == 0 and result.stdout:
+                return parse_phpunit_junit(result.stdout)
+            logger.debug(
+                "PHPUnit JUnit XML not present in container at %s "
+                "(rc=%s) — returning [] for parser",
+                _PHPUNIT_JUNIT_PATH,
+                result.returncode,
+            )
+            return []
+
         try:
             xml_path = Path(_PHPUNIT_JUNIT_PATH)
             if xml_path.exists():
