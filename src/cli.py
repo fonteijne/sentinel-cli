@@ -9,7 +9,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import click
 
@@ -41,6 +41,9 @@ from src.core.persistence import apply_migrations, connect, list_postmortems
 from src.prompt_loader import get_prompt_loader
 from src.ticket_context import TicketContextBuilder
 from src.utils.adf_parser import parse_adf_to_text
+
+if TYPE_CHECKING:  # noqa: I001 -- forward-ref only, avoids runtime cost of learning import
+    from src.core.learning.outcome_sync import OutcomeSyncSummary
 
 
 def _verifier_loop_enabled() -> bool:
@@ -1818,30 +1821,26 @@ def _discover_known_projects(conn: sqlite3.Connection) -> list[str]:
     return [r[0] for r in rows]
 
 
-def _print_outcome_sync_summary(summary: object) -> None:
+def _print_outcome_sync_summary(summary: "OutcomeSyncSummary") -> None:
     """Pretty-print an ``OutcomeSyncSummary`` to stdout (Phase 3A).
 
-    Defensive ``getattr`` access keeps this helper decoupled from the
-    summary dataclass's import path — the CLI imports the service lazily
-    inside the subcommand body.
+    Field access is direct (``summary.mrs_seen``, not
+    ``getattr(summary, "mrs_seen", 0)``) so a future field rename in
+    ``OutcomeSyncSummary`` surfaces as ``AttributeError`` here instead of
+    silently rendering zeros. The parameter is typed via a
+    ``TYPE_CHECKING`` forward reference so mypy enforces the contract
+    statically without forcing ``cli.py`` to import the learning subsystem
+    at module-load time.
     """
-    project = getattr(summary, "project", "?")
-    mrs_seen = getattr(summary, "mrs_seen", 0)
-    executions_tagged = getattr(summary, "executions_tagged", 0)
-    tag_counts = getattr(summary, "tag_counts", {}) or {}
-    watermark = getattr(summary, "watermark_advanced_to", None)
-    errors = getattr(summary, "errors", []) or []
-    dry_run = getattr(summary, "dry_run", False)
-
-    suffix = " (dry-run)" if dry_run else ""
-    click.echo(f"📦 {project}{suffix}")
-    click.echo(f"   mrs_seen:          {mrs_seen}")
-    click.echo(f"   executions_tagged: {executions_tagged}")
-    if tag_counts:
-        for tag in sorted(tag_counts):
-            click.echo(f"     {tag}: {tag_counts[tag]}")
-    click.echo(f"   watermark_advanced_to: {watermark}")
-    for err in errors:
+    suffix = " (dry-run)" if summary.dry_run else ""
+    click.echo(f"📦 {summary.project}{suffix}")
+    click.echo(f"   mrs_seen:          {summary.mrs_seen}")
+    click.echo(f"   executions_tagged: {summary.executions_tagged}")
+    if summary.tag_counts:
+        for tag in sorted(summary.tag_counts):
+            click.echo(f"     {tag}: {summary.tag_counts[tag]}")
+    click.echo(f"   watermark_advanced_to: {summary.watermark_advanced_to}")
+    for err in summary.errors:
         click.echo(f"   ⚠ {err}", err=True)
 
 
