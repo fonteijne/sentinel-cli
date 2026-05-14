@@ -430,6 +430,55 @@ def _build_mr_description(
     return description
 
 
+def _assert_overlay_paths_clean(
+    repo_root: Path,
+    overlay_relpaths: list[Path],
+) -> None:
+    """Raise ``RuntimeError`` if any of the given overlay paths has uncommitted
+    modifications or is untracked.
+
+    Uses ``git status --porcelain --`` with explicit pathspecs so unrelated
+    dirt elsewhere in the tree does NOT block the proposer (e.g., the operator
+    may legitimately have unrelated WIP in ``src/`` or other non-overlay
+    files). Only modifications/untracked entries that match the supplied
+    overlay relpaths can block.
+
+    Untracked overlay files (porcelain ``?? <path>``) also block: we do not
+    want to commit something the operator has not yet decided to track.
+
+    Known limitation: porcelain v1 quotes paths containing special characters;
+    we use a simple ``line[3:].strip()`` slice (mirroring
+    ``src/worktree_manager.py``). Overlay paths today are ASCII, so this is
+    safe.
+    """
+    if not overlay_relpaths:
+        return
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--"]
+            + [str(p) for p in overlay_relpaths],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if e.stderr else ""
+        raise RuntimeError(
+            f"git status --porcelain failed in {repo_root}: {stderr}"
+        ) from e
+
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    if not stdout.strip():
+        return
+
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    blocking = ", ".join(sorted({line[3:].strip() for line in lines}))
+    raise RuntimeError(
+        f"propose_overlays: uncommitted changes in {blocking}; "
+        f"commit or stash first."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -479,10 +528,13 @@ def propose_overlays(
          when ``event_bus`` is provided.
 
     Constraints:
-      - The dry-run branch-revert step uses ``git branch -D`` which fails if
-        the working tree is dirty when we created the branch. Tests run on
-        clean tmp repos so this is fine. Production callers should run on a
-        clean Sentinel-repo working tree.
+      - **Pre-flight clean-tree check**: any overlay file that would be edited
+        must have NO uncommitted modifications and must NOT be untracked.
+        ``RuntimeError`` is raised before any git or filesystem mutation if
+        the check fails. The error message names every blocking path.
+      - The dry-run path explicitly restores each overlay file's pre-edit
+        bytes before reverting the branch — defense in depth against future
+        regressions in either the precondition check or git plumbing.
       - Push failures abort only this proposer run; un-mark_proposed'd rules
         remain promotable for the next run. The exception bubbles unchanged.
       - ``draft=True`` is hard-coded in the ``create_merge_request`` call.
@@ -508,6 +560,16 @@ def propose_overlays(
     rules_by_agent: dict[str, list[sqlite3.Row]] = {}
     for rule in rules:
         rules_by_agent.setdefault(rule["agent_target"], []).append(rule)
+
+    # H4 pre-flight: refuse to run if any overlay we would touch has
+    # uncommitted modifications. Branch-D revert (dry-run) and finally-block
+    # revert (H2) only undo branch-level state; they cannot recover a
+    # working-tree file the operator had not yet committed.
+    candidate_overlays = [
+        _overlay_relpath_for(scope, agent_target)
+        for agent_target in rules_by_agent
+    ]
+    _assert_overlay_paths_clean(repo_root, candidate_overlays)
 
     # Snapshot the operator's starting ref BEFORE any HEAD mutation. If this
     # raises, no checkout is attempted — the operator's tree is untouched.
@@ -537,6 +599,11 @@ def propose_overlays(
     # Map rule_id -> overlay_relpath so we can stamp mark_proposed later.
     overlay_by_rule_id: dict[int, Path] = {}
     edited_overlay_paths: list[Path] = []
+    # Belt-and-braces: capture each overlay's pre-edit bytes so the dry-run
+    # path can explicitly restore them before letting git plumbing revert.
+    # Layer-2 defense against silent overwrite (layer 1 is the pre-flight
+    # ``_assert_overlay_paths_clean`` above).
+    original_overlay_bytes: dict[Path, bytes] = {}
 
     # State contract: if any step below raises, we re-raise unchanged
     # (un-mark_proposed'd rules stay promotable, and we deliberately do NOT
@@ -550,6 +617,8 @@ def propose_overlays(
                 raise FileNotFoundError(
                     f"overlay {overlay_relpath} not found in repo {repo_root}"
                 )
+            overlay_abs = repo_root / overlay_relpath
+            original_overlay_bytes[overlay_relpath] = overlay_abs.read_bytes()
             bullets = [_render_rule_bullet(r, conn) for r in agent_rules]
             _apply_overlay_edit(repo_root, overlay_relpath, bullets)
             edited_overlay_paths.append(overlay_relpath)
@@ -557,6 +626,11 @@ def propose_overlays(
                 overlay_by_rule_id[r["id"]] = overlay_relpath
 
         if dry_run:
+            # Belt-and-braces: explicitly restore each overlay file's original
+            # bytes before letting git plumbing revert. Layer-2 defense
+            # against silent overwrite (layer 1 is the pre-flight check above).
+            for relpath, original in original_overlay_bytes.items():
+                (repo_root / relpath).write_bytes(original)
             # Revert the branch — tests verify no stale branch survives.
             subprocess.run(
                 ["git", "checkout", "-"],

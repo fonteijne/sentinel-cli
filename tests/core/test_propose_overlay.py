@@ -659,3 +659,138 @@ def test_restores_to_detached_head_when_started_detached(
     )
 
     assert _current_ref(tmp_repo) == sha
+
+
+def test_dry_run_refuses_when_overlay_is_dirty(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+) -> None:
+    """H4: pre-flight refuses to run when the overlay file we would touch
+    has uncommitted modifications. Operator's edits are preserved verbatim
+    and the error message names the blocking file."""
+    overlay_path = tmp_repo / "prompts" / "overlays" / "drupal_developer.md"
+    operator_edit = (
+        overlay_path.read_text(encoding="utf-8")
+        + "\n## My WIP section\n- handwritten note\n"
+    )
+    overlay_path.write_text(operator_edit, encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError, match=r"uncommitted changes in .*drupal_developer\.md"
+    ):
+        propose_overlays(
+            conn_with_promotable_rules,
+            gitlab_client=mock_gitlab,
+            repo_root=tmp_repo,
+            repo_project_path="sentinel-team/sentinel",
+            scope="drupal",
+            min_confidence=80,
+            dry_run=True,
+        )
+
+    # Operator's edits are preserved byte-for-byte.
+    assert overlay_path.read_text(encoding="utf-8") == operator_edit
+    # No branch was created.
+    assert all(
+        not b.startswith("sentinel-learning/promote-drupal-")
+        for b in _list_branches(tmp_repo)
+    )
+    # No GitLab call.
+    assert mock_gitlab.create_merge_request.call_count == 0
+
+
+def test_real_run_refuses_when_overlay_is_dirty(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H4: real-run also refuses on dirty tree (same precondition)."""
+    monkeypatch.setattr(
+        propose_module, "push_overlay_branch", _no_push_overlay_branch,
+    )
+    overlay_path = tmp_repo / "prompts" / "overlays" / "drupal_developer.md"
+    overlay_path.write_text(
+        overlay_path.read_text(encoding="utf-8") + "\n## WIP\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=r"uncommitted changes"):
+        propose_overlays(
+            conn_with_promotable_rules,
+            gitlab_client=mock_gitlab,
+            repo_root=tmp_repo,
+            repo_project_path="sentinel-team/sentinel",
+            scope="drupal",
+            min_confidence=80,
+        )
+    assert mock_gitlab.create_merge_request.call_count == 0
+
+
+def test_dry_run_leaves_overlay_file_byte_identical_on_clean_tree(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+) -> None:
+    """H4 layer-2: even on a clean tree, dry-run must leave the overlay
+    file byte-identical to its pre-run contents. Tests the explicit
+    restore path, not just the branch-revert side-effect."""
+    overlay_path = tmp_repo / "prompts" / "overlays" / "drupal_developer.md"
+    before = overlay_path.read_bytes()
+
+    results = propose_overlays(
+        conn_with_promotable_rules,
+        gitlab_client=mock_gitlab,
+        repo_root=tmp_repo,
+        repo_project_path="sentinel-team/sentinel",
+        scope="drupal",
+        min_confidence=80,
+        dry_run=True,
+    )
+    assert len(results) == 1
+
+    after = overlay_path.read_bytes()
+    assert before == after, "dry-run mutated the overlay file"
+
+
+def test_dry_run_refuses_when_overlay_is_untracked(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+) -> None:
+    """H4 edge case: if the overlay file is untracked (e.g. operator
+    drafted a new overlay variant but never `git add`'d it), porcelain
+    output shows `?? path` and we must still refuse. Defensive.
+
+    We exercise this by deleting the committed overlay and re-creating
+    it as untracked content — porcelain reports it as ``?? prompts/...``
+    but only AFTER we drop the deletion (otherwise the file appears as
+    ` D` deleted and the test would conflate the two cases).
+    """
+    overlay_relpath = Path("prompts") / "overlays" / "drupal_developer.md"
+    overlay_path = tmp_repo / overlay_relpath
+
+    # Remove and commit the deletion so the next write is genuinely untracked.
+    overlay_path.unlink()
+    subprocess.run(
+        ["git", "add", "-A"], cwd=tmp_repo, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "drop overlay"],
+        cwd=tmp_repo, check=True, capture_output=True,
+    )
+    # Re-create as untracked. The proposer's FileNotFoundError check would
+    # normally fire first if the file doesn't exist, so we DO write content
+    # — the file exists in the working tree but is untracked.
+    overlay_path.write_text("# operator's new draft overlay\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=r"uncommitted changes"):
+        propose_overlays(
+            conn_with_promotable_rules,
+            gitlab_client=mock_gitlab,
+            repo_root=tmp_repo,
+            repo_project_path="sentinel-team/sentinel",
+            scope="drupal",
+            min_confidence=80,
+            dry_run=True,
+        )
