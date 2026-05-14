@@ -1,5 +1,6 @@
 """Unit tests for GitLabClient."""
 
+import logging
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -795,6 +796,79 @@ class TestListMergedMrsSince:
                 gitlab_client.list_merged_mrs_since(
                     "acme/backend", updated_after="2026-01-01T00:00:00Z"
                 )
+
+    def test_safety_hatch_caps_pagination_at_max_pages(
+        self, gitlab_client, caplog
+    ):
+        """max_pages cap trips at exactly N pages; partial result + WARNING."""
+        def make_full_page():
+            m = Mock()
+            m.json.return_value = [
+                {"iid": i, "updated_at": "2026-01-01T00:00:00Z"}
+                for i in range(2)
+            ]
+            m.headers = {}  # no X-Total-Pages → forces fallback path
+            return m
+
+        with patch.object(
+            gitlab_client.session,
+            "get",
+            side_effect=lambda *a, **kw: make_full_page(),
+        ) as mock_get:
+            with caplog.at_level(logging.WARNING, logger="src.gitlab_client"):
+                result = gitlab_client.list_merged_mrs_since(
+                    "acme/backend",
+                    updated_after="2026-01-01T00:00:00Z",
+                    per_page=2,
+                    max_pages=5,
+                )
+
+        # Cap stops at exactly 5 pages, not 6.
+        assert mock_get.call_count == 5
+        # Partial result returned, not raised: 5 pages × 2 rows = 10.
+        assert len(result) == 10
+        # WARNING logged with project + safety-hatch context.
+        warning_records = [
+            r for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert len(warning_records) == 1
+        msg = warning_records[0].getMessage()
+        assert "max_pages safety hatch" in msg
+        assert "acme/backend" in msg
+
+    def test_default_max_pages_does_not_interfere_with_short_page_termination(
+        self, gitlab_client, caplog
+    ):
+        """Default max_pages=1000 doesn't fire on healthy 2-page response."""
+        # Page 1 returns exactly per_page=2 rows → must loop again.
+        page1 = Mock()
+        page1.json.return_value = [{"iid": 1}, {"iid": 2}]
+        page1.headers = {}  # no X-Total-Pages
+
+        # Page 2 returns 1 row (< per_page) → loop terminates naturally.
+        page2 = Mock()
+        page2.json.return_value = [{"iid": 3}]
+        page2.headers = {}
+
+        with patch.object(
+            gitlab_client.session, "get", side_effect=[page1, page2]
+        ) as mock_get:
+            with caplog.at_level(logging.WARNING, logger="src.gitlab_client"):
+                result = gitlab_client.list_merged_mrs_since(
+                    "acme/backend",
+                    updated_after="2026-01-01T00:00:00Z",
+                    per_page=2,
+                )
+
+        # Loop terminated naturally after 2 pages, NOT at max_pages=1000.
+        assert mock_get.call_count == 2
+        assert [mr["iid"] for mr in result] == [1, 2, 3]
+        # Negative-space: no safety-hatch WARNING fired on healthy response.
+        safety_hatch_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "safety hatch" in r.getMessage()
+        ]
+        assert len(safety_hatch_warnings) == 0
 
 
 class TestListPipelinesForCommit:

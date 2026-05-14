@@ -290,6 +290,7 @@ class GitLabClient:
         *,
         updated_after: str,
         per_page: int = 100,
+        max_pages: int = 1000,
     ) -> List[Dict[str, Any]]:
         """List merged MRs updated at or after ``updated_after`` (ISO-8601 UTC).
 
@@ -299,6 +300,32 @@ class GitLabClient:
 
         Pagination: walks `?page=N` until ``X-Total-Pages`` is exhausted (or, if
         that header is missing, until a page returns fewer than ``per_page`` rows).
+        A `max_pages` safety hatch (default 1000) bounds the loop so a misbehaving
+        reverse proxy stripping ``X-Total-Pages`` and replaying full pages cannot
+        wedge the CLI in an infinite loop.
+
+        Args:
+            project_id: GitLab project path (e.g. ``"acme/backend"``).
+            updated_after: ISO-8601 UTC watermark; only MRs with ``updated_at`` at
+                or after this are returned.
+            per_page: GitLab page size (default 100, GitLab max).
+            max_pages: Safety-hatch upper bound on pagination loops. Default 1000
+                (= 100 000 MRs at ``per_page=100``, two orders of magnitude above
+                any realistic project size). When the cap is hit, a ``WARNING``
+                is logged with full context (project, updated_after, page,
+                results-so-far) and the partial result is returned rather than
+                raised — ``OutcomeSyncService`` advances the watermark only past
+                handled MRs, so partial returns are safely idempotent and resume
+                cleanly on the next sync. Note: ``list_pipelines_for_commit`` is
+                a single-shot GET and needs no equivalent guard.
+
+        Returns:
+            List of merged MR dictionaries, ordered ``updated_at asc``. May be
+            partial if the ``max_pages`` safety hatch trips (a WARNING is logged
+            in that case).
+
+        Raises:
+            requests.HTTPError: If any page request fails.
         """
         project_path = project_id.replace("/", "%2F")
         url = f"{self.base_url}/api/v4/projects/{project_path}/merge_requests"
@@ -322,6 +349,17 @@ class GitLabClient:
                 if page >= int(total_pages_hdr):
                     break
             elif len(batch) < per_page:
+                break
+            if page >= max_pages:
+                logger.warning(
+                    "list_merged_mrs_since hit max_pages safety hatch: "
+                    "project=%s updated_after=%s page=%d max_pages=%d "
+                    "results_so_far=%d per_page=%d — returning partial "
+                    "result. This usually indicates a misbehaving reverse "
+                    "proxy stripping X-Total-Pages and replaying full pages.",
+                    project_id, updated_after, page, max_pages,
+                    len(results), per_page,
+                )
                 break
             page += 1
         return results
