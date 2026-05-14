@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from src.core.events import (
@@ -186,3 +187,56 @@ def test_ts_filled_when_empty() -> None:
     # datetime.fromisoformat handles "+00:00" suffix in 3.11+; raises if not ISO.
     parsed = datetime.fromisoformat(row["ts"])
     assert parsed.tzinfo is not None
+
+
+def test_concurrent_writers_do_not_collide_on_seq(tmp_path: Path) -> None:
+    """Two ``EventBus`` instances over the same DB file must produce a
+    contiguous, duplicate-free seq sequence — locks in M6 atomicity guarantee.
+    """
+    db_path = tmp_path / "events.db"
+
+    # Setup connection: apply migrations and create the parent execution row.
+    setup_conn = sqlite3.connect(str(db_path))
+    setup_conn.row_factory = sqlite3.Row
+    setup_conn.execute("PRAGMA foreign_keys=ON")
+    apply_migrations(setup_conn)
+    setup_conn.execute(
+        "INSERT INTO executions (id, ticket_id, kind, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("exec-1", "TICKET-1", "execute", "running", "2026-05-08T00:00:00+00:00"),
+    )
+    setup_conn.commit()
+    setup_conn.close()
+
+    # Two writer connections to the same DB file — schema already exists.
+    conn_a = sqlite3.connect(str(db_path))
+    conn_a.row_factory = sqlite3.Row
+    conn_a.execute("PRAGMA foreign_keys=ON")
+
+    conn_b = sqlite3.connect(str(db_path))
+    conn_b.row_factory = sqlite3.Row
+    conn_b.execute("PRAGMA foreign_keys=ON")
+
+    bus_a = EventBus(conn_a)
+    bus_b = EventBus(conn_b)
+
+    # Six interleaved publishes across the two writers. None should raise
+    # sqlite3.IntegrityError or any other exception.
+    for attempt, bus in enumerate((bus_a, bus_b, bus_a, bus_b, bus_a, bus_b), start=1):
+        bus.publish(
+            TestResultRecorded(
+                execution_id="exec-1",
+                passed=True,
+                attempt=attempt,
+                structured_errors_count=0,
+            )
+        )
+
+    rows = conn_a.execute(
+        "SELECT seq FROM events WHERE execution_id = ? ORDER BY seq",
+        ("exec-1",),
+    ).fetchall()
+
+    assert [row["seq"] for row in rows] == [1, 2, 3, 4, 5, 6]
+    # Clearer failure message if duplicates ever sneak in.
+    assert len({row["seq"] for row in rows}) == 6

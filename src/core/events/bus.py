@@ -4,7 +4,8 @@ Invariants (matches d75d276 commit-message contract; tests assert each):
   1. Persist FIRST: the row exists in ``events`` before any subscriber runs.
      A subscriber that queries the table for its own event must find it.
   2. ``seq`` is monotonic per ``execution_id`` (not global). Computed via
-     ``MAX(seq) + 1`` inside the same transaction as the INSERT.
+     ``MAX(seq) + 1`` *inside the INSERT statement itself* (single-statement
+     atomic), so two writers cannot collide on the PK.
   3. Subscriber exceptions are caught and logged, never propagated. One bad
      subscriber must not crash a run, and subsequent subscribers must still
      fire for the same event.
@@ -59,20 +60,14 @@ class EventBus:
 
         Steps:
           1. Fill ``ts`` if empty (UTC ISO-8601).
-          2. Compute next per-execution ``seq``.
-          3. Serialize payload; truncate marker if oversized.
-          4. INSERT and COMMIT.
-          5. Call subscribers; swallow + log exceptions individually.
+          2. Serialize payload; truncate marker if oversized.
+          3. INSERT in one statement that derives the next per-execution ``seq``
+             from ``MAX(seq)+1``, so two writer connections cannot race on the PK.
+             COMMIT.
+          4. Call subscribers; swallow + log exceptions individually.
         """
         if not event.ts:
             event.ts = datetime.now(timezone.utc).isoformat()
-
-        cursor = self._conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq "
-            "FROM events WHERE execution_id = ?",
-            (event.execution_id,),
-        )
-        next_seq = cursor.fetchone()[0]
 
         payload_json = event.model_dump_json()
         if len(payload_json.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
@@ -88,8 +83,16 @@ class EventBus:
 
         self._conn.execute(
             "INSERT INTO events (execution_id, seq, ts, agent, type, payload_json) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (event.execution_id, next_seq, event.ts, agent, event.type, payload_json),
+            "SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ? "
+            "FROM events WHERE execution_id = ?",
+            (
+                event.execution_id,
+                event.ts,
+                agent,
+                event.type,
+                payload_json,
+                event.execution_id,
+            ),
         )
         self._conn.commit()
 
