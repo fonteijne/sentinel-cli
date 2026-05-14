@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="Example Module" tests="3" assertions="3" errors="1" failures="2" skipped="0" time="0.234567">
+    <testsuite name="Drupal\Tests\example\Unit\ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" tests="3" assertions="3" errors="1" failures="2" skipped="0" time="0.234567">
+      <testcase name="testDoThingHappyPath" class="Drupal\Tests\example\Unit\ExampleServiceTest" classname="Drupal.Tests.example.Unit.ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" line="22" assertions="1" time="0.080000">
+        <failure type="PHPUnit\Framework\ExpectationFailedException">Failed asserting that 'old' matches expected 'new'.
+
+/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php:30</failure>
+      </testcase>
+      <testcase name="testDoThingHandlesEmpty" class="Drupal\Tests\example\Unit\ExampleServiceTest" classname="Drupal.Tests.example.Unit.ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" line="38" assertions="1" time="0.080000">
+        <failure type="PHPUnit\Framework\ExpectationFailedException">Failed asserting that null is not null.
+
+/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php:45</failure>
+      </testcase>
+      <testcase name="testLoad" class="Drupal\Tests\example\Unit\ExampleServiceTest" classname="Drupal.Tests.example.Unit.ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" line="55" assertions="1" time="0.074567">
+        <error type="TypeError">TypeError: Drupal\example\Service\ExampleService::load(): Argument #1 ($id) must be of type int, string given.
+
+/app/web/modules/custom/example/src/Service/ExampleService.php:71</error>
+      </testcase>
+    </testsuite>
+  </testsuite>
+</testsuites>

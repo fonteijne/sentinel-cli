@@ -9,6 +9,8 @@ Sysbox (Phase 2) without changes to the execute flow.
 """
 
 import logging
+import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -152,6 +154,13 @@ class EnvironmentManager:
 
         # Stop and remove containers + volumes
         result = runner.down(volumes=True)
+
+        # Remove the per-ticket projects volume. Compose's --volumes only
+        # cleans up compose-managed volumes; ours is declared external,
+        # so we remove it explicitly. Best-effort — _remove_volume logs
+        # rather than raises if the volume is in use or already gone.
+        self._remove_volume(self._volume_name_for(ticket_id))
+
         if not result.success:
             logger.error(f"Teardown failed for {ticket_id}: {result.stderr}")
             # Try to clean up orphans as fallback
@@ -243,10 +252,26 @@ class EnvironmentManager:
         """
         return self._environments.get(ticket_id)
 
+    @staticmethod
+    def _volume_name_for(ticket_id: str) -> str:
+        """Construct a per-ticket project volume name.
+
+        Each ticket gets its own ``sentinel-projects-<slug>`` volume,
+        seeded fresh from the worktree on every setup. This replaces the
+        previous shared ``sentinel-projects`` volume, which silently
+        drifted: populated once, never refreshed, so ``composer install``
+        in the appserver kept reading a stale ``composer.lock`` regardless
+        of what the worktree on disk actually contained.
+
+        Slug rules: lowercased; characters outside ``[a-z0-9_-]`` collapsed
+        to ``-``. Docker volume names accept ``[a-zA-Z0-9][a-zA-Z0-9_.-]*``,
+        so this is a strict subset.
+        """
+        slug = re.sub(r"[^a-z0-9_-]", "-", ticket_id.lower())
+        return f"sentinel-projects-{slug}"
+
     def _ensure_volume_exists(self, volume_name: str) -> None:
         """Ensure a Docker named volume exists, creating it if needed."""
-        import subprocess
-
         result = subprocess.run(
             ["docker", "volume", "inspect", volume_name],
             capture_output=True,
@@ -263,6 +288,89 @@ class EnvironmentManager:
                 raise RuntimeError(
                     f"Failed to create volume '{volume_name}': {create_result.stderr}"
                 )
+
+    def _seed_volume(self, worktree_path: Path, volume_name: str) -> None:
+        """Wipe and re-seed the per-ticket project volume from the worktree.
+
+        Worktrees live in sentinel-dev's container filesystem and are not
+        directly visible to the host docker daemon (we run via DooD). We
+        bridge that gap by tarring the worktree from sentinel-dev's local
+        FS and piping the stream into a helper container that has the
+        volume mounted — the tar extraction lands in the volume, which the
+        appserver subsequently sees as ``/app``.
+
+        The volume is wiped before extraction so that its contents reflect
+        the current worktree exactly, never a merge of past state and
+        current. This is the property that prevents lockfile drift: every
+        ``composer install`` reads the lockfile that's actually on the
+        branch right now.
+        """
+        self._ensure_volume_exists(volume_name)
+
+        logger.info(
+            f"Seeding volume '{volume_name}' from {worktree_path} "
+            "(wipe + recopy)"
+        )
+
+        tar_proc = subprocess.Popen(
+            ["tar", "-cf", "-", "-C", str(worktree_path), "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        docker_proc = subprocess.Popen(
+            [
+                "docker", "run", "--rm", "-i",
+                "-v", f"{volume_name}:/dst",
+                "alpine",
+                "sh", "-c",
+                # Wipe both regular and dotfile entries; suppress "no match"
+                # noise from the second glob if the volume was empty.
+                "rm -rf /dst/* /dst/.[!.]* 2>/dev/null; tar -xf - -C /dst",
+            ],
+            stdin=tar_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Allow tar to receive SIGPIPE if docker exits early.
+        if tar_proc.stdout is not None:
+            tar_proc.stdout.close()
+
+        docker_out, docker_err = docker_proc.communicate()
+        tar_proc.wait()
+        tar_err = b""
+        if tar_proc.stderr is not None:
+            tar_err = tar_proc.stderr.read()
+            tar_proc.stderr.close()
+
+        if docker_proc.returncode != 0 or tar_proc.returncode != 0:
+            raise RuntimeError(
+                f"Failed to seed volume '{volume_name}': "
+                f"tar rc={tar_proc.returncode}, "
+                f"docker rc={docker_proc.returncode}; "
+                f"tar stderr={tar_err.decode('utf-8', errors='replace').strip()}; "
+                f"docker stderr={docker_err.decode('utf-8', errors='replace').strip()}"
+            )
+
+        logger.info(f"Volume '{volume_name}' seeded successfully")
+
+    def _remove_volume(self, volume_name: str) -> None:
+        """Best-effort removal of a per-ticket volume after teardown.
+
+        Compose's ``down --volumes`` only cleans up compose-managed
+        volumes; the project volume is declared ``external: true``, so we
+        remove it explicitly. If removal fails (volume still attached, or
+        already gone), we log and continue — failing teardown over a
+        stranded volume isn't worth it.
+        """
+        result = subprocess.run(
+            ["docker", "volume", "rm", volume_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"Could not remove volume '{volume_name}': {result.stderr.strip()}"
+            )
 
     def _setup_lando(
         self,
@@ -283,7 +391,11 @@ class EnvironmentManager:
         Raises:
             RuntimeError: If setup fails
         """
-        volume_name = env_config.get("volume_name", "sentinel-projects")
+        # Per-ticket volume name. The legacy "sentinel-projects" key in
+        # env_config is ignored — it pointed at a shared volume that
+        # silently drifted across runs. We construct a fresh per-ticket
+        # name and seed it from the worktree below.
+        volume_name = self._volume_name_for(ticket_id)
         health_timeout = env_config.get("health_timeout", 120)
 
         # Find Lando config
@@ -304,8 +416,12 @@ class EnvironmentManager:
 
         logger.info(f"Generated {compose_file}")
 
-        # Ensure the shared volume exists before starting services
-        self._ensure_volume_exists(volume_name)
+        # Seed the per-ticket volume from the worktree BEFORE bringing
+        # services up. The appserver mounts this volume as /app, so
+        # anything not in the volume at this point is invisible to
+        # composer/drush/phpunit. Wipe-and-recopy guarantees /app reflects
+        # the worktree exactly — no inheritance from prior runs.
+        self._seed_volume(worktree_path, volume_name)
 
         # Create compose runner
         project_name = f"sentinel-{ticket_id}".lower()
@@ -315,6 +431,9 @@ class EnvironmentManager:
         logger.info(f"Starting services for {ticket_id}")
         result = runner.up()
         if not result.success:
+            # Remove the seeded volume so a retry starts clean (otherwise
+            # it leaks until the next teardown of this ticket).
+            self._remove_volume(volume_name)
             raise RuntimeError(
                 f"Failed to start services for {ticket_id}: {result.stderr}"
             )
@@ -328,8 +447,10 @@ class EnvironmentManager:
                     logs = runner.logs(service=svc.name, tail=20)
                     logger.error(f"Service {svc.name} ({svc.state}/{svc.health}): {logs.stdout}")
 
-            # Clean up on failure
+            # Clean up on failure — compose down + remove per-ticket volume
+            # so a retry starts from a clean slate (no half-populated /app).
             runner.down(volumes=True)
+            self._remove_volume(volume_name)
             raise RuntimeError(
                 f"Services failed to become healthy for {ticket_id} "
                 f"(timeout: {health_timeout}s)"

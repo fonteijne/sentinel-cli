@@ -1,0 +1,182 @@
+# Decisions — Agent Learning from Feedback
+
+**Companions:**
+- Design: [`agent-learning-from-feedback-2026-05-03.md`](./agent-learning-from-feedback-2026-05-03.md)
+- Handover: [`agent-learning-from-feedback-HANDOVER.md`](./agent-learning-from-feedback-HANDOVER.md)
+
+Append-only log. Each entry resolves an open question from the handover §5 or a later design question. Do not mutate past entries; supersede with a new one if a decision changes.
+
+---
+
+## D1 — Loop A retry cap: global N=3 for Phase 1
+
+**Date:** 2026-05-05
+**Resolves:** Handover §5 Q1
+**Status:** Accepted
+
+**Context.** Design §5.1 Loop A specifies a hard cap of N=3 retries inside the developer Karpathy loop. Question was whether to allow a per-stack override (Drupal tests are slower and sometimes flaky on a recoverable first pass).
+
+**Decision.** Ship Phase 1 with a single global `N=3`. Revisit after cap-hit telemetry is available.
+
+**Revisit condition.** If ≥20% of Drupal executions cap out at N=3 and postmortems show the 4th attempt would have passed on a meaningful fraction, add a per-stack override. Metric lives in the Phase 1 exit telemetry (handover §7 — cap-hit rate).
+
+**Implementation note.** Keep the cap as a single named constant, not scattered. A future per-stack dict is a one-line change if needed.
+
+---
+
+## D2 — FeedbackDistiller model: `claude-4-5-haiku`
+
+**Date:** 2026-05-05
+**Resolves:** Handover §5 Q2
+**Status:** Accepted
+
+**Context.** Distiller (Appendix C.2) is invoked per unresolved MR comment. Strict JSON output, temperature=0. Design suggested Haiku for cost.
+
+**Decision.** Use `claude-4-5-haiku` for the distiller. No Sonnet fallback in Phase 2.
+
+**Rationale.** Distillation is a classification + slot-filling task with a tightly bounded output schema — Haiku's known comfort zone. Cost matters because the distiller runs on every MR comment, not every execution. Sonnet fallback adds runtime complexity that we haven't justified with data.
+
+**Revisit condition.** If distiller-produced `signature_slug` collisions or scope misclassifications are caught in `sentinel rules` audits at a rate > 5%, consider the Sonnet fallback.
+
+**Implementation note.** Model string is stored in `feedback_observations.distiller_model` so re-distillation with a different model is a supported audit operation (Appendix C.8).
+
+---
+
+## D3 — Probation rules injection: inject with `[probation]` tag, flag-gated
+
+**Date:** 2026-05-05
+**Resolves:** Handover §5 Q3
+**Status:** Accepted
+
+**Context.** Rules at `status='probation'` have crossed ingest but not promotion thresholds (Appendix C.4 / C.6). Question: inject them into agent prompts as tentative hints, or hold back entirely until promoted.
+
+**Decision.** Inject probation rules into the "Known pitfalls" section with an explicit `[probation]` tag. Gate behind a feature flag (working name `PROBATION_INJECTION=true`, default on) so we can disable without a code change if drift shows up.
+
+**Rationale.** Maximizes learning speed — new rules start influencing behavior immediately. The tag tells the agent the rule is tentative (via a `shared/base_instructions.md` clause: "`[probation]`-tagged rules are hints, not policy — apply judgment"). The flag is the kill switch if injecting probation rules turns out to encode bad habits.
+
+**Revisit condition.** If postmortems trace bad behavior back to a probation rule that was later revoked, flip the default off and require explicit opt-in per stack.
+
+**Implementation notes.**
+- The `shared/base_instructions.md` addition must be written as part of Phase 2 (when retrieval injection lands), not Phase 1.
+- Retrieval query (§D.4 of the design doc) already includes `status IN ('active', 'probation')` — no schema change needed.
+- Flag is read at prompt-build time in `prompt_loader.load()`, not cached into the execution snapshot, so toggling takes effect on the next execution.
+
+---
+
+## D4 — Widening PR location/approver: Sentinel repo, Sentinel maintainer, always-draft, never-auto-merge
+
+**Date:** 2026-05-05 (deferred); resolved 2026-05-09 (Phase 2C kickoff)
+**Resolves:** Handover §5 Q4
+**Status:** Accepted
+
+**Context.** When a `project:<KEY>` rule earns its way to `<stack>` scope (Appendix D.3), an overlay PR opens somewhere and someone approves it. Design proposed Sentinel repo + Sentinel maintainer.
+
+**Revisit trigger (now triggered).** Starting work on Phase 2 task "Overlay PR proposer" (handover §8 / design §8 task 11). The `sentinel-distiller-expert` and `sentinel-cli-rules-expert` agents block on this decision.
+
+**Decision.**
+1. **Target repo: the Sentinel repo (this repo), not the originating project.** The overlay files (`prompts/overlays/<stack>_*.md`) live here, so the PR must land here.
+2. **Approver: the Sentinel maintainer pool.** The originating project's reviewer does NOT block. Distinct projects fed evidence into the cluster, but the durable rule travels with Sentinel itself.
+3. **MR is always `draft=True` on creation.** The proposer never un-drafts. Merge is a human action — `sentinel learning mark-merged <rule_id> --sha <sha> --by <user>` flips persistence state from `probation` → `active` after the human merges in GitLab. (Mirrors D7 — never un-draft incomplete or unverified work.)
+4. **No automatic widening from `project:<KEY>` to `<stack>` in Phase 2C.** Project-scoped rules (`project:<KEY>` scope) are out of Phase 2C scope (Appendix D, future phase). Phase 2C only promotes `<stack>`-scoped rules from `feedback_rules.status='probation'` to a draft overlay PR.
+5. **When the project-scoped path lands (future phase), this decision is revisited only for the `project → stack` widening flow.** The mechanism here (target = Sentinel repo, approver = maintainer pool, always-draft) remains unchanged.
+
+**Implementation pointer.** `src/core/learning/propose_overlay.py` reads target from config key `sentinel.repo_project_path` (e.g. `"sentinel-team/sentinel"`). The proposer fails loudly with exit 1 if the key is missing AND `OVERLAY_PROPOSER_ENABLED=1`.
+
+---
+
+## D5 — Overlay character cap: PR-review discipline, no CI check
+
+**Date:** 2026-05-05
+**Resolves:** Handover §5 Q5
+**Status:** Accepted for Phase 1/2
+
+**Context.** Design §9 flagged overlay bloat as a real risk (e.g. `drupal_plan_generator.md` drifting from 137 → 600+ lines). Question: committed CI check with a hard cap, a soft warning, or just reviewer discipline.
+
+**Decision.** Phase 1 and Phase 2: PR-review discipline only. No CI job. The `sentinel-learning-reviewer` agent (handover §6) explicitly checks overlay deltas as part of its pre-merge invocation policy.
+
+**Rationale.** Prompt budget is already enforced at prompt-build time (Appendix E.8 — `PromptBudgetExceeded` event with deterministic truncation). A CI cap on the source file would be a second, weaker enforcement layer that adds tuning friction. Reviewer eyes catch bloat earlier, with context about whether growth is earned.
+
+**Revisit condition.** If overlay files exceed their §E.8 token allocation on ≥2 occasions and truncation starts dropping rules the team wanted kept, introduce a CI soft-warning job (not a hard fail).
+
+**Implementation note.** Add overlay-size scrutiny to the reviewer agent's prompt when that agent is written.
+
+---
+
+## D6 — `project_sync_state` watermark: per Sentinel installation
+
+**Date:** 2026-05-05
+**Resolves:** Handover §5 Q6
+**Status:** Accepted
+
+**Context.** Phase 3 introduces pull-on-demand outcome ingestion (design §10, task 14) with a new `project_sync_state(project, last_synced_at, last_seen_mr_iid)` table to avoid re-paginating GitLab on every run. Question: one watermark per Sentinel installation (dev/staging/prod each track their own) or one watermark per GitLab repo shared across installations.
+
+**Decision.** Per Sentinel installation. Each instance's SQLite DB holds its own watermark row per project.
+
+**Rationale.** Shared watermark would require cross-instance coordination to advance safely; if two instances both ingest the same project, one would race past the other. Per-installation avoids the coordination problem entirely at the cost of a small amount of duplicated GitLab API traffic if multiple instances track the same project — which is not the common case.
+
+**Revisit condition.** If multiple production Sentinel instances end up tracking overlapping project sets and GitLab rate-limit pressure becomes real, consider a shared watermark behind a coordination primitive (advisory lock or `UPDATE ... WHERE last_seen_mr_iid < :new_iid`).
+
+**Implementation notes.**
+- The `sentinel outcomes sync [--project X] [--since DATE] [--all]` CLI (design §10 task 14) is already in scope — fresh installations use `--all` or `--since` to backfill rather than inheriting another instance's watermark.
+- Schema stays as specified in the design: no `installation_id` column. The DB file itself identifies the installation.
+
+---
+
+## D7 — On cap-out, the MR stays (or reverts to) draft; never un-draft incomplete work
+
+**Date:** 2026-05-05
+**Resolves:** Ambiguity in design §5.1 Loop E ("un-un-draft so humans see it" — double negative, unclear intent).
+**Status:** Accepted
+
+**Context.** When Loop A caps out at N=3 (D1), the implementation is known-broken. The original design-doc wording for the escalation step was ambiguous about the MR's draft status. One reading said "un-draft" (mark ready for review), the other said "re-draft" (revert to draft). Shipping the wrong reading would page reviewers on every cap-out and train them to ignore the signal.
+
+**Decision.** On cap-out, the MR is in draft state when the escalation finishes. Concretely:
+- If the MR is already a draft, leave it alone.
+- If a prior successful phase un-drafted it, revert it to draft before posting the escalation comment.
+- Never un-draft on cap-out, even partially, even as a "hint."
+
+The escalation surface is the "Sentinel paused here" comment plus assignee notification — not MR visibility state.
+
+**Rationale.** Reviewer attention is a finite resource and a recurring theme in the risk register (handover §10). Un-drafting known-broken work would signal "ready for review" when the code doesn't work. Over time this erodes trust in Sentinel's draft-status signal — reviewers would learn to distrust it and either check every draft (wasted effort) or ignore all un-drafts (missed completions). Neither is acceptable. Keeping draft state truthful — *un-drafted only when the work is ready* — is the only stable equilibrium.
+
+**Revisit condition.** If a future workflow intentionally uses un-drafted-but-known-incomplete MRs as a coordination signal (e.g., "assign to reviewer for design feedback before implementation is done"), revisit. That's a different UX than "cap-out" and deserves its own ADR, not a carve-out here.
+
+**Implementation notes.**
+- `src/core/execution/post_execute.py` already has an un-draft path on the happy flow (handover §9 pointer). The escalation path adds a symmetric "ensure-draft" step guarded on cap-out.
+- The `sentinel-verifier-loop-expert` agent's spec already says "emit, do NOT burn more tokens." The `DeveloperCappedOut` subscriber owns the draft-reassertion logic, not the loop itself.
+- Tests (owned by `sentinel-test-harness-expert`): on cap-out fixture, assert the MR's draft status is `true` after escalation regardless of its state before.
+
+---
+
+## D8 — MR comments: none on Loop A retries; one per Loop C reviewer handoff
+
+**Date:** 2026-05-05
+**Resolves:** MR-comment volume policy (not previously in the design doc).
+**Status:** Accepted
+
+**Context.** The question came up whether to post progress comments on the MR for each Loop A retry (e.g. "attempt 2 of 3: still red on test_foo"). A parallel question applies to Loop C — when a reviewer veto escalates back to the planner or developer, does that generate a comment?
+
+The two loops have very different economics:
+
+| | Loop A (verifier retry) | Loop C (reviewer handoff) |
+|---|---|---|
+| Frequency | Fires on most executions | Fires only on reviewer vetoes |
+| Resolution rate | Usually self-resolves by attempt 2–3 | Represents a real inflection; always meaningful |
+| Comment volume | 1–3 per execution × every execution | 0–2 per execution, only when something went wrong |
+| Reader value | Low — "tests are still failing" is low-signal | High — "reviewer said X, now planner re-runs" is the decision |
+
+**Decision.**
+- **Loop A retries emit no MR comments.** The retries are internal state. Only the terminal signals are visible: the cap-out escalation (D7 / design §5.1 Loop E) on failure, or the successful MR push on pass.
+- **Loop C reviewer handoffs emit one concise MR comment per handoff.** Format: one line, imperative, naming the reviewer, the finding class (not the full finding text), and the next actor. Example: *"Drupal Reviewer found 2 blockers (service-injection, missing hook). Re-running Planner."*
+
+**Rationale.** Same principle as D7: reviewer attention is finite, and bot comments that reviewers learn to filter out erode the signal of bot comments that *should* interrupt them. Loop A would be low-signal on most executions — tests that fail then pass on retry don't need a human. Loop C is always meaningful because the reviewer agent has already decided the work is blocked.
+
+**Revisit conditions.**
+- If Loop A failures turn out to be hard to debug without a per-retry trace, consider adding a **single edit-in-place comment** (one comment per execution, updated on each retry) rather than per-retry new comments. This was considered and deferred; it has the live-trace value without the notification spam.
+- If Loop C comments themselves become noisy (e.g. re-runs happen often enough that a single MR accumulates 5+ handoff comments), consider collapsing into a single update-in-place comment for Loop C as well.
+
+**Implementation notes.**
+- Loop C is Phase 2 (design §8 task 12); this ADR is forward-looking and binds that work.
+- The subscriber posting the Loop C comment lives alongside existing post-exec hooks in `src/core/execution/post_execute.py` (handover §9 pointer), subscribing to whatever event marks a reviewer handoff (likely a new `ReviewerHandoffTriggered` — integrator territory).
+- Comment format is a one-line template; the distilled finding class comes from the reviewer's output schema, not free-form text. No paraphrasing of the reviewer's original comment (consistent with Decision 10).
+- Tests (`sentinel-test-harness-expert`): integration test asserts zero MR comments on a Loop A cap-avoidance fixture (retries then passes); and exactly one comment per handoff on a Loop C fixture.

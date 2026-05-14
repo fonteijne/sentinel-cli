@@ -1,0 +1,8 @@
+./composer.json is valid for simple usage with Composer but has
+strict errors that make it unable to be published as a package
+# General errors
+- License "Proprietary-Custom" is not a valid SPDX license identifier, see https://spdx.org/licenses/ if you use an open-source license.
+# Publish errors
+ERROR: Required package "drupal/core" is missing a version constraint.
+# Warnings
+WARNING: The package name "MyOrg/example_module" is invalid; it must be all lowercase.

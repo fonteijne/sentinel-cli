@@ -1,0 +1,42 @@
+{
+  "totals": {
+    "errors": 0,
+    "file_errors": 4
+  },
+  "files": {
+    "/app/web/modules/custom/example/src/Controller/ExampleController.php": {
+      "errors": 2,
+      "messages": [
+        {
+          "message": "Call to an undefined method Drupal\\example\\Service\\ExampleService::doThing().",
+          "line": 42,
+          "ignorable": true,
+          "identifier": "method.notFound"
+        },
+        {
+          "message": "Parameter #1 $id of method Drupal\\example\\Service\\ExampleService::load() expects int, string given.",
+          "line": 57,
+          "ignorable": true,
+          "identifier": "argument.type"
+        }
+      ]
+    },
+    "/app/web/modules/custom/example/src/Plugin/Block/ExampleBlock.php": {
+      "errors": 2,
+      "messages": [
+        {
+          "message": "Access to an undefined property Drupal\\example\\Plugin\\Block\\ExampleBlock::$config.",
+          "line": 18,
+          "ignorable": true,
+          "level": "5"
+        },
+        {
+          "message": "Function example_legacy_helper not found.",
+          "line": 91,
+          "ignorable": true
+        }
+      ]
+    }
+  },
+  "errors": []
+}

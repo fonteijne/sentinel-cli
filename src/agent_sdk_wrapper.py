@@ -46,6 +46,26 @@ class AgentSDKWrapper:
         self.temperature = agent_config.get("temperature", 0.2)
         self.allowed_tools = self._get_allowed_tools(self.agent_name)
 
+        # Cancellation seam (Phase 2B Task 8): allows callers to signal an
+        # in-flight ``client.receive_response()`` loop to stop on its next
+        # message and to wait for the stream to drain before mutating session
+        # state. Defensive — synchronous resets in the planner today never
+        # race with a live stream because the wrapper has already exited its
+        # ``async with`` block, but the seam guards against future async
+        # interleaving.
+        self._stream_active: bool = False
+        self._cancel_requested: bool = False
+
+    def request_cancel(self) -> None:
+        """Signal the in-flight stream loop (if any) to stop on its next message."""
+        self._cancel_requested = True
+
+    async def wait_for_idle(self, timeout: float = 5.0) -> None:
+        """Poll _stream_active until False or timeout. Returns silently on timeout."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while self._stream_active and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+
     def set_project(self, project: str) -> None:
         """Set the project key for session tracking.
 
@@ -338,57 +358,72 @@ class AgentSDKWrapper:
         sdk_start = time.monotonic()
         logger.info(f"[{self.agent_name}] Opening ClaudeSDKClient (model={self.model})...")
 
-        async with ClaudeSDKClient(options=options) as client:
-            logger.info(f"[{self.agent_name}] Client opened ({time.monotonic() - sdk_start:.1f}s), sending query ({len(prompt)} chars)...")
-            query_start = time.monotonic()
-            await client.query(prompt)
-            logger.info(f"[{self.agent_name}] Query sent ({time.monotonic() - query_start:.1f}s), waiting for response stream...")
+        # Cancellation seam (Phase 2B Task 8): mark stream active for the
+        # duration of the receive_response loop so synchronous callers using
+        # ``_safe_reset_session`` can wait for drain before zeroing session
+        # state. Reset ``_cancel_requested`` per stream so a stale flag from
+        # a previous run cannot abort the new one.
+        self._cancel_requested = False
+        self._stream_active = True
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                logger.info(f"[{self.agent_name}] Client opened ({time.monotonic() - sdk_start:.1f}s), sending query ({len(prompt)} chars)...")
+                query_start = time.monotonic()
+                await client.query(prompt)
+                logger.info(f"[{self.agent_name}] Query sent ({time.monotonic() - query_start:.1f}s), waiting for response stream...")
 
-            stream_start = time.monotonic()
-            last_heartbeat = stream_start
-            msg_count = 0
-            text_chars = 0
-            async for message in client.receive_response():
-                msg_count += 1
-                now = time.monotonic()
+                stream_start = time.monotonic()
+                last_heartbeat = stream_start
+                msg_count = 0
+                text_chars = 0
+                async for message in client.receive_response():
+                    if self._cancel_requested:
+                        logger.info(
+                            f"[{self.agent_name}] Cancellation requested — breaking receive_response loop"
+                        )
+                        break
+                    msg_count += 1
+                    now = time.monotonic()
 
-                # Heartbeat: log progress every 30s during long generation
-                if now - last_heartbeat >= 30:
-                    elapsed = now - stream_start
-                    logger.info(
-                        f"[{self.agent_name}] ♥ alive: {elapsed:.0f}s, "
-                        f"{msg_count} msgs, {len(tool_uses)} tools, "
-                        f"{text_chars} text chars so far"
-                    )
-                    last_heartbeat = now
+                    # Heartbeat: log progress every 30s during long generation
+                    if now - last_heartbeat >= 30:
+                        elapsed = now - stream_start
+                        logger.info(
+                            f"[{self.agent_name}] ♥ alive: {elapsed:.0f}s, "
+                            f"{msg_count} msgs, {len(tool_uses)} tools, "
+                            f"{text_chars} text chars so far"
+                        )
+                        last_heartbeat = now
 
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            responses.append(block.text)
-                            text_chars += len(block.text)
-                            elapsed_in_stream = now - stream_start
-                            logger.debug(
-                                f"[{self.agent_name}] Text block ({len(block.text)} chars, "
-                                f"{elapsed_in_stream:.1f}s into stream)"
-                            )
-                        elif isinstance(block, ToolUseBlock):
-                            elapsed_in_stream = now - stream_start
-                            tool_uses.append({
-                                "tool": block.name,
-                                "input": block.input
-                            })
-                            input_preview = str(block.input.get("command", block.input))[:200] if isinstance(block.input, dict) else str(block.input)[:200]
-                            logger.info(f"[{self.agent_name}] Tool use: {block.name} ({elapsed_in_stream:.1f}s into stream) - {input_preview}")
-                            self._write_diagnostic("tool_use", {
-                                "tool": block.name,
-                                "input": block.input if isinstance(block.input, dict) else str(block.input),
-                                "tool_index": len(tool_uses),
-                                "elapsed_s": round(elapsed_in_stream, 1),
-                            }, cwd=cwd)
-                # Extract session ID from ResultMessage
-                if hasattr(message, 'session_id'):
-                    final_session_id = message.session_id
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                responses.append(block.text)
+                                text_chars += len(block.text)
+                                elapsed_in_stream = now - stream_start
+                                logger.debug(
+                                    f"[{self.agent_name}] Text block ({len(block.text)} chars, "
+                                    f"{elapsed_in_stream:.1f}s into stream)"
+                                )
+                            elif isinstance(block, ToolUseBlock):
+                                elapsed_in_stream = now - stream_start
+                                tool_uses.append({
+                                    "tool": block.name,
+                                    "input": block.input
+                                })
+                                input_preview = str(block.input.get("command", block.input))[:200] if isinstance(block.input, dict) else str(block.input)[:200]
+                                logger.info(f"[{self.agent_name}] Tool use: {block.name} ({elapsed_in_stream:.1f}s into stream) - {input_preview}")
+                                self._write_diagnostic("tool_use", {
+                                    "tool": block.name,
+                                    "input": block.input if isinstance(block.input, dict) else str(block.input),
+                                    "tool_index": len(tool_uses),
+                                    "elapsed_s": round(elapsed_in_stream, 1),
+                                }, cwd=cwd)
+                    # Extract session ID from ResultMessage
+                    if hasattr(message, 'session_id'):
+                        final_session_id = message.session_id
+        finally:
+            self._stream_active = False
 
         total_elapsed = time.monotonic() - sdk_start
         logger.info(f"[{self.agent_name}] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {total_elapsed:.1f}s total")

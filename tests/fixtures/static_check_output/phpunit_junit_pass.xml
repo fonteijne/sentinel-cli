@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="Example Module" tests="3" assertions="5" errors="0" failures="0" skipped="0" time="0.123456">
+    <testsuite name="Drupal\Tests\example\Unit\ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" tests="3" assertions="5" errors="0" failures="0" skipped="0" time="0.123456">
+      <testcase name="testDoThingHappyPath" class="Drupal\Tests\example\Unit\ExampleServiceTest" classname="Drupal.Tests.example.Unit.ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" line="22" assertions="2" time="0.040000"/>
+      <testcase name="testDoThingHandlesEmpty" class="Drupal\Tests\example\Unit\ExampleServiceTest" classname="Drupal.Tests.example.Unit.ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" line="38" assertions="2" time="0.041000"/>
+      <testcase name="testLoad" class="Drupal\Tests\example\Unit\ExampleServiceTest" classname="Drupal.Tests.example.Unit.ExampleServiceTest" file="/app/web/modules/custom/example/tests/src/Unit/ExampleServiceTest.php" line="55" assertions="1" time="0.042456"/>
+    </testsuite>
+  </testsuite>
+</testsuites>

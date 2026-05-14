@@ -71,16 +71,46 @@ class BaseAgent(ABC):
         )
 
     def set_project(self, project: str) -> None:
-        """Set the project key for session tracking.
+        """Set the project key and re-load the system prompt with stack context.
 
-        This should be called before running the agent to ensure
-        sessions are correctly associated with the project.
+        Phase 2A: once we know the project, we know its ``stack_type``. Re-load the
+        system prompt with ``stack_type`` and a DB connection so the planner gets
+        the ``## Known pitfalls`` block (gated on ``POSTMORTEM_INJECTION=1``).
+        Failure here is non-fatal — the static prompt loaded at ``__init__`` is the
+        fallback.
 
         Args:
-            project: Project key (e.g., "ACME")
+            project: Project key (e.g., "ACME").
         """
         self._project = project
         self.agent_sdk.set_project(project)
+
+        try:
+            project_config = self.config.get_project_config(project)
+            stack_type = project_config.get("stack_type") or None
+            if not stack_type:
+                return  # No stack context → keep the static prompt loaded at __init__.
+
+            from src.core.persistence import apply_migrations, connect
+
+            conn = connect()
+            try:
+                apply_migrations(conn)
+                self.system_prompt = load_agent_prompt(
+                    self.agent_name, stack_type=stack_type, conn=conn
+                )
+                logger.info(
+                    "Re-loaded system prompt for %s with stack=%s (%d chars)",
+                    self.agent_name, stack_type, len(self.system_prompt),
+                )
+            finally:
+                conn.close()
+        except Exception:
+            # Non-fatal: keep the static prompt loaded at __init__ if anything fails.
+            logger.warning(
+                "stack-aware prompt re-load failed for %s/%s; keeping static prompt",
+                self.agent_name, project, exc_info=True,
+            )
 
     def _add_system_message(self) -> None:
         """Add system prompt to message history if not already present."""
@@ -219,6 +249,36 @@ class BaseAgent(ABC):
 
     def clear_history(self) -> None:
         """Clear the message history."""
+        self.messages.clear()
+
+    def _safe_reset_session(self) -> None:
+        """Cancel any live SDK stream, then zero session state.
+
+        Replaces direct ``self.session_id = None; self.messages.clear()`` calls
+        so a concurrent ``receive_response`` stream cannot lose its session-id
+        binding mid-flight. Best-effort: hard 5s timeout on the drain wait, log
+        and proceed if exceeded — this seam must never block forever.
+
+        Note: the SDK wrapper is stored on ``BaseAgent`` as ``self.agent_sdk``
+        (set up in ``__init__``), not ``_sdk_wrapper`` as the Phase 2B plan
+        boilerplate suggests. The attribute lookup uses ``getattr`` defensively
+        so subclasses without the wrapper still get the session-state reset.
+        """
+        sdk = getattr(self, "agent_sdk", None)
+        if sdk is not None:
+            try:
+                sdk.request_cancel()
+            except Exception as exc:
+                logger.debug("safe_reset request_cancel failed: %s", exc)
+            try:
+                loop = asyncio.get_event_loop()
+                if not loop.is_running():
+                    loop.run_until_complete(sdk.wait_for_idle(timeout=5.0))
+                # If a loop is already running, the caller is async and must
+                # await wait_for_idle itself; we proceed without blocking.
+            except Exception as exc:
+                logger.debug("safe_reset wait skipped: %s", exc)
+        self.session_id = None
         self.messages.clear()
 
     def get_history(self) -> List[Dict[str, str]]:

@@ -110,11 +110,52 @@ class TestDrupalDeveloperAgent:
             assert "Drupal Developer Overlay" in agent.system_prompt
 
     def test_get_test_command(self, mock_config, mock_agent_sdk, mock_prompt):
-        """Test Drupal test command returns phpunit."""
+        """Test Drupal test command returns phpunit scoped to custom modules.
+
+        Path-based scope (web/modules/custom) instead of --testsuite=unit
+        so contrib-test autoload errors (e.g. honeypot referencing rules
+        classes that aren't installed) don't kill the verifier on
+        every task.
+        """
         agent = DrupalDeveloperAgent()
         cmd = agent._get_test_command()
 
-        assert cmd == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+        assert cmd == [
+            "vendor/bin/phpunit",
+            "web/modules/custom",
+            "--no-coverage",
+            "--log-junit=/tmp/phpunit-junit.xml",
+        ]
+
+    def test_get_test_command_with_paths(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """When paths are given, phpunit runs against just those files."""
+        agent = DrupalDeveloperAgent()
+        cmd = agent._get_test_command(
+            paths=["web/modules/custom/foo/tests/src/Unit/FooTest.php"]
+        )
+
+        assert cmd == [
+            "vendor/bin/phpunit",
+            "web/modules/custom/foo/tests/src/Unit/FooTest.php",
+            "--no-coverage",
+            "--log-junit=/tmp/phpunit-junit.xml",
+        ]
+
+    def test_get_test_command_empty_paths_falls_back(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Empty paths list falls back to broad scope, like None."""
+        agent = DrupalDeveloperAgent()
+        cmd = agent._get_test_command(paths=[])
+
+        assert cmd == [
+            "vendor/bin/phpunit",
+            "web/modules/custom",
+            "--no-coverage",
+            "--log-junit=/tmp/phpunit-junit.xml",
+        ]
 
     def test_get_test_command_is_not_pytest(
         self, mock_config, mock_agent_sdk, mock_prompt    ):
@@ -184,9 +225,14 @@ class TestDrupalDeveloperAgent:
 
             result = agent.run_tests(temp_worktree)
 
-            assert result["success"] is True
+            assert result["passed"] is True
             call_args = mock_run.call_args
-            assert call_args[0][0] == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+            assert call_args[0][0] == [
+                "vendor/bin/phpunit",
+                "web/modules/custom",
+                "--no-coverage",
+                "--log-junit=/tmp/phpunit-junit.xml",
+            ]
             assert call_args[1]["cwd"] == temp_worktree
 
     def test_run_tests_failure(
@@ -204,7 +250,7 @@ class TestDrupalDeveloperAgent:
 
             result = agent.run_tests(temp_worktree)
 
-            assert result["success"] is False
+            assert result["passed"] is False
             assert result["return_code"] == 1
 
     def test_write_tests_creates_php_file(
@@ -232,9 +278,10 @@ class TestDrupalDeveloperAgent:
              patch.object(agent, "run_tests") as mock_test:
 
             mock_test.return_value = {
-                "success": True,
+                "passed": True,
                 "return_code": 0,
-                "output": "OK (3 tests, 5 assertions)",
+                "test_results": "OK (3 tests, 5 assertions)",
+                "structured_errors": [],
             }
 
             result = agent.run(
@@ -261,7 +308,12 @@ class TestDrupalDeveloperAgent:
                 "success": True,
                 "workflow": [{"name": "write_failing_test"}],
             }
-            mock_tests.return_value = {"success": True, "output": "", "return_code": 0}
+            mock_tests.return_value = {
+                "passed": True,
+                "test_results": "",
+                "structured_errors": [],
+                "return_code": 0,
+            }
 
             result = agent.implement_feature("Add form handler", {}, temp_worktree)
 
@@ -323,16 +375,21 @@ class TestContainerAwareTests:
                 "sh", "-c", "test -f phpunit.xml || test -f phpunit.xml.dist"
             ]
 
-            # Last call: actual test execution (suite kept since config+suite exist)
+            # Last call: actual test execution, scoped to web/modules/custom
+            # to avoid contrib-test autoload pollution (e.g. honeypot
+            # referencing rules classes that aren't installed).
             assert calls[-1].kwargs["command"] == [
-                "vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"
+                "vendor/bin/phpunit",
+                "web/modules/custom",
+                "--no-coverage",
+                "--log-junit=/tmp/phpunit-junit.xml",
             ]
             assert calls[-1].kwargs["workdir"] == "/app"
 
             # Host subprocess should NOT be called
             mock_subprocess.assert_not_called()
 
-            assert result["success"] is True
+            assert result["passed"] is True
             assert result["return_code"] == 0
 
     def test_run_tests_falls_back_to_host_without_env(
@@ -353,10 +410,15 @@ class TestContainerAwareTests:
             # Host subprocess should be called
             mock_subprocess.assert_called_once()
             call_args = mock_subprocess.call_args
-            assert call_args[0][0] == ["vendor/bin/phpunit", "--testsuite=unit", "--no-coverage"]
+            assert call_args[0][0] == [
+                "vendor/bin/phpunit",
+                "web/modules/custom",
+                "--no-coverage",
+                "--log-junit=/tmp/phpunit-junit.xml",
+            ]
             assert call_args[1]["cwd"] == temp_worktree
 
-            assert result["success"] is True
+            assert result["passed"] is True
 
     def test_run_tests_container_failure_returns_gracefully(
         self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
@@ -370,9 +432,9 @@ class TestContainerAwareTests:
 
         result = agent.run_tests(temp_worktree)
 
-        assert result["success"] is False
+        assert result["passed"] is False
         assert result["return_code"] == -1
-        assert "No active environment" in result["output"]
+        assert "No active environment" in result["test_results"]
 
     def test_run_tests_container_test_failure(
         self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
@@ -381,11 +443,13 @@ class TestContainerAwareTests:
         agent = DrupalDeveloperAgent()
         mock_env_mgr = Mock()
         ok = Mock(success=True, stdout="", stderr="", returncode=0)
-        # Calls: phpunit exists, phpunit.xml check, grep testsuite, actual test run (fails)
+        # Calls: composer install (ensure deps), phpunit.xml exists,
+        # actual test run (fails). Note: no testsuite-grep step now —
+        # the Drupal command is path-scoped, not testsuite-based, so
+        # _resolve_test_cmd_for_container skips that check.
         mock_env_mgr.exec.side_effect = [
-            ok,  # phpunit exists
+            ok,  # composer install
             ok,  # phpunit.xml exists
-            ok,  # grep testsuite found
             Mock(
                 success=False,
                 stdout="FAILURES!\nTests: 3, Assertions: 4, Failures: 1.",
@@ -398,9 +462,9 @@ class TestContainerAwareTests:
 
         result = agent.run_tests(temp_worktree)
 
-        assert result["success"] is False
+        assert result["passed"] is False
         assert result["return_code"] == 1
-        assert "FAILURES!" in result["output"]
+        assert "FAILURES!" in result["test_results"]
 
     def test_run_tests_skips_when_no_config(
         self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
@@ -421,43 +485,116 @@ class TestContainerAwareTests:
         result = agent.run_tests(temp_worktree)
 
         # Should return success with skip message (no actual test run)
-        assert result["success"] is True
-        assert "skipping" in result["output"].lower()
+        assert result["passed"] is True
+        assert "skipping" in result["test_results"].lower()
         assert result["return_code"] == 0
         # Only 2 exec calls — no test execution attempted
         assert mock_env_mgr.exec.call_count == 2
 
-    def test_run_tests_strips_testsuite_when_suite_undefined(
-        self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
+    def test_parse_test_output_reads_junit_from_container(
+        self, mock_config, mock_agent_sdk, mock_prompt
     ):
-        """Test that --testsuite is stripped when suite name not in config."""
+        """Env attached: _parse_test_output execs `cat` and parses XML."""
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "static_check_output"
+            / "phpunit_junit_fail.xml"
+        )
+        xml_content = fixture_path.read_text()
+
         agent = DrupalDeveloperAgent()
         mock_env_mgr = Mock()
-        ok = Mock(success=True, stdout="", stderr="", returncode=0)
-        fail = Mock(success=False, stdout="", stderr="", returncode=1)
-        # Calls: phpunit exists, phpunit.xml exists, grep phpunit.xml fails,
-        #        grep phpunit.xml.dist fails, test run (without --testsuite)
-        mock_env_mgr.exec.side_effect = [
-            ok,    # phpunit exists
-            ok,    # phpunit.xml exists
-            fail,  # grep 'name="unit"' phpunit.xml — not found
-            fail,  # grep 'name="unit"' phpunit.xml.dist — not found
-            Mock(  # actual test run
-                success=True,
-                stdout="OK (3 tests, 5 assertions)",
-                stderr="",
-                returncode=0,
-            ),
-        ]
-
+        mock_env_mgr.exec.return_value = Mock(
+            success=True,
+            stdout=xml_content,
+            stderr="",
+            returncode=0,
+        )
         agent.set_environment(mock_env_mgr, "TEST-123")
 
-        result = agent.run_tests(temp_worktree)
+        errors = agent._parse_test_output(raw="ignored", return_code=1)
 
-        calls = mock_env_mgr.exec.call_args_list
-        # Last call should have --testsuite stripped
-        assert calls[-1].kwargs["command"] == ["vendor/bin/phpunit", "--no-coverage"]
-        assert result["success"] is True
+        mock_env_mgr.exec.assert_called_once_with(
+            ticket_id="TEST-123",
+            service="appserver",
+            command=["cat", "/tmp/phpunit-junit.xml"],
+            workdir="/app",
+        )
+        # Fixture has 2 failures + 1 error => 3 structured entries.
+        assert len(errors) == 3
+        for entry in errors:
+            assert entry["file"]
+            assert entry["rule"]
+            assert entry["message"]
+            assert isinstance(entry["line"], int)
+
+    def test_parse_test_output_returns_empty_when_container_file_missing(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Env attached, JUnit XML missing in container: returns []."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.return_value = Mock(
+            success=False,
+            stdout="",
+            stderr="cat: /tmp/phpunit-junit.xml: No such file",
+            returncode=1,
+        )
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        errors = agent._parse_test_output(raw="", return_code=1)
+
+        assert errors == []
+        assert mock_env_mgr.exec.call_count == 1
+
+    def test_parse_test_output_returns_empty_when_exec_raises(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """Env attached, exec raises RuntimeError: returns [] (no leak)."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        mock_env_mgr.exec.side_effect = RuntimeError(
+            "No active environment for TEST-123"
+        )
+        agent.set_environment(mock_env_mgr, "TEST-123")
+
+        errors = agent._parse_test_output(raw="", return_code=1)
+
+        assert errors == []
+
+    def test_parse_test_output_falls_back_to_host_path_without_env(
+        self, mock_config, mock_agent_sdk, mock_prompt, tmp_path, monkeypatch
+    ):
+        """No env attached, host file exists: existing host-path read works."""
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "static_check_output"
+            / "phpunit_junit_fail.xml"
+        )
+        host_xml = tmp_path / "phpunit.xml"
+        host_xml.write_text(fixture_path.read_text())
+
+        monkeypatch.setattr(
+            "src.agents.drupal_developer._PHPUNIT_JUNIT_PATH",
+            str(host_xml),
+        )
+
+        agent = DrupalDeveloperAgent()
+        # No set_environment call — host fallback path.
+
+        errors = agent._parse_test_output(raw="", return_code=1)
+
+        assert len(errors) == 3
+
+    # NOTE: previous test ``test_run_tests_strips_testsuite_when_suite_undefined``
+    # was retired alongside switching the Drupal test command from
+    # ``--testsuite=unit`` to a path-based scope (``web/modules/custom``).
+    # The base-developer helper ``_resolve_test_cmd_for_container`` still
+    # contains the strip-when-undefined logic for any future agent that
+    # constructs a testsuite-based command, but this agent no longer
+    # exercises that branch.
 
 
 class TestEnvironmentContextInjection:
@@ -578,3 +715,295 @@ class TestDrupalFilterOutputFiles:
         ]
         result = agent._filter_output_files(files)
         assert result == ["/app/web/modules/custom/mymod/mymod.module"]
+
+
+class TestChangedFilesScopedVerifier:
+    """Tests for the per-task changed-files scope on phpunit.
+
+    These exercise the helpers added to ``BaseDeveloperAgent``
+    (``_capture_pretask_sha``, ``_derive_changed_test_paths``,
+    ``_infer_module_test_dirs``) plus the integration through
+    ``run_tests``. The fixture below builds a tiny git repo with a
+    Drupal-shaped module so the helpers' fs walks can be exercised
+    without mocking pathlib.
+    """
+
+    @pytest.fixture
+    def drupal_worktree(self, tmp_path):
+        """Init a git repo, create a Drupal module skeleton, return the path.
+
+        The worktree starts with a baseline commit so callers can
+        produce diffs against ``HEAD``. Test functions write further
+        files and commit them; the SHA captured before those edits is
+        the simulated pretask SHA.
+        """
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=tmp_path, check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=tmp_path, check=True,
+        )
+
+        module = tmp_path / "web" / "modules" / "custom" / "foo"
+        (module / "tests" / "src" / "Unit").mkdir(parents=True)
+        (module / "foo.info.yml").write_text(
+            "name: Foo\ntype: module\ncore_version_requirement: ^11\n"
+        )
+        (module / "foo.module").write_text("<?php\n// initial\n")
+        (module / "tests" / "src" / "Unit" / "FooTest.php").write_text(
+            "<?php\nclass FooTest {}\n"
+        )
+
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "baseline"], cwd=tmp_path, check=True
+        )
+        return tmp_path
+
+    def test_capture_pretask_sha_returns_head(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+        assert sha is not None
+        assert len(sha) == 40
+
+    def test_capture_pretask_sha_returns_none_on_non_git(
+        self, mock_config, mock_agent_sdk, mock_prompt, tmp_path
+    ):
+        """Fresh non-git dir → None → caller falls back to broad scope."""
+        agent = DrupalDeveloperAgent()
+        assert agent._capture_pretask_sha(tmp_path) is None
+
+    def test_derive_changed_test_paths_picks_up_changed_test(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        new_test = (
+            drupal_worktree
+            / "web/modules/custom/foo/tests/src/Unit/BarTest.php"
+        )
+        new_test.write_text("<?php\nclass BarTest {}\n")
+        subprocess.run(["git", "add", "."], cwd=drupal_worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add bar test"],
+            cwd=drupal_worktree, check=True,
+        )
+
+        paths = agent._derive_changed_test_paths(drupal_worktree, sha)
+        assert paths == [
+            "web/modules/custom/foo/tests/src/Unit/BarTest.php"
+        ]
+
+    def test_derive_changed_test_paths_implementation_only_infers_tests_dir(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Impl file changed, no test changed → infer module's tests/ dir."""
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        impl = drupal_worktree / "web/modules/custom/foo/foo.module"
+        impl.write_text("<?php\n// changed\n")
+        subprocess.run(["git", "add", "."], cwd=drupal_worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "tweak module"],
+            cwd=drupal_worktree, check=True,
+        )
+
+        paths = agent._derive_changed_test_paths(drupal_worktree, sha)
+        assert paths == ["web/modules/custom/foo/tests"]
+
+    def test_derive_changed_test_paths_no_sha_returns_empty(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        agent = DrupalDeveloperAgent()
+        assert agent._derive_changed_test_paths(drupal_worktree, None) == []
+
+    def test_derive_changed_test_paths_no_diff_returns_empty(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """SHA == HEAD with no working-tree changes → fallback to broad scope."""
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+        assert agent._derive_changed_test_paths(drupal_worktree, sha) == []
+
+    def test_derive_changed_test_paths_picks_up_uncommitted_changes(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Regression test for the actual production scenario.
+
+        At verifier time the developer agent has just written files to
+        the worktree but the per-task commit hasn't happened yet (commits
+        only land *after* tests pass). Diffing against ``<sha>..HEAD``
+        would return empty here because HEAD == sha, forcing the broad
+        fallback. Diffing the SHA directly against the working tree
+        picks up the unstaged write.
+        """
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        new_test = (
+            drupal_worktree
+            / "web/modules/custom/foo/tests/src/Unit/UncommittedTest.php"
+        )
+        new_test.write_text("<?php\nclass UncommittedTest {}\n")
+        # Deliberately do NOT commit. Worktree HEAD is unchanged.
+
+        paths = agent._derive_changed_test_paths(drupal_worktree, sha)
+        assert paths == [
+            "web/modules/custom/foo/tests/src/Unit/UncommittedTest.php"
+        ], (
+            "Diff base must compare SHA→working-tree, not SHA..HEAD — "
+            "uncommitted changes should still be picked up."
+        )
+
+    def test_derive_changed_test_paths_picks_up_staged_changes(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Staged-but-uncommitted changes are also picked up by the diff."""
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        new_test = (
+            drupal_worktree
+            / "web/modules/custom/foo/tests/src/Unit/StagedTest.php"
+        )
+        new_test.write_text("<?php\nclass StagedTest {}\n")
+        subprocess.run(["git", "add", "."], cwd=drupal_worktree, check=True)
+        # Staged but not committed — HEAD still at baseline.
+
+        paths = agent._derive_changed_test_paths(drupal_worktree, sha)
+        assert paths == [
+            "web/modules/custom/foo/tests/src/Unit/StagedTest.php"
+        ]
+
+    def test_run_tests_uses_changed_paths_in_container(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """run_tests with pretask_sha runs phpunit against just the diff."""
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        new_test = (
+            drupal_worktree
+            / "web/modules/custom/foo/tests/src/Unit/NewTest.php"
+        )
+        new_test.write_text("<?php\nclass NewTest {}\n")
+        subprocess.run(["git", "add", "."], cwd=drupal_worktree, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "new test"],
+            cwd=drupal_worktree, check=True,
+        )
+
+        mock_env_mgr = Mock()
+        ok = Mock(success=True, stdout="", stderr="", returncode=0)
+        mock_env_mgr.exec.side_effect = [
+            ok,  # composer install
+            ok,  # phpunit.xml exists
+            Mock(
+                success=True,
+                stdout="OK (1 test)",
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        agent.set_environment(mock_env_mgr, "TEST-1")
+
+        result = agent.run_tests(drupal_worktree, pretask_sha=sha)
+
+        last_cmd = mock_env_mgr.exec.call_args_list[-1].kwargs["command"]
+        assert last_cmd == [
+            "vendor/bin/phpunit",
+            "web/modules/custom/foo/tests/src/Unit/NewTest.php",
+            "--no-coverage",
+            "--log-junit=/tmp/phpunit-junit.xml",
+        ]
+        assert result["passed"] is True
+
+    def test_run_tests_falls_back_when_no_diff(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """pretask_sha set but no test files changed → broad scope."""
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        mock_env_mgr = Mock()
+        ok = Mock(success=True, stdout="", stderr="", returncode=0)
+        mock_env_mgr.exec.side_effect = [
+            ok,  # composer install
+            ok,  # phpunit.xml exists
+            Mock(
+                success=True,
+                stdout="OK",
+                stderr="",
+                returncode=0,
+            ),
+        ]
+        agent.set_environment(mock_env_mgr, "TEST-1")
+
+        agent.run_tests(drupal_worktree, pretask_sha=sha)
+
+        last_cmd = mock_env_mgr.exec.call_args_list[-1].kwargs["command"]
+        assert last_cmd == [
+            "vendor/bin/phpunit",
+            "web/modules/custom",
+            "--no-coverage",
+            "--log-junit=/tmp/phpunit-junit.xml",
+        ]
+
+    def test_run_tests_no_pretask_sha_uses_broad_scope(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Backwards-compat: run_tests() without pretask_sha keeps the old
+        broad-scope behavior."""
+        agent = DrupalDeveloperAgent()
+        mock_env_mgr = Mock()
+        ok = Mock(success=True, stdout="", stderr="", returncode=0)
+        mock_env_mgr.exec.side_effect = [ok, ok, ok]
+        agent.set_environment(mock_env_mgr, "TEST-1")
+
+        agent.run_tests(drupal_worktree)
+
+        last_cmd = mock_env_mgr.exec.call_args_list[-1].kwargs["command"]
+        assert last_cmd == [
+            "vendor/bin/phpunit",
+            "web/modules/custom",
+            "--no-coverage",
+            "--log-junit=/tmp/phpunit-junit.xml",
+        ]
+
+    def test_infer_module_test_dirs_skips_files_outside_modules(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Files not under any module root produce no inferred test dirs."""
+        agent = DrupalDeveloperAgent()
+        # Path that isn't under any *.info.yml-bearing directory.
+        result = agent._infer_module_test_dirs(
+            drupal_worktree, ["docs/README.md"]
+        )
+        assert result == []
+
+    def test_infer_module_test_dirs_skips_module_without_tests_dir(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Module without a tests/ subdir → nothing inferred."""
+        agent = DrupalDeveloperAgent()
+        # Make a second module that has *no* tests/.
+        bare = (
+            drupal_worktree / "web" / "modules" / "custom" / "bare"
+        )
+        bare.mkdir(parents=True)
+        (bare / "bare.info.yml").write_text("name: Bare\ntype: module\n")
+        (bare / "bare.module").write_text("<?php\n")
+
+        result = agent._infer_module_test_dirs(
+            drupal_worktree, ["web/modules/custom/bare/bare.module"]
+        )
+        assert result == []

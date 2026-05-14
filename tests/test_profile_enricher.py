@@ -160,8 +160,14 @@ class TestProfileEnricherEnrich:
     @patch("src.agents.base_agent.AgentSDKWrapper")
     @patch("src.agents.base_agent.get_config")
     @patch("src.agents.base_agent.load_agent_prompt")
-    def test_enrich_returns_llm_response(self, mock_load_prompt, mock_config, mock_sdk):
-        """Enrich should return the LLM response directly."""
+    def test_enrich_returns_llm_response_with_appendix(self, mock_load_prompt, mock_config, mock_sdk):
+        """Enrich should return the LLM response with the deterministic skeleton appended.
+
+        The appendix is added by the enricher itself rather than asked of the
+        LLM — the model used to spend tokens regenerating an inventory it had
+        already been given. Sentinel now appends the skeleton verbatim and the
+        prompt forbids the model from emitting one.
+        """
         mock_load_prompt.return_value = ""
         mock_config.return_value = MagicMock(
             get_agent_config=MagicMock(return_value={"model": "claude-4-5-sonnet", "temperature": 0.2})
@@ -169,12 +175,44 @@ class TestProfileEnricherEnrich:
 
         from src.profile_enricher import ProfileEnricher
         enricher = ProfileEnricher()
-        expected = "# Deep Profile\n\n## Architecture\nThis is a modular Drupal app..."
-        enricher.send_message = MagicMock(return_value=expected)
+        llm_body = "# Deep Profile\n\n## Architecture\nThis is a modular Drupal app..."
+        enricher.send_message = MagicMock(return_value=llm_body)
         enricher.set_project = MagicMock()
 
         result = enricher.enrich(Path("/tmp/repo"), {"stack_type": "drupal10"}, "TEST")
-        assert result == expected
+
+        # LLM body comes through unchanged at the start.
+        assert result.startswith(llm_body)
+        # Appendix is present and contains the deterministic stack marker.
+        assert "## Codebase Inventory (Appendix)" in result
+        assert "Stack: drupal10" in result
+
+    @patch("src.agents.base_agent.AgentSDKWrapper")
+    @patch("src.agents.base_agent.get_config")
+    @patch("src.agents.base_agent.load_agent_prompt")
+    def test_enrich_passes_max_turns_cap(self, mock_load_prompt, mock_config, mock_sdk):
+        """Enrich must cap the agent turn budget. Without the cap a previous
+        run saw 26 tool calls and 186s of wall time for a structural-extraction
+        task; the deterministic skeleton already covers structural facts so the
+        LLM should be writing prose, not exploring."""
+        mock_load_prompt.return_value = ""
+        mock_config.return_value = MagicMock(
+            get_agent_config=MagicMock(return_value={"model": "claude-4-5-sonnet", "temperature": 0.2})
+        )
+
+        from src.profile_enricher import ProfileEnricher
+        enricher = ProfileEnricher()
+        enricher.send_message = MagicMock(return_value="# Profile body")
+        enricher.set_project = MagicMock()
+
+        enricher.enrich(Path("/tmp/repo"), {"stack_type": "drupal10"}, "TEST")
+
+        kwargs = enricher.send_message.call_args.kwargs
+        assert "max_turns" in kwargs, "max_turns must be passed to bound the tool loop"
+        assert kwargs["max_turns"] is not None
+        assert kwargs["max_turns"] <= 15, (
+            "max_turns should be tight (≤15); the original unbounded run took 26 turns"
+        )
 
     @patch("src.agents.base_agent.AgentSDKWrapper")
     @patch("src.agents.base_agent.get_config")

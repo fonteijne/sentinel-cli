@@ -1,21 +1,149 @@
 """Base Developer Agent — shared orchestration for stack-specific developer agents."""
 
 import asyncio
+import fnmatch
 import logging
+import os
 import subprocess
 from abc import abstractmethod
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
+    from src.core.events import EventBus
     from src.environment_manager import EnvironmentManager
 
+from src.agents._structured_errors import (
+    StructuredError,
+    parse_drush_config_validation,
+)
 from src.agents.base_agent import ImplementationAgent
+from src.core.events import (
+    BaseEvent,
+    DeveloperCappedOut,
+    StaticCheckRecorded,
+    TestResultRecorded,
+)
 from src.prompt_loader import load_agent_prompt
 from src.worktree_manager import get_branch_name
 
 
 logger = logging.getLogger(__name__)
+
+
+# D1: single global cap for the verifier-retry loop. Per-stack overrides are
+# explicitly out of scope for Phase 1 — revisit only with telemetry from
+# ≥20% of executions capping out AND postmortems showing a 4th attempt
+# would have passed on a meaningful fraction.
+MAX_ATTEMPTS: int = 3
+
+
+def _verifier_loop_enabled() -> bool:
+    """Phase 1 feature flag — set DEV_VERIFIER_LOOP=1 to enable Loop A."""
+    return os.getenv("DEV_VERIFIER_LOOP", "0") == "1"
+
+
+class DeveloperCappedOutException(Exception):
+    """Raised when the verifier-retry loop hits MAX_ATTEMPTS without converging.
+
+    Carries the last batch of structured errors so callers (e.g. the iteration
+    loop) can accumulate them into a ``RegressionContext`` for the next
+    iteration's developer prompts.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        structured_errors: Optional[List[StructuredError]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.structured_errors: List[StructuredError] = list(structured_errors or [])
+
+
+class DeveloperTaskFailedException(Exception):
+    """Raised by the single-shot path when tests fail post-implementation.
+
+    Carries the structured errors parsed from the failing test run so the
+    caller can fold them into the cross-iteration regression context.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        structured_errors: Optional[List[StructuredError]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.structured_errors: List[StructuredError] = list(structured_errors or [])
+
+
+@dataclass
+class RegressionContext:
+    """Test failures that survived the prior iteration of an execution.
+
+    Injected into every task prompt in the next iteration as additional
+    acceptance criteria. Ephemeral — never persisted, never crosses
+    execution boundaries.
+    """
+
+    iteration_n: int
+    errors: List[StructuredError] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.errors
+
+
+def _dedupe_structured_errors(
+    errors: List[StructuredError],
+) -> List[StructuredError]:
+    """Collapse duplicate structured errors by (file, line, rule, message).
+
+    The same test failing in three task runs within an iteration shouldn't
+    appear three times in the next iteration's prompt. Order of first
+    appearance is preserved.
+    """
+    seen: set[tuple[str, int, str, str]] = set()
+    out: List[StructuredError] = []
+    for err in errors:
+        key = (
+            str(err.get("file") or ""),
+            int(err.get("line") or 0),
+            str(err.get("rule") or ""),
+            str(err.get("message") or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(err)
+    return out
+
+
+def _render_regression_section(ctx: Optional[RegressionContext]) -> str:
+    """Render a regression context as a markdown block ready to prepend to
+    a developer task prompt. ``None`` or empty context returns ``''``.
+    """
+    if ctx is None or ctx.is_empty():
+        return ""
+    lines = [
+        "## Prior Iteration Regressions",
+        "",
+        (
+            f"The previous iteration ({ctx.iteration_n}) left "
+            f"{len(ctx.errors)} test(s) failing. Treat fixing them as "
+            f"additional acceptance criteria for your task — your work "
+            f"isn't done until your task passes **and** these are green:"
+        ),
+        "",
+    ]
+    for err in ctx.errors:
+        file_part = err.get("file") or "<unknown>"
+        line_part = err.get("line") or 0
+        rule_part = err.get("rule") or "unknown"
+        msg_part = (err.get("message") or "").strip()
+        lines.append(
+            f"- `{file_part}:{line_part}` [{rule_part}] {msg_part}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 class BaseDeveloperAgent(ImplementationAgent):
@@ -49,6 +177,40 @@ class BaseDeveloperAgent(ImplementationAgent):
         # Container environment for test execution (set via set_environment)
         self._env_manager: Optional["EnvironmentManager"] = None
         self._env_ticket_id: Optional[str] = None
+
+        # Event bus for Loop A telemetry (set via set_event_bus). When unset,
+        # _emit() is a no-op so unit tests don't need persistence infra.
+        self._event_bus: Optional["EventBus"] = None
+        self._execution_id: Optional[str] = None
+
+    def set_event_bus(self, bus: "EventBus", execution_id: str) -> None:
+        """Attach an event bus + execution scope for Loop A telemetry.
+
+        When a bus is attached, ``_emit()`` will publish events; otherwise
+        emits are no-ops. Called by the CLI at execute-time.
+
+        Args:
+            bus: EventBus instance bound to a SQLite connection
+            execution_id: Unique id for this run (FK to executions table)
+        """
+        self._event_bus = bus
+        self._execution_id = execution_id
+
+    def _emit(self, event: BaseEvent) -> None:
+        """Publish an event if a bus is attached, no-op otherwise.
+
+        This makes the loop testable without spinning up persistence: unit
+        tests that don't call ``set_event_bus`` get a silent emitter.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.publish(event)
+        except Exception as e:  # pragma: no cover - defensive
+            # Bus is supposed to swallow subscriber exceptions itself; this
+            # catch is a belt-and-braces guard so a bus bug never breaks
+            # the agent loop.
+            logger.error("Event publish failed: %s", e, exc_info=True)
 
     def set_environment(
         self,
@@ -88,8 +250,14 @@ class BaseDeveloperAgent(ImplementationAgent):
         """
 
     @abstractmethod
-    def _get_test_command(self) -> List[str]:
+    def _get_test_command(self, paths: Optional[List[str]] = None) -> List[str]:
         """Return the test runner CLI command for this stack.
+
+        Args:
+            paths: Optional list of test files (or test dirs) to scope the
+                run to. When ``None`` or empty, subclasses fall back to
+                their default broad scope so implementation-only tasks
+                still produce a verifier signal.
 
         Returns:
             Command list, e.g. ["pytest", "-v", "--tb=short"]
@@ -102,6 +270,49 @@ class BaseDeveloperAgent(ImplementationAgent):
         Returns:
             Test stub source code string
         """
+
+    def _parse_test_output(
+        self, raw: str, return_code: int
+    ) -> List[StructuredError]:
+        """Parse test runner output into structured errors.
+
+        Default returns ``[]`` — subclasses override with stack-specific parsers
+        (pytest text, PHPUnit JUnit XML, etc.). Defined as a regular method
+        rather than ``@abstractmethod`` so existing tests/mocks that
+        instantiate ``BaseDeveloperAgent`` directly still work.
+
+        Args:
+            raw: combined stdout+stderr from the test run
+            return_code: process exit code
+
+        Returns:
+            list of StructuredError dicts; empty list when nothing was parsed
+        """
+        return []
+
+    def run_static_checks(self, worktree_path: Path) -> Dict[str, Any]:
+        """Run stack-specific static checks (lint/typecheck/etc.).
+
+        Default returns a passing skip — subclasses override with the real
+        verifiers (PHPStan + composer validate for Drupal; ruff + mypy for
+        Python).
+
+        Args:
+            worktree_path: Path to git worktree
+
+        Returns:
+            Dictionary matching ``run_tests`` shape:
+              - passed: bool
+              - test_results: str (raw combined output)
+              - structured_errors: list[StructuredError]
+              - return_code: int
+        """
+        return {
+            "passed": True,
+            "test_results": "Skipped (no static checks configured)",
+            "structured_errors": [],
+            "return_code": 0,
+        }
 
     # ------------------------------------------------------------------
     # Config validation
@@ -290,18 +501,70 @@ Return the task list now, one task per line:"""
         worktree_path: Path,
         commit_prefix: str = "feat",
         user_prompt: str | None = None,
+        regressions: Optional[RegressionContext] = None,
     ) -> Dict[str, Any]:
         """Implement a feature following TDD approach.
+
+        Behavior is governed by the ``DEV_VERIFIER_LOOP`` env var (D1):
+          - default (``0``): single-shot — write code, run tests once, raise
+            if tests fail. Identical to legacy behavior.
+          - ``1``: Loop A — capped (``MAX_ATTEMPTS``) verifier-retry loop;
+            on cap-out, emits ``DeveloperCappedOut`` and raises
+            ``DeveloperCappedOutException``.
 
         Args:
             task: Task description
             context: Implementation context
             worktree_path: Path to git worktree
             commit_prefix: Git commit prefix (feat, fix, etc.)
+            regressions: Optional structured failures from the prior
+                iteration of the enclosing execution. When non-empty, a
+                "## Prior Iteration Regressions" section is prepended to
+                the task prompt as additional acceptance criteria.
 
         Returns:
             Dictionary with success, files_created, files_modified,
-            test_results, commit_message, agent_response
+            test_results, commit_message, agent_response.
+        """
+        # Snapshot the worktree HEAD *before* the developer agent runs.
+        #
+        # Single-shot path: this is the diff base for the post-task verifier.
+        # Loop A path: this is the LOOP-ENTRY sentinel only — each attempt
+        # re-captures its own diff base inside _implement_feature_with_loop
+        # so the verifier scope reflects what *this attempt* changed (not
+        # what's accumulated since loop entry, which can drift if the SDK
+        # commits via Bash between attempts). See _warn_if_sha_drifted.
+        #
+        # ``None`` from the helper preserves legacy broad-scope behavior.
+        pretask_sha = self._capture_pretask_sha(worktree_path)
+
+        if not _verifier_loop_enabled():
+            return self._implement_feature_single_shot(
+                task, context, worktree_path, commit_prefix, user_prompt,
+                pretask_sha=pretask_sha,
+                regressions=regressions,
+            )
+        return self._implement_feature_with_loop(
+            task, context, worktree_path, commit_prefix, user_prompt,
+            pretask_sha=pretask_sha,
+            regressions=regressions,
+        )
+
+    def _implement_feature_single_shot(
+        self,
+        task: str,
+        context: Dict[str, Any],
+        worktree_path: Path,
+        commit_prefix: str = "feat",
+        user_prompt: str | None = None,
+        pretask_sha: Optional[str] = None,
+        regressions: Optional[RegressionContext] = None,
+    ) -> Dict[str, Any]:
+        """Legacy single-shot TDD path (preserved verbatim from pre-Phase-1).
+
+        Used when ``DEV_VERIFIER_LOOP`` is unset or ``0``. No retries, no
+        static checks, no event emission — drop-in compatible with previous
+        behavior so the flag flip is a true rollback.
         """
         logger.info(f"Implementing task: {task}")
 
@@ -329,6 +592,7 @@ Return the task list now, one task per line:"""
 
         # Build stack-specific TDD prompt
         tdd_prompt = self._build_tdd_prompt(task, context, worktree_path)
+        tdd_prompt = self._prepend_regression_section(tdd_prompt, regressions)
         tdd_prompt = self._append_operator_prompt(tdd_prompt, user_prompt)
 
         # Execute TDD workflow using Agent SDK
@@ -354,16 +618,25 @@ Return the task list now, one task per line:"""
             files_created = self._filter_output_files(files_created)
             files_modified = self._filter_output_files(files_modified)
 
-            test_results = self.run_tests(worktree_path)
+            test_results = self.run_tests(worktree_path, pretask_sha=pretask_sha)
 
-            if not test_results.get("success"):
-                logger.warning(f"Tests failed after TDD implementation: {test_results.get('output')}")
-                raise RuntimeError(
-                    f"TDD cycle completed but tests are failing: {test_results.get('output')}"
+            if not test_results.get("passed"):
+                logger.warning(
+                    "Tests failed after TDD implementation: %s",
+                    test_results.get("test_results"),
+                )
+                raise DeveloperTaskFailedException(
+                    (
+                        f"TDD cycle completed but tests are failing: "
+                        f"{test_results.get('test_results')}"
+                    ),
+                    structured_errors=list(
+                        test_results.get("structured_errors") or []
+                    ),
                 )
 
             task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
-            test_output = test_results.get("output", "")
+            test_output = test_results.get("test_results", "")
             if "skipping" in test_output.lower():
                 test_status = "Tests skipped (no test config found)"
             else:
@@ -388,6 +661,215 @@ Return the task list now, one task per line:"""
             logger.error(f"Error executing TDD workflow: {e}")
             raise
 
+    def _implement_feature_with_loop(
+        self,
+        task: str,
+        context: Dict[str, Any],
+        worktree_path: Path,
+        commit_prefix: str = "feat",
+        user_prompt: str | None = None,
+        pretask_sha: Optional[str] = None,
+        regressions: Optional[RegressionContext] = None,
+    ) -> Dict[str, Any]:
+        """Loop A — capped verifier-retry loop (design §5.1).
+
+        For up to ``MAX_ATTEMPTS`` attempts: run the developer SDK, then
+        verify with ``run_tests`` + ``run_static_checks``. If both pass,
+        return success. If both fail, build a refine prompt from the
+        structured errors and ask the agent for a single targeted fix.
+
+        On cap-out:
+          - emit ``DeveloperCappedOut`` (last 10 errors)
+          - raise ``DeveloperCappedOutException``
+
+        Guardrail-denied iterations (``execute_with_tools`` returning a
+        failed result) count as a failed attempt — the cap is not reset.
+        """
+        logger.info(f"Implementing task with Loop A: {task}")
+
+        # Load the TDD command definition (same as single-shot)
+        try:
+            cmd_result = self.execute_command(
+                "implement-tdd",
+                {
+                    "feature_description": task,
+                    "plan_step": task,
+                },
+            )
+            if not cmd_result.get("success"):
+                error_msg = f"TDD command validation failed: {cmd_result.get('errors')}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+        except Exception as e:
+            logger.error(f"Error loading TDD command: {e}")
+            raise
+
+        tdd_prompt = self._build_tdd_prompt(task, context, worktree_path)
+        tdd_prompt = self._prepend_regression_section(tdd_prompt, regressions)
+        tdd_prompt = self._append_operator_prompt(tdd_prompt, user_prompt)
+
+        files_created: List[str] = []
+        files_modified: List[str] = []
+        last_errors: List[StructuredError] = []
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            logger.info("Loop A attempt %d/%d for task: %s", attempt, MAX_ATTEMPTS, task)
+
+            # Re-capture HEAD at the top of each attempt so the verifier's
+            # changed-files scope reflects what *this attempt* changed, not
+            # what's accumulated since loop entry. The outer ``pretask_sha``
+            # remains as the loop-entry sentinel for drift detection only.
+            attempt_sha = self._capture_pretask_sha(worktree_path)
+            self._warn_if_sha_drifted(pretask_sha, attempt_sha, attempt)
+
+            prompt = (
+                tdd_prompt
+                if attempt == 1
+                else self._build_refine_prompt(last_errors, attempt)
+            )
+
+            sdk_result = asyncio.run(self.agent_sdk.execute_with_tools(
+                prompt=prompt,
+                session_id=None,
+                system_prompt=self.system_prompt,
+                cwd=str(worktree_path),
+            ))
+
+            for tool_use in sdk_result.get("tool_uses", []):
+                tool_name = tool_use.get("tool")
+                if tool_name == "Write":
+                    files_created.append(tool_use.get("input", {}).get("file_path", ""))
+                elif tool_name == "Edit":
+                    files_modified.append(tool_use.get("input", {}).get("file_path", ""))
+
+            test_result = self.run_tests(worktree_path, pretask_sha=attempt_sha)
+            static_result = self.run_static_checks(worktree_path)
+
+            test_errors = test_result.get("structured_errors", []) or []
+            static_errors = static_result.get("structured_errors", []) or []
+
+            self._emit(
+                TestResultRecorded(
+                    execution_id=self._execution_id or "",
+                    passed=bool(test_result.get("passed")),
+                    attempt=attempt,
+                    structured_errors_count=len(test_errors),
+                    agent=self.agent_name,
+                )
+            )
+            self._emit(
+                StaticCheckRecorded(
+                    execution_id=self._execution_id or "",
+                    checker="combined",
+                    passed=bool(static_result.get("passed")),
+                    structured_errors_count=len(static_errors),
+                    agent=self.agent_name,
+                )
+            )
+
+            last_errors = list(test_errors) + list(static_errors)
+
+            if test_result.get("passed") and static_result.get("passed"):
+                # Happy path — same payload shape as single-shot.
+                files_created = self._filter_output_files(files_created)
+                files_modified = self._filter_output_files(files_modified)
+
+                task_summary = task[:72] if len(task) <= 72 else task[:69] + "..."
+                test_output = test_result.get("test_results", "") or ""
+                if "skipping" in test_output.lower():
+                    test_status = "Tests skipped (no test config found)"
+                else:
+                    test_status = "All tests passing"
+                commit_message = (
+                    f"{commit_prefix}: {task_summary}\n\n"
+                    f"- Implemented using TDD approach (Loop A, attempt {attempt})\n"
+                    f"- {test_status}"
+                )
+
+                logger.info(
+                    "Task converged on attempt %d/%d: %s", attempt, MAX_ATTEMPTS, task
+                )
+
+                return {
+                    "success": True,
+                    "files_created": [f for f in files_created if f],
+                    "files_modified": [f for f in files_modified if f],
+                    "test_results": test_result,
+                    "commit_message": commit_message,
+                    "agent_response": sdk_result.get("content", ""),
+                    "attempts": attempt,
+                }
+
+            logger.warning(
+                "Loop A attempt %d/%d failed (%d test err, %d static err) — refining",
+                attempt, MAX_ATTEMPTS, len(test_errors), len(static_errors),
+            )
+
+        # Capped out — emit and raise. Cap-side-effects (postmortem row,
+        # MR draft revert, single MR comment) live in the subscriber per D7+D8.
+        capped_payload = [dict(e) for e in last_errors[:10]]
+        self._emit(
+            DeveloperCappedOut(
+                execution_id=self._execution_id or "",
+                agent=self.agent_name,
+                attempts=MAX_ATTEMPTS,
+                last_structured_errors=capped_payload,
+            )
+        )
+        logger.error(
+            "Developer agent %s capped out after %d attempts on task: %s",
+            self.agent_name, MAX_ATTEMPTS, task,
+        )
+        raise DeveloperCappedOutException(
+            f"Capped at {MAX_ATTEMPTS} attempts for task: {task}",
+            structured_errors=list(last_errors),
+        )
+
+    def _build_refine_prompt(
+        self, errors: List[StructuredError], attempt: int
+    ) -> str:
+        """Compose the refine prompt fed back to the SDK on retry attempts.
+
+        Design §7.3: "When the verifier fails, respond with a single targeted
+        fix; do not rewrite unrelated code." Errors are included verbatim as
+        a bulleted list. We deliberately do NOT replay the previous diff
+        (the SDK session history already has it) and we do NOT inject
+        postmortem-derived rules (Phase 2 concern).
+        """
+        if errors:
+            bullets = []
+            for err in errors:
+                file_part = err.get("file") or "<unknown>"
+                line_part = err.get("line") or 0
+                rule_part = err.get("rule") or "unknown"
+                msg_part = (err.get("message") or "").strip()
+                bullets.append(
+                    f"- `{file_part}:{line_part}` [{rule_part}] {msg_part}"
+                )
+            error_block = "\n".join(bullets)
+        else:
+            error_block = "- (no structured errors captured)"
+
+        return (
+            f"The verifier reported failures on attempt {attempt - 1} of "
+            f"{MAX_ATTEMPTS}. This is attempt {attempt} of {MAX_ATTEMPTS}.\n\n"
+            f"Structured errors:\n{error_block}\n\n"
+            "Respond with a single targeted fix. Do not rewrite unrelated "
+            "code, do not refactor, and do not hypothesize beyond what the "
+            "errors above show. Use Edit/Write tools to apply the fix."
+        )
+
+    def _prepend_regression_section(
+        self, prompt: str, regressions: Optional[RegressionContext]
+    ) -> str:
+        """Prepend the rendered ``## Prior Iteration Regressions`` block to
+        a developer task prompt. Empty/None context is a no-op.
+        """
+        block = _render_regression_section(regressions)
+        if not block:
+            return prompt
+        return f"{block}\n{prompt}"
+
     def write_tests(self, implementation: str, test_path: Path) -> str:
         """Write tests for an implementation.
 
@@ -408,42 +890,341 @@ Return the task list now, one task per line:"""
         logger.info(f"Tests written to {test_path}")
         return test_code
 
-    def run_tests(self, worktree_path: Path) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Changed-files-scoped verifier helpers
+    # ------------------------------------------------------------------
+
+    def _capture_pretask_sha(self, worktree_path: Path) -> Optional[str]:
+        """Snapshot the worktree's HEAD before a task runs.
+
+        Returns ``None`` on failure (e.g. fresh worktree with no commits,
+        worktree is not a git dir, git is unavailable). Callers should
+        treat ``None`` as "no diff base — fall back to broad scope".
+        """
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug("Could not capture pretask SHA: %s", e)
+            return None
+        if result.returncode != 0:
+            return None
+        sha = result.stdout.strip()
+        return sha or None
+
+    def _warn_if_sha_drifted(
+        self,
+        loop_entry_sha: Optional[str],
+        attempt_sha: Optional[str],
+        attempt: int,
+    ) -> None:
+        """Emit a single advisory warning if HEAD moved between loop entry
+        and the start of this attempt.
+
+        A drift means the developer SDK created a git commit during a prior
+        attempt (Bash tool is allowed). The per-attempt re-capture in
+        ``_implement_feature_with_loop`` already gives the verifier the
+        semantically correct diff base; this warning exists only so
+        operators can see mid-loop commits in the logs.
+
+        No-op when either SHA is ``None`` — that means git capture failed,
+        which is reported separately at debug level by
+        ``_capture_pretask_sha``; we have no signal to report.
+        """
+        if loop_entry_sha is None or attempt_sha is None:
+            return
+        if loop_entry_sha == attempt_sha:
+            return
+        logger.warning(
+            "Loop A: HEAD moved between attempt %d and loop entry "
+            "(loop_entry=%s, attempt=%s); using attempt-anchored diff base",
+            attempt, loop_entry_sha[:8], attempt_sha[:8],
+        )
+
+    def _derive_changed_test_paths(
+        self,
+        worktree_path: Path,
+        pretask_sha: Optional[str],
+        test_glob: str = "**/tests/**/*.php",
+    ) -> List[str]:
+        """Return paths of test files changed since ``pretask_sha`` plus
+        any test files that live in the same module dir as a changed
+        implementation file (when that module's tests aren't already
+        directly covered).
+
+        An empty list means "fall back to broad scope" — caller is
+        expected to feed the empty list to ``_get_test_command(paths=...)``
+        which will substitute its default.
+        """
+        if pretask_sha is None:
+            return []
+
+        # Two reasons we don't use ``<pretask_sha>..HEAD`` here:
+        #
+        # 1. The per-task commit only lands AFTER tests pass — at verifier
+        #    time the agent's writes are still in the worktree (modified)
+        #    or merely on disk (brand-new files), so HEAD == pretask_sha
+        #    and a HEAD-anchored diff is empty every time → broad fallback
+        #    on every task → the very condition this scoping is meant to
+        #    avoid.
+        # 2. ``git diff <sha>`` compares <sha> to the working tree
+        #    (including the index), which catches *modifications* to
+        #    tracked files. But it does NOT catch brand-new untracked
+        #    files — and brand-new test files are exactly what TDD
+        #    produces. Untracked files have to be picked up via
+        #    ``git ls-files --others --exclude-standard`` and unioned in.
+        try:
+            diff = subprocess.run(
+                [
+                    "git", "diff", "--name-only", "--diff-filter=AM",
+                    pretask_sha, "--", test_glob,
+                ],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            impl = subprocess.run(
+                [
+                    "git", "diff", "--name-only", "--diff-filter=AM",
+                    pretask_sha,
+                ],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            untracked = subprocess.run(
+                [
+                    "git", "ls-files", "--others", "--exclude-standard",
+                ],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug("git diff failed while deriving test paths: %s", e)
+            return []
+
+        if (
+            diff.returncode != 0
+            or impl.returncode != 0
+            or untracked.returncode != 0
+        ):
+            logger.debug(
+                "git diff/ls-files returned non-zero "
+                "(test=%d impl=%d untracked=%d) — falling back",
+                diff.returncode, impl.returncode, untracked.returncode,
+            )
+            return []
+
+        # Untracked files split into test vs non-test by glob match.
+        untracked_paths = [p for p in untracked.stdout.splitlines() if p]
+        untracked_tests = [
+            p for p in untracked_paths if fnmatch.fnmatch(p, test_glob)
+        ]
+        untracked_non_tests = [
+            p for p in untracked_paths if not fnmatch.fnmatch(p, test_glob)
+        ]
+
+        direct = [p for p in diff.stdout.splitlines() if p] + untracked_tests
+        impl_paths = (
+            [p for p in impl.stdout.splitlines() if p] + untracked_non_tests
+        )
+
+        # Modules whose tests are already directly covered. We don't want
+        # to also list the module's whole tests/ dir from inference —
+        # the specific test file is the more useful scope.
+        covered_roots: set = set()
+        for p in direct:
+            root = self._find_module_root(
+                worktree_path, (worktree_path / p)
+            )
+            if root is not None:
+                covered_roots.add(root)
+
+        # Strip test files from impl_paths — they're handled above.
+        non_test_impl = [
+            p for p in impl_paths
+            if not fnmatch.fnmatch(p, test_glob)
+        ]
+        inferred = self._infer_module_test_dirs(
+            worktree_path, non_test_impl, exclude_roots=covered_roots
+        )
+
+        seen: set = set()
+        out: List[str] = []
+        for p in direct + inferred:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def _infer_module_test_dirs(
+        self,
+        worktree_path: Path,
+        changed_paths: List[str],
+        exclude_roots: Optional[set] = None,
+    ) -> List[str]:
+        """For each changed file, walk up to the nearest Drupal module
+        root (a directory containing a ``*.info.yml`` file) and return
+        its ``tests/`` subdir if that subdir exists.
+
+        Modules in ``exclude_roots`` are skipped — used by the caller
+        to avoid duplicating coverage already in the direct-changes
+        list.
+
+        Returns deduped relative paths. When a path doesn't sit under a
+        module root, or the module has no tests dir, it's silently
+        skipped — broad scope is the safety net, not this helper.
+        """
+        if not changed_paths:
+            return []
+        excluded = exclude_roots or set()
+
+        out: List[str] = []
+        seen: set = set()
+        for rel in changed_paths:
+            abs_path = (worktree_path / rel).resolve()
+            module_root = self._find_module_root(worktree_path, abs_path)
+            if module_root is None or module_root in excluded:
+                continue
+            tests_dir = module_root / "tests"
+            if not tests_dir.is_dir():
+                continue
+            try:
+                rel_tests = tests_dir.relative_to(worktree_path).as_posix()
+            except ValueError:
+                continue
+            if rel_tests not in seen:
+                seen.add(rel_tests)
+                out.append(rel_tests)
+        return out
+
+    @staticmethod
+    def _find_module_root(
+        worktree_path: Path, abs_path: Path
+    ) -> Optional[Path]:
+        """Walk parents of ``abs_path`` (capped at ``worktree_path``)
+        until one contains a ``*.info.yml`` file. Returns that dir, or
+        ``None`` if no module root is found within the worktree."""
+        try:
+            worktree_resolved = worktree_path.resolve()
+            target = abs_path.resolve() if abs_path.exists() else abs_path
+        except OSError:
+            return None
+
+        # Start from the file's parent dir (changed file itself isn't
+        # the module root). If target is the worktree itself, bail.
+        current = target if (target.exists() and target.is_dir()) else target.parent
+        while True:
+            try:
+                current.relative_to(worktree_resolved)
+            except ValueError:
+                return None
+            if current.is_dir():
+                try:
+                    if any(current.glob("*.info.yml")):
+                        return current
+                except OSError:
+                    return None
+            if current == worktree_resolved:
+                return None
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+
+    def run_tests(
+        self,
+        worktree_path: Path,
+        pretask_sha: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Run tests using the stack's test framework.
 
         If a container environment is attached (via set_environment),
         tests run inside the container. Otherwise, tests run on the host.
 
+        When ``pretask_sha`` is supplied, the run is scoped to the test
+        files changed since that SHA (plus tests that live alongside
+        changed implementation files). When the diff yields no test
+        paths, we fall back to the stack's default broad scope so
+        implementation-only tasks still get a verifier signal.
+
         Args:
             worktree_path: Path to git worktree
+            pretask_sha: Optional pre-task HEAD SHA captured at the
+                start of ``implement_feature``. ``None`` preserves
+                legacy broad-scope behavior.
 
         Returns:
-            Dictionary with success, output, return_code
+            Dictionary with:
+              - passed: bool — True if tests succeeded
+              - test_results: str — raw stdout+stderr (renamed from "output")
+              - structured_errors: list[StructuredError] — parsed errors,
+                empty on pass
+              - return_code: int — process exit code (-1 on exception/timeout)
         """
         logger.info(f"Running tests in {worktree_path}")
 
-        test_cmd = self._get_test_command()
+        paths = self._derive_changed_test_paths(worktree_path, pretask_sha)
+        if pretask_sha is not None:
+            logger.info(
+                "Verifier scope: %s (pretask SHA %s)",
+                f"{len(paths)} changed file(s)" if paths else "broad fallback",
+                pretask_sha[:8],
+            )
+
+        test_cmd = self._get_test_command(paths=paths)
 
         if self._env_manager and self._env_ticket_id:
             return self._run_tests_in_container(test_cmd)
 
         return self._run_tests_on_host(test_cmd, worktree_path)
 
-    def _ensure_composer_deps(self) -> None:
+    def _ensure_composer_deps(self, max_attempts: int = 3):
         """Ensure composer dependencies and scaffold files are installed.
 
-        Always runs ``composer install`` to guarantee all dependencies,
-        scaffold files (e.g. default.settings.php), and binaries are present.
+        Runs ``composer install`` up to ``max_attempts`` times. Composer plugins
+        (notably ``cweagans/composer-patches``) sometimes need a second pass
+        to fully activate when dependency ordering is awkward — retrying is a
+        well-known workaround that costs nothing on the happy path.
+
+        Returns the final ExecResult so callers can react to a permanent
+        failure. Callers that ignore the return value retain prior behavior.
         """
-        logger.info("Running composer install in container")
-        result = self._env_manager.exec(
-            ticket_id=self._env_ticket_id,
-            service="appserver",
-            command=["composer", "install", "--no-interaction", "--no-progress"],
-            workdir="/app",
+        last_result = None
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                "Running composer install in container "
+                f"(attempt {attempt}/{max_attempts})"
+            )
+            last_result = self._env_manager.exec(
+                ticket_id=self._env_ticket_id,
+                service="appserver",
+                command=["composer", "install", "--no-interaction", "--no-progress"],
+                workdir="/app",
+            )
+            if last_result.returncode == 0:
+                if attempt > 1:
+                    logger.info(f"composer install succeeded on attempt {attempt}")
+                return last_result
+            logger.warning(
+                f"composer install attempt {attempt}/{max_attempts} failed "
+                f"(rc={last_result.returncode}): "
+                f"{(last_result.stderr or '')[:200]}"
+            )
+        logger.error(
+            f"composer install failed after {max_attempts} attempts — "
+            "callers should treat this as a fatal precondition failure"
         )
-        if result.returncode != 0:
-            logger.warning(f"composer install failed: {result.stderr}")
+        return last_result
 
     def _resolve_test_cmd_for_container(self, test_cmd: List[str]) -> Optional[List[str]]:
         """Adapt the test command to what the container actually supports.
@@ -501,7 +1282,8 @@ Return the task list now, one task per line:"""
             test_cmd: Test command as list of strings
 
         Returns:
-            Dictionary with success, output, return_code
+            Dictionary matching the run_tests shape (passed, test_results,
+            structured_errors, return_code).
         """
         logger.info(f"Running tests in container (service=appserver)")
 
@@ -515,8 +1297,9 @@ Return the task list now, one task per line:"""
             if resolved_cmd is None:
                 # No phpunit config exists — skip tests gracefully
                 return {
-                    "success": True,
-                    "output": "No phpunit configuration found — skipping test execution",
+                    "passed": True,
+                    "test_results": "No phpunit configuration found — skipping test execution",
+                    "structured_errors": [],
                     "return_code": 0,
                 }
 
@@ -528,19 +1311,24 @@ Return the task list now, one task per line:"""
             )
 
             output = result.stdout + result.stderr
-            success = result.returncode == 0
+            passed = result.returncode == 0
+            structured_errors = (
+                [] if passed else self._parse_test_output(output, result.returncode)
+            )
 
             return {
-                "success": success,
-                "output": output,
+                "passed": passed,
+                "test_results": output,
+                "structured_errors": structured_errors,
                 "return_code": result.returncode,
             }
 
         except Exception as e:
             logger.error(f"Error running tests in container: {e}")
             return {
-                "success": False,
-                "output": str(e),
+                "passed": False,
+                "test_results": str(e),
+                "structured_errors": [],
                 "return_code": -1,
             }
 
@@ -554,7 +1342,8 @@ Return the task list now, one task per line:"""
             worktree_path: Path to git worktree
 
         Returns:
-            Dictionary with success, output, return_code
+            Dictionary matching the run_tests shape (passed, test_results,
+            structured_errors, return_code).
         """
         try:
             result = subprocess.run(
@@ -566,26 +1355,32 @@ Return the task list now, one task per line:"""
             )
 
             output = result.stdout + result.stderr
-            success = result.returncode == 0
+            passed = result.returncode == 0
+            structured_errors = (
+                [] if passed else self._parse_test_output(output, result.returncode)
+            )
 
             return {
-                "success": success,
-                "output": output,
+                "passed": passed,
+                "test_results": output,
+                "structured_errors": structured_errors,
                 "return_code": result.returncode,
             }
 
         except subprocess.TimeoutExpired:
             logger.error("Tests timed out after 5 minutes")
             return {
-                "success": False,
-                "output": "Tests timed out",
+                "passed": False,
+                "test_results": "Tests timed out",
+                "structured_errors": [],
                 "return_code": -1,
             }
         except Exception as e:
             logger.error(f"Error running tests: {e}")
             return {
-                "success": False,
-                "output": str(e),
+                "passed": False,
+                "test_results": str(e),
+                "structured_errors": [],
                 "return_code": -1,
             }
 
@@ -633,6 +1428,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         plan_file: Path,
         worktree_path: Path,
         user_prompt: str | None = None,
+        regressions: Optional[RegressionContext] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Run the complete implementation workflow.
@@ -640,6 +1436,14 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
         Args:
             plan_file: Path to implementation plan
             worktree_path: Path to git worktree
+            regressions: Optional structured failures from the prior
+                iteration. When non-empty, each task's developer prompt
+                is prefixed with a "## Prior Iteration Regressions"
+                section. The returned dict also includes
+                ``regression_errors`` — the union of structured errors
+                from any tasks that failed in *this* iteration, ready
+                for the caller to fold into the next iteration's
+                ``RegressionContext``.
             **kwargs: Additional parameters
 
         Returns:
@@ -665,15 +1469,48 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
                 )
                 logger.info(f"Found {len(files)} attachments for {ticket_id}")
 
+        # Baseline gate: config must be valid BEFORE we touch anything.
+        # If it's broken now, nothing this run does is to blame and the
+        # post-implementation developer-fix retry loop is the wrong
+        # remediation — it would ask the developer to fix code they
+        # never touched.
+        baseline_config = self.validate_config(worktree_path)
+        if (
+            not baseline_config.get("success", True)
+            and not baseline_config.get("environment_issue")
+        ):
+            parsed = parse_drush_config_validation(
+                baseline_config.get("output", "") or ""
+            )
+            logger.error(
+                "Baseline config validation failed before any task ran — "
+                "aborting run. Parsed %d structured error(s).",
+                len(parsed),
+            )
+            return {
+                "tasks_completed": 0,
+                "tasks_failed": 0,
+                "test_results": None,
+                "config_validation": baseline_config,
+                "results": [],
+                "aborted": "baseline_config_broken",
+                "baseline_failure": parsed,
+            }
+
         # Break down plan into tasks
         tasks = self.break_down_plan(plan_file)
 
         # Implement each task
         results = []
+        regression_errors: List[StructuredError] = []
         for task in tasks:
             try:
                 task_with_context = task + attachment_context if attachment_context else task
-                impl_result = self.implement_feature(task_with_context, {}, worktree_path, user_prompt=user_prompt)
+                impl_result = self.implement_feature(
+                    task_with_context, {}, worktree_path,
+                    user_prompt=user_prompt,
+                    regressions=regressions,
+                )
 
                 if impl_result.get("success"):
                     all_files = (
@@ -690,7 +1527,17 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
                 results.append({"task": task, "success": True, "details": impl_result})
             except Exception as e:
                 logger.error(f"Failed to implement task '{task}': {e}")
-                results.append({"task": task, "success": False, "error": str(e)})
+                # Capture any structured errors carried on the exception so
+                # the iteration loop can inject them as additional acceptance
+                # criteria into the next iteration's task prompts.
+                task_errors = list(getattr(e, "structured_errors", []) or [])
+                regression_errors.extend(task_errors)
+                results.append({
+                    "task": task,
+                    "success": False,
+                    "error": str(e),
+                    "structured_errors": task_errors,
+                })
 
         # Run all tests
         test_results = self.run_tests(worktree_path)
@@ -747,6 +1594,7 @@ Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"""
             "test_results": test_results,
             "config_validation": config_validation,
             "results": results,
+            "regression_errors": _dedupe_structured_errors(regression_errors),
         }
 
     def run_revision(  # type: ignore[override]
@@ -1118,7 +1966,7 @@ Provide a clear, concise answer (2-3 sentences) explaining:
 
 **Files changed:** {files_text}
 
-**Tests:** {'✅ Passing' if test_results.get('success') else '⚠️ Some failures'}
+**Tests:** {'✅ Passing' if test_results.get('passed') else '⚠️ Some failures'}
 
 ---
 🤖 Sentinel Developer
@@ -1237,7 +2085,7 @@ A human will need to respond to this.
 **Tasks:** {tasks_completed}/{tasks_total} completed ({tasks_failed} failed)
 **Questions:** {questions_answered}/{questions} answered ({questions_failed} failed)
 **Acknowledged:** {acknowledged}
-**Tests:** {'✅ All passing' if test_results.get('success') else '⚠️ Some failures - see output'}
+**Tests:** {'✅ All passing' if test_results.get('passed') else '⚠️ Some failures - see output'}
 **Config:** {'✅ Valid' if config_validation.get('success') else '❌ Validation failed — config dependencies broken'}
 
 All discussions have been addressed.

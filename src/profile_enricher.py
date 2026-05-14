@@ -71,46 +71,63 @@ class ProfileEnricher(PlanningAgent):
         skeleton = profiler.format_for_llm_prompt(deterministic_profile)
         stack_type = deterministic_profile.get("stack_type", "unknown")
 
-        prompt = f"""Analyze this codebase and produce a comprehensive project profile.
+        prompt = f"""Write a project-context.md for this {stack_type} codebase.
 
-## Deterministic Inventory
+## Authoritative Inventory
 
-A machine scan of this {stack_type} project produced the following inventory:
+A deterministic scan already produced the structural facts below. **Treat this as
+authoritative.** Do not re-derive any of it with tools.
 
 ```
 {skeleton}
 ```
 
-## Your Task
+## What to produce
 
-Using your tools (Read, Glob, Grep), explore this codebase and produce a complete
-project-context.md document following the sections defined in your system prompt.
+Write the sections defined in your system prompt. The inventory above tells you
+WHAT exists; your job is the *why* and *how* — architectural roles, integration
+patterns, conventions, gotchas. That is the part a machine scan cannot produce.
 
-The inventory above tells you WHAT exists. Your job is to explain WHY it's structured
-this way, HOW the pieces fit together, and WHAT conventions to follow.
+## Tool-use budget — STRICT
 
-**Key files to start with:**
-- `composer.json` (dependencies and project config)
-- `.lando.yml` (environment setup)
-- `web/modules/custom/*/src/*.php` (main service classes)
-- `web/modules/custom/*/*.module` (hook implementations)
-- `web/modules/custom/*/*.services.yml` (dependency injection)
-- `web/themes/custom/*/` (theme structure)
+You have a hard cap of about 8 file reads. Use them on the highest-leverage
+files only:
 
-**Important:**
-- Read actual code — don't guess from file names
-- Be specific — cite file paths and class names
-- Be concise — agents don't need essays, they need actionable context
-- Include the deterministic inventory as a compact appendix at the end
+- 2-3 `.module` files of central modules (whichever look foundational based on
+  the inventory's dependency graph)
+- 1-2 main service classes from those modules (`src/*.php`)
+- 1 representative `.services.yml` to confirm DI conventions
+- 1 controller, plugin, or form to confirm UI conventions
 
-Return the complete markdown document directly in your response.
-Do NOT use the Write tool. Just output the markdown.
+That is enough. If you find yourself reaching for a 9th read, stop and write.
+Do not glob to enumerate things the inventory already lists.
+
+## Output rules
+
+- Return the markdown document directly in your response. Do NOT use Write.
+- Do NOT include a "Codebase Inventory" appendix — Sentinel will append the
+  deterministic skeleton itself.
+- Cite file paths and class names. Avoid prose without referents.
+- ≤ 600 lines total.
 """
 
         try:
-            response = self.send_message(prompt, cwd=str(repo_path))
+            # max_turns=12 caps the tool-use loop. The deterministic skeleton
+            # already covers structural enumeration, so the LLM should be
+            # writing prose, not exploring. The previous unbounded loop saw
+            # 26 tool calls and 186s for output that should take ~30s.
+            response = self.send_message(prompt, cwd=str(repo_path), max_turns=12)
             logger.info(f"LLM enrichment complete ({len(response)} chars)")
-            return response
+
+            # Append the deterministic skeleton as an appendix so consumers
+            # still get the structural reference without spending LLM tokens
+            # on it. Trims a section the model used to re-emit verbatim.
+            appendix = (
+                "\n\n---\n\n## Codebase Inventory (Appendix)\n\n"
+                "*Generated deterministically by StackProfiler — do not edit by hand.*\n\n"
+                f"```\n{skeleton}\n```\n"
+            )
+            return response + appendix
         except Exception as e:
             logger.error(f"LLM enrichment failed: {e}")
             raise

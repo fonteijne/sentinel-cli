@@ -149,6 +149,23 @@ class ConfigLoader:
             "api_token": self.get_env("GITLAB_API_TOKEN"),
         }
 
+    def get_sentinel_repo_project_path(self) -> str | None:
+        """Return the configured Sentinel repo's GitLab project path, if any.
+
+        Phase 2C: the overlay-PR proposer opens its draft MR against the
+        Sentinel repo itself (D4). This config key tells the proposer where
+        to push. Returns ``None`` when unset — the proposer errors out at
+        invocation time only when ``OVERLAY_PROPOSER_ENABLED=1`` and the key
+        is missing. Single-project users that never run the proposer can
+        leave it unset.
+        """
+        value = self.get("sentinel.repo_project_path")
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()
+
     def get_llm_config(self) -> Dict[str, Any]:
         """Get LLM configuration with auto-detected mode.
 

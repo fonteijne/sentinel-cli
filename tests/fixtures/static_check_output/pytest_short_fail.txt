@@ -1,0 +1,30 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.3, pluggy-1.5.0
+rootdir: /app
+configfile: pyproject.toml
+collected 5 items
+
+tests/test_example.py FF.E.                                              [100%]
+
+=================================== FAILURES ===================================
+_______________________________ test_addition __________________________________
+tests/test_example.py:11: in test_addition
+    assert add(2, 2) == 5
+E   AssertionError: assert 4 == 5
+
+________________________________ test_greeting _________________________________
+tests/test_example.py:18: in test_greeting
+    assert greet("world") == "hi world"
+E   AssertionError: assert 'hello world' == 'hi world'
+
+==================================== ERRORS ====================================
+___________________ ERROR at setup of test_division_by_zero ____________________
+tests/test_example.py:27: in test_division_by_zero
+    fixture_value = setup_fixture()
+E   ZeroDivisionError: division by zero
+
+=========================== short test summary info ============================
+FAILED tests/test_example.py::test_addition - AssertionError: assert 4 == 5
+FAILED tests/test_example.py::test_greeting - AssertionError: assert 'hello world' == 'hi world'
+ERROR tests/test_example.py::test_division_by_zero - ZeroDivisionError: division by zero
+========================= 2 failed, 2 passed, 1 error in 0.58s =================

@@ -1,5 +1,7 @@
 """Unit tests for PromptLoader."""
 
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -141,3 +143,209 @@ class TestPromptLoader:
             # Should raise when trying to load from empty directory
             with pytest.raises(FileNotFoundError):
                 loader.load("any_agent")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2A — pitfalls injection
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_db_with_postmortem():
+    """In-memory SQLite with migrations + a parent execution + one drupal postmortem.
+
+    Local to this file (mirrors ``tests/conftest.py:sqlite_mem_conn``) because
+    the loader tests don't need the broader event-bus fixtures and we want to
+    keep the import surface minimal.
+    """
+    from src.core.persistence import apply_migrations, connect, insert_postmortem
+
+    conn = connect(":memory:")
+    apply_migrations(conn)
+    conn.execute(
+        """
+        INSERT INTO executions (id, ticket_id, kind, status, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "exec-1",
+            "TEST-1",
+            "execute",
+            "running",
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    insert_postmortem(
+        conn,
+        execution_id="exec-1",
+        stack_type="drupal",
+        agent="drupal_developer",
+        failure_signature="phpunit::failed_assertion::sentinel_demo",
+        context_excerpt="Demo failure for prompt-loader tests.",
+        fix_summary="Fix the assertion.",
+        provenance="auto",
+        confidence=88,
+    )
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+class TestPromptLoaderPhase2A:
+    """Phase 2A: pitfalls injection contract on ``PromptLoader.load``."""
+
+    def test_load_with_stack_type_no_conn_no_op(
+        self, temp_prompts_dir, monkeypatch
+    ):
+        """stack_type without a conn must be a no-op regardless of flag state."""
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "1")
+        loader = PromptLoader(temp_prompts_dir)
+
+        with_stack = loader.load("plan_generator", stack_type="drupal")
+        # Use a fresh loader so the cache doesn't return the previous value
+        # under a different cache key.
+        loader_baseline = PromptLoader(temp_prompts_dir)
+        baseline = loader_baseline.load("plan_generator")
+
+        assert with_stack == baseline
+        assert "Known pitfalls" not in with_stack
+
+    def test_load_with_flag_off_no_op(
+        self, temp_prompts_dir, monkeypatch, tmp_db_with_postmortem
+    ):
+        """Flag explicitly disabled — no pitfalls section appended."""
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "0")
+        loader = PromptLoader(temp_prompts_dir)
+
+        prompt = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+
+        assert "Known pitfalls" not in prompt
+        assert "phpunit::failed_assertion::sentinel_demo" not in prompt
+
+    def test_load_with_flag_unset_no_op(
+        self, temp_prompts_dir, monkeypatch, tmp_db_with_postmortem
+    ):
+        """Flag unset — default-off behaviour, no injection."""
+        monkeypatch.delenv("POSTMORTEM_INJECTION", raising=False)
+        loader = PromptLoader(temp_prompts_dir)
+
+        prompt = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+
+        assert "Known pitfalls" not in prompt
+        assert "phpunit::failed_assertion::sentinel_demo" not in prompt
+
+    def test_load_with_flag_on_appends_pitfalls(
+        self, temp_prompts_dir, monkeypatch, tmp_db_with_postmortem
+    ):
+        """Flag on + stack + conn — pitfalls section is appended."""
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "1")
+        loader = PromptLoader(temp_prompts_dir)
+
+        prompt = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+
+        assert "## Known pitfalls" in prompt
+        assert "phpunit::failed_assertion::sentinel_demo" in prompt
+
+    def test_cache_key_separates_stacks(
+        self, temp_prompts_dir, monkeypatch, tmp_db_with_postmortem
+    ):
+        """Same agent loaded for different stacks → distinct cache entries."""
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "1")
+        loader = PromptLoader(temp_prompts_dir)
+
+        drupal_prompt = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+        python_prompt = loader.load(
+            "plan_generator", stack_type="python", conn=tmp_db_with_postmortem
+        )
+
+        assert ("plan_generator", "drupal") in loader._cache
+        assert ("plan_generator", "python") in loader._cache
+        # Drupal sees the postmortem; python does not (different stack).
+        assert "phpunit::failed_assertion::sentinel_demo" in drupal_prompt
+        assert "phpunit::failed_assertion::sentinel_demo" not in python_prompt
+
+        # Re-loading drupal returns the cached entry (same identity).
+        again = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+        assert again is drupal_prompt
+
+    def test_cache_invalidation_after_clear_cache(
+        self, temp_prompts_dir, monkeypatch, tmp_db_with_postmortem
+    ):
+        """Inserting a new postmortem only takes effect after clear_cache()."""
+        from src.core.persistence import insert_postmortem
+
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "1")
+        loader = PromptLoader(temp_prompts_dir)
+
+        first = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+        assert "phpunit::failed_assertion::sentinel_demo" in first
+
+        insert_postmortem(
+            tmp_db_with_postmortem,
+            execution_id="exec-1",
+            stack_type="drupal",
+            agent="drupal_developer",
+            failure_signature="composer::missing_dependency::sentinel_demo2",
+            context_excerpt="Second demo failure.",
+            fix_summary="Re-run composer install.",
+            provenance="auto",
+            confidence=90,
+        )
+
+        # Cached — second signature not yet visible.
+        cached = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+        assert "composer::missing_dependency::sentinel_demo2" not in cached
+
+        loader.clear_cache()
+        refreshed = loader.load(
+            "plan_generator", stack_type="drupal", conn=tmp_db_with_postmortem
+        )
+        assert "phpunit::failed_assertion::sentinel_demo" in refreshed
+        assert "composer::missing_dependency::sentinel_demo2" in refreshed
+
+    def test_existing_callers_still_get_string_keyed_behaviour(
+        self, temp_prompts_dir
+    ):
+        """No-kwargs load caches under ('agent_name', '') — tuple-key contract."""
+        loader = PromptLoader(temp_prompts_dir)
+        loader.load("plan_generator")
+
+        assert ("plan_generator", "") in loader._cache
+        assert len(loader._cache) == 1
+
+    def test_pitfalls_section_falls_back_on_db_error(
+        self, temp_prompts_dir, monkeypatch, tmp_db_with_postmortem, caplog
+    ):
+        """A closed connection must not raise — base prompt + a warning log."""
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "1")
+        loader = PromptLoader(temp_prompts_dir)
+        tmp_db_with_postmortem.close()
+
+        with caplog.at_level(logging.WARNING, logger="src.prompt_loader"):
+            prompt = loader.load(
+                "plan_generator",
+                stack_type="drupal",
+                conn=tmp_db_with_postmortem,
+            )
+
+        assert "Plan Generator" in prompt
+        assert "Known pitfalls" not in prompt
+        assert any(
+            "Pitfalls injection failed" in rec.message for rec in caplog.records
+        )

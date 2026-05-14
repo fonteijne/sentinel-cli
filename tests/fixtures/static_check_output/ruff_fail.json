@@ -1,0 +1,32 @@
+[
+  {
+    "code": "F401",
+    "message": "`os` imported but unused",
+    "fix": {
+      "applicability": "safe",
+      "message": "Remove unused import: `os`",
+      "edits": [
+        {
+          "content": "",
+          "location": {"row": 3, "column": 1},
+          "end_location": {"row": 4, "column": 1}
+        }
+      ]
+    },
+    "location": {"row": 3, "column": 1},
+    "end_location": {"row": 3, "column": 10},
+    "filename": "src/example/service.py",
+    "noqa_row": 3,
+    "url": "https://docs.astral.sh/ruff/rules/unused-import"
+  },
+  {
+    "code": "E501",
+    "message": "Line too long (124 > 100)",
+    "fix": null,
+    "location": {"row": 27, "column": 101},
+    "end_location": {"row": 27, "column": 125},
+    "filename": "src/example/handlers.py",
+    "noqa_row": 27,
+    "url": "https://docs.astral.sh/ruff/rules/line-too-long"
+  }
+]
