@@ -98,6 +98,85 @@ def _branch_name_for(scope: str) -> str:
     return f"sentinel-learning/promote-{scope}-{stamp}"
 
 
+def _capture_starting_ref(repo_root: Path) -> str:
+    """Snapshot the operator's current git ref BEFORE we mutate HEAD.
+
+    Returns either the current branch name (normal checkout) or the current
+    HEAD SHA (detached HEAD). Both forms are restorable via ``git checkout
+    <ref>``: a branch name re-checks-out the branch; a SHA re-detaches at
+    that commit, which is the correct round-trip for an operator who started
+    detached.
+
+    Resolution order:
+      1. ``git symbolic-ref --short HEAD`` — returns the branch name without
+         the ``refs/heads/`` prefix; exits non-zero on detached HEAD.
+      2. ``git rev-parse HEAD`` — returns the commit SHA; only fails when the
+         repo has an unborn HEAD (no commits at all).
+
+    Raises ``RuntimeError`` if BOTH commands fail. This is the idempotency
+    guarantee: if we can't read the starting ref, we refuse to mutate HEAD
+    at all (the caller must not call ``git checkout -b`` after this raises).
+    """
+    sym = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if sym.returncode == 0:
+        return sym.stdout.strip()
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if sha.returncode == 0 and sha.stdout.strip():
+        return sha.stdout.strip()
+
+    sym_err = (sym.stderr or "").strip()
+    sha_err = (sha.stderr or "").strip()
+    raise RuntimeError(
+        f"could not capture starting git ref in {repo_root}: "
+        f"symbolic-ref: {sym_err!r}; rev-parse: {sha_err!r}"
+    )
+
+
+def _restore_starting_ref(repo_root: Path, ref: str) -> None:
+    """Best-effort restore of HEAD to the captured starting ref.
+
+    Runs ``git checkout <ref>`` with ``check=False``. ``ref`` may be a branch
+    name (normal re-checkout) or a SHA (re-detach at that commit) — both are
+    accepted by ``git checkout`` and produce the correct round-trip.
+
+    A failure here is logged at WARNING level and swallowed: a restore
+    failure inside a ``finally`` must NEVER mask the original exception (if
+    any) bubbling out of the ``try`` block. The operator gets a warning plus
+    the original error.
+
+    Note: we deliberately do NOT use ``git checkout -`` (the "previous
+    branch" shortcut). It depends on git's reflog state, which is mutated by
+    intervening operations and is therefore not deterministic.
+    """
+    result = subprocess.run(
+        ["git", "checkout", ref],
+        cwd=repo_root,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode() if result.stderr else ""
+        logger.warning(
+            "propose_overlays: could not restore starting ref %s in %s: %s",
+            ref,
+            repo_root,
+            stderr.strip(),
+        )
+
+
 def _overlay_relpath_for(scope: str, agent_target: str) -> Path:
     """``prompts/overlays/{scope}_{agent_target}.md`` (relative to repo root)."""
     return Path("prompts") / "overlays" / f"{scope}_{agent_target}.md"
@@ -426,6 +505,10 @@ def propose_overlays(
     for rule in rules:
         rules_by_agent.setdefault(rule["agent_target"], []).append(rule)
 
+    # Snapshot the operator's starting ref BEFORE any HEAD mutation. If this
+    # raises, no checkout is attempted — the operator's tree is untouched.
+    starting_ref = _capture_starting_ref(repo_root)
+
     branch_name = _branch_name_for(scope)
     try:
         subprocess.run(
@@ -451,6 +534,11 @@ def propose_overlays(
     overlay_by_rule_id: dict[int, Path] = {}
     edited_overlay_paths: list[Path] = []
 
+    # State contract: if any step below raises, we re-raise unchanged
+    # (un-mark_proposed'd rules stay promotable, and we deliberately do NOT
+    # delete the promote branch — the operator may want to inspect partial
+    # state). The `finally` restores the operator's HEAD to where they
+    # started regardless of success/failure.
     try:
         for agent_target, agent_rules in rules_by_agent.items():
             overlay_relpath = _overlay_relpath_for(scope, agent_target)
@@ -557,8 +645,5 @@ def propose_overlays(
             )
         return results
 
-    except Exception:
-        # Don't try to clean up the branch on failure — the operator may want
-        # to inspect the partial state. Failure aborts only this run; the
-        # un-mark_proposed'd rules remain promotable for the next run.
-        raise
+    finally:
+        _restore_starting_ref(repo_root, starting_ref)

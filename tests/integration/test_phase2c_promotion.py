@@ -352,12 +352,19 @@ def test_extract_propose_promote_revoke_full_workflow(
     assert call_kwargs["target_branch"] == "main"
     assert call_kwargs["project_id"] == "sentinel-team/sentinel"
 
-    # The overlay file in tmp_repo now contains the rendered bullet's
-    # provenance trailer. Reading from disk (post-commit) confirms the
-    # commit landed.
-    overlay_after = (
-        tmp_repo / "prompts" / "overlays" / "drupal_developer.md"
-    ).read_text(encoding="utf-8")
+    # The overlay file committed onto the promote branch contains the
+    # rendered bullet's provenance trailer. H2 restores HEAD to the
+    # operator's starting ref after the call, so we inspect the promote
+    # branch directly (via `git show <branch>:<path>`) rather than reading
+    # the working tree.
+    promote_branch = call_kwargs["source_branch"]
+    overlay_after = subprocess.run(
+        [
+            "git", "show",
+            f"{promote_branch}:prompts/overlays/drupal_developer.md",
+        ],
+        cwd=tmp_repo, check=True, capture_output=True,
+    ).stdout.decode()
     assert (
         f"<!-- rule:{rule_id} origin:postmortem-" in overlay_after
     ), "overlay must contain the rule provenance trailer"

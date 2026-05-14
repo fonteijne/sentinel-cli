@@ -198,6 +198,25 @@ def _list_branches(repo_root: Path) -> list[str]:
     ]
 
 
+def _current_ref(repo_root: Path) -> str:
+    """Return the current branch name, or the SHA if HEAD is detached.
+
+    Mirrors the production ``_capture_starting_ref`` resolution order so test
+    assertions can compare directly against either form.
+    """
+    sym = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if sym.returncode == 0:
+        return sym.stdout.strip()
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root, capture_output=True, text=True, check=True,
+    )
+    return sha.stdout.strip()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -260,8 +279,10 @@ def test_propose_writes_provenance_trailer(
     assert len(results) == 1
     rule_id = results[0].rule_id
 
+    # HEAD is restored to the operator's starting ref after the call (H2);
+    # inspect the promote branch directly to verify the committed overlay.
     committed = subprocess.run(
-        ["git", "show", "HEAD:prompts/overlays/drupal_developer.md"],
+        ["git", "show", f"{results[0].branch_name}:prompts/overlays/drupal_developer.md"],
         cwd=tmp_repo, check=True, capture_output=True,
     ).stdout.decode()
     assert f"<!-- rule:{rule_id} origin:postmortem-" in committed
@@ -482,3 +503,140 @@ def test_proposal_result_overlay_path_is_string(
     )
     assert isinstance(results[0], ProposalResult)
     assert results[0].overlay_path == str(Path("prompts/overlays/drupal_developer.md"))
+
+
+def test_real_run_restores_head_on_success(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real-run happy path: HEAD is restored to the operator's starting ref,
+    AND the promote branch is preserved on disk (regression guard against
+    accidentally also deleting it).
+    """
+    monkeypatch.setattr(
+        propose_module, "push_overlay_branch", _no_push_overlay_branch,
+    )
+    starting = _current_ref(tmp_repo)
+
+    propose_overlays(
+        conn_with_promotable_rules,
+        gitlab_client=mock_gitlab,
+        repo_root=tmp_repo,
+        repo_project_path="sentinel-team/sentinel",
+        scope="drupal",
+        min_confidence=80,
+    )
+
+    assert _current_ref(tmp_repo) == starting
+    branches_joined = " ".join(_list_branches(tmp_repo))
+    assert "sentinel-learning/promote-drupal-" in branches_joined, (
+        f"promote branch was unexpectedly removed: {branches_joined}"
+    )
+
+
+def test_real_run_restores_head_on_failure(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real-run failure path (push raises): HEAD is restored to starting ref,
+    and the promote branch survives on disk for operator inspection (existing
+    intentional contract, now explicitly tested).
+    """
+    def _failing_push(
+        repo_root: Path,
+        branch_name: str,
+        paths: list[Path],
+        commit_message: str,
+    ) -> None:
+        raise RuntimeError("push fail")
+
+    monkeypatch.setattr(propose_module, "push_overlay_branch", _failing_push)
+    starting = _current_ref(tmp_repo)
+
+    with pytest.raises(RuntimeError, match="push fail"):
+        propose_overlays(
+            conn_with_promotable_rules,
+            gitlab_client=mock_gitlab,
+            repo_root=tmp_repo,
+            repo_project_path="sentinel-team/sentinel",
+            scope="drupal",
+            min_confidence=80,
+        )
+
+    assert _current_ref(tmp_repo) == starting
+    assert any(
+        b.startswith("sentinel-learning/promote-")
+        for b in _list_branches(tmp_repo)
+    ), "promote branch must be preserved on failure for operator inspection"
+
+
+def test_dry_run_restores_head_when_apply_overlay_raises_midflow(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dry-run mid-flow failure (e.g. malformed overlay): HEAD must still be
+    restored. Previously the dry-run cleanup (`git checkout -` + `git branch
+    -D`) only ran on the happy path; an exception inside the loop stranded
+    HEAD on the promote branch.
+    """
+    monkeypatch.setattr(
+        propose_module,
+        "_apply_overlay_edit",
+        Mock(side_effect=RuntimeError("synthetic")),
+    )
+    starting = _current_ref(tmp_repo)
+
+    with pytest.raises(RuntimeError, match="synthetic"):
+        propose_overlays(
+            conn_with_promotable_rules,
+            gitlab_client=mock_gitlab,
+            repo_root=tmp_repo,
+            repo_project_path="sentinel-team/sentinel",
+            scope="drupal",
+            min_confidence=80,
+            dry_run=True,
+        )
+
+    assert _current_ref(tmp_repo) == starting
+
+
+def test_restores_to_detached_head_when_started_detached(
+    conn_with_promotable_rules: sqlite3.Connection,
+    tmp_repo: Path,
+    mock_gitlab: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator started in detached HEAD: snapshot via `git rev-parse HEAD`,
+    restore via `git checkout <sha>` (which re-detaches at the same SHA).
+    """
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", sha],
+        cwd=tmp_repo, check=True, capture_output=True,
+    )
+    # Sanity check: we're now detached at `sha`.
+    assert _current_ref(tmp_repo) == sha
+
+    monkeypatch.setattr(
+        propose_module, "push_overlay_branch", _no_push_overlay_branch,
+    )
+
+    propose_overlays(
+        conn_with_promotable_rules,
+        gitlab_client=mock_gitlab,
+        repo_root=tmp_repo,
+        repo_project_path="sentinel-team/sentinel",
+        scope="drupal",
+        min_confidence=80,
+    )
+
+    assert _current_ref(tmp_repo) == sha
