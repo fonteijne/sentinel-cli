@@ -30,6 +30,7 @@ NOT change ``status``).
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -48,6 +49,22 @@ logger = logging.getLogger(__name__)
 # per-rule context_excerpts long before then so the description stays readable.
 _MR_DESCRIPTION_MAX_BYTES = 64 * 1024
 _CONTEXT_EXCERPT_MAX_CHARS = 200
+
+# Allowlist for `scope` and `agent_target` interpolated into the overlay
+# file path. Both args originate from DB rows (postmortems.stack_type and
+# postmortems.agent respectively); a malformed/malicious upstream row with
+# path separators (e.g. agent='drupal_developer/../etc') would otherwise
+# let _overlay_relpath_for redirect the edit outside prompts/overlays/.
+# Defense in depth (M3): the data flow is internal today, but validating
+# here is one regex.
+#
+# Pattern: lowercase ASCII letter + lowercase ASCII alphanumerics or `_`,
+# matched as fullmatch (anchored both ends). Verified against every agent
+# name in src/agents/ (drupal_developer, python_developer, plan_generator,
+# security_reviewer, drupal_reviewer, confidence_evaluator,
+# functional_debrief, base_agent, base_developer) and every concrete
+# stack_type from src/stack_profiler.py (drupal9, drupal10, drupal11).
+_SAFE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 class _EventBusLike(Protocol):
@@ -182,7 +199,21 @@ def _restore_starting_ref(repo_root: Path, ref: str) -> None:
 
 
 def _overlay_relpath_for(scope: str, agent_target: str) -> Path:
-    """``prompts/overlays/{scope}_{agent_target}.md`` (relative to repo root)."""
+    """``prompts/overlays/{scope}_{agent_target}.md`` (relative to repo root).
+
+    Raises ``ValueError`` if either arg fails the ``_SAFE_NAME_RE``
+    allowlist (defense in depth — see the constant's docstring for why).
+    """
+    if not _SAFE_NAME_RE.fullmatch(scope):
+        raise ValueError(
+            f"_overlay_relpath_for: invalid scope {scope!r}; "
+            f"must match {_SAFE_NAME_RE.pattern}"
+        )
+    if not _SAFE_NAME_RE.fullmatch(agent_target):
+        raise ValueError(
+            f"_overlay_relpath_for: invalid agent_target {agent_target!r}; "
+            f"must match {_SAFE_NAME_RE.pattern}"
+        )
     return Path("prompts") / "overlays" / f"{scope}_{agent_target}.md"
 
 

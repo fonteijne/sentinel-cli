@@ -794,3 +794,68 @@ def test_dry_run_refuses_when_overlay_is_untracked(
             min_confidence=80,
             dry_run=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# _overlay_relpath_for validation (M3 — defense in depth)
+# ---------------------------------------------------------------------------
+
+
+def test_overlay_relpath_for_valid_inputs() -> None:
+    """No-op proof: known-good ``(scope, agent_target)`` produces the
+    expected path under ``prompts/overlays/`` and does not raise."""
+    from src.core.learning.propose_overlay import _overlay_relpath_for
+
+    assert (
+        str(_overlay_relpath_for("drupal", "developer"))
+        == "prompts/overlays/drupal_developer.md"
+    )
+    # Real stack_type with a digit (drupal9/10/11 from stack_profiler.py)
+    assert (
+        str(_overlay_relpath_for("drupal10", "plan_generator"))
+        == "prompts/overlays/drupal10_plan_generator.md"
+    )
+
+
+def test_overlay_relpath_for_rejects_traversal_in_agent_target() -> None:
+    """``agent_target`` with path separators (e.g. ``"../etc"``) raises
+    ``ValueError`` at the leaf — defense in depth even if the DB ever holds
+    a malformed row."""
+    from src.core.learning.propose_overlay import _overlay_relpath_for
+
+    with pytest.raises(ValueError, match=r"invalid agent_target"):
+        _overlay_relpath_for("drupal", "../etc")
+
+
+def test_overlay_relpath_for_rejects_traversal_in_scope() -> None:
+    """``scope`` is also DB-sourced (postmortems.stack_type) and is
+    interpolated into the filename — same validation."""
+    from src.core.learning.propose_overlay import _overlay_relpath_for
+
+    with pytest.raises(ValueError, match=r"invalid scope"):
+        _overlay_relpath_for("../etc", "developer")
+
+
+@pytest.mark.parametrize(
+    "scope,agent_target",
+    [
+        ("", "developer"),                      # empty scope
+        ("drupal", ""),                         # empty agent_target
+        ("Drupal", "developer"),                # uppercase rejected
+        ("drupal", "Developer"),                # uppercase rejected
+        ("9drupal", "developer"),               # leading digit rejected
+        ("drupal", "9developer"),               # leading digit rejected
+        ("drupal", "developer/extra"),          # forward slash
+        ("drupal", "developer\\extra"),         # backslash
+        ("drupal", "developer.md"),             # dot
+        ("drupal", "developer extra"),          # space
+        ("drupal", "developer\x00etc"),         # NUL byte
+    ],
+)
+def test_overlay_relpath_for_rejects_malformed_inputs(
+    scope: str, agent_target: str,
+) -> None:
+    from src.core.learning.propose_overlay import _overlay_relpath_for
+
+    with pytest.raises(ValueError):
+        _overlay_relpath_for(scope, agent_target)
