@@ -1,10 +1,13 @@
 """GitLab API client for merge request management."""
 
+import logging
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from src.config_loader import get_config
+
+logger = logging.getLogger(__name__)
 
 
 class GitLabClient:
@@ -211,32 +214,75 @@ class GitLabClient:
         project_id: str,
         state: str = "opened",
         source_branch: Optional[str] = None,
+        *,
+        created_after: Optional[str] = None,
+        per_page: int = 100,
+        max_pages: int = 100,
     ) -> List[Dict[str, Any]]:
-        """List merge requests for a project.
+        """List merge requests for a project (paginated).
 
         Args:
             project_id: GitLab project ID or path
             state: MR state - "opened", "closed", "merged", or "all"
             source_branch: Filter by source branch (optional)
+            created_after: ISO-8601 UTC timestamp; restricts results to MRs
+                created at or after this instant. Inclusive on the second per
+                GitLab CE >=11.x semantics. Older self-hosted GitLab silently
+                ignores the filter (graceful degradation).
+            per_page: rows per request page (default 100; GitLab max is 100).
+            max_pages: safety hatch — stop after this many pages and log a
+                warning. Bounds the worst case for a sync run.
 
         Returns:
-            List of merge request dictionaries
+            List of merge request dictionaries, ordered ``created_at asc``.
 
         Raises:
-            requests.HTTPError: If API request fails
+            requests.HTTPError: If API request fails on any page.
         """
         project_path = project_id.replace("/", "%2F")
         url = f"{self.base_url}/api/v4/projects/{project_path}/merge_requests"
 
-        params = {"state": state}
-        if source_branch:
-            params["source_branch"] = source_branch
+        results: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            params: Dict[str, Any] = {
+                "state": state,
+                "order_by": "created_at",
+                "sort": "asc",
+                "per_page": per_page,
+                "page": page,
+            }
+            if source_branch:
+                params["source_branch"] = source_branch
+            if created_after is not None:
+                params["created_after"] = created_after
 
-        response = self.session.get(url, params=params)
-        response.raise_for_status()
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            batch: List[Dict[str, Any]] = response.json()
+            results.extend(batch)
 
-        result: List[Dict[str, Any]] = response.json()
-        return result
+            total_pages_hdr = response.headers.get("X-Total-Pages")
+            if total_pages_hdr is not None:
+                if page >= int(total_pages_hdr):
+                    break
+            elif len(batch) < per_page:
+                break
+
+            if page >= max_pages:
+                logger.warning(
+                    "list_merge_requests: hit max_pages=%d safety hatch "
+                    "for project=%s (state=%s, created_after=%s)",
+                    max_pages,
+                    project_id,
+                    state,
+                    created_after,
+                )
+                break
+
+            page += 1
+
+        return results
 
     def list_merged_mrs_since(
         self,

@@ -370,6 +370,225 @@ class TestOutcomeSyncService:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Revert-lookup hoist optimization (H5)
+# ---------------------------------------------------------------------------
+
+
+class TestRevertLookupOptimization:
+    """H5: ``list_merge_requests`` is called at most once per ``sync()``.
+
+    Before H5: O(M) calls (one per Sentinel-owned MR processed).
+    After  H5: O(1) call hoisted into ``sync()``, narrowed by ``created_after``.
+
+    These tests pin the load-bearing optimization invariant + verify
+    classification semantics are byte-identical pre/post-refactor.
+    """
+
+    def test_called_once_per_sync_with_one_mr(self, sqlite_mem_conn):
+        mr = _make_mr(iid=1, ticket_id="TEST-1")
+        gl = _make_gitlab_mock(merged_mrs=[mr])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        service.sync(project="acme/backend")
+
+        assert gl.list_merge_requests.call_count == 1
+
+    def test_called_once_per_sync_with_many_mrs(self, sqlite_mem_conn):
+        """10 Sentinel-owned MRs → still exactly 1 list_merge_requests call."""
+        # Seed extra executions so each ticket has untagged work.
+        for i in range(2, 11):
+            _seed_execution(
+                sqlite_mem_conn,
+                execution_id=f"test-exec-{i}",
+                ticket_id=f"TEST-{i}",
+                created_at=f"2026-05-{i:02d}T00:00:00Z",
+            )
+        mrs = [
+            _make_mr(
+                iid=i,
+                ticket_id=f"TEST-{i}",
+                updated_at=f"2026-05-{i:02d}T00:00:00Z",
+                merge_commit_sha=f"sha{i:013d}",
+            )
+            for i in range(1, 11)
+        ]
+        gl = _make_gitlab_mock(merged_mrs=mrs)
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        summary = service.sync(project="acme/backend")
+
+        assert gl.list_merge_requests.call_count == 1
+        # Sanity: pipelines still scale per Sentinel-owned MR (existing behavior).
+        assert gl.list_pipelines_for_commit.call_count == 10
+        assert summary.executions_tagged == 10
+
+    def test_not_called_when_no_sentinel_mrs(self, sqlite_mem_conn):
+        """Only non-Sentinel branches → skip the revert-candidate fetch entirely."""
+        mr = {
+            "iid": 1,
+            "source_branch": "hotfix/x",
+            "target_branch": "main",
+            "updated_at": "2026-05-01T00:00:00Z",
+            "merged_at": "2026-05-01T00:00:00Z",
+            "merge_commit_sha": "abc",
+            "state": "merged",
+            "title": "Hotfix",
+        }
+        gl = _make_gitlab_mock(merged_mrs=[mr])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        service.sync(project="acme/backend")
+
+        assert gl.list_merge_requests.call_count == 0
+
+    def test_not_called_when_no_mrs_at_all(self, sqlite_mem_conn):
+        """Empty merged-MR list → skip the revert-candidate fetch."""
+        gl = _make_gitlab_mock(merged_mrs=[])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        service.sync(project="acme/backend")
+
+        assert gl.list_merge_requests.call_count == 0
+
+    def test_passes_min_merged_at_as_created_after(self, sqlite_mem_conn):
+        """``created_after`` = min(merged_at) across Sentinel-owned MRs."""
+        _seed_execution(
+            sqlite_mem_conn,
+            execution_id="test-exec-2",
+            ticket_id="TEST-2",
+        )
+        _seed_execution(
+            sqlite_mem_conn,
+            execution_id="test-exec-3",
+            ticket_id="TEST-3",
+        )
+        mrs = [
+            _make_mr(iid=1, ticket_id="TEST-1", updated_at="2026-05-03T00:00:00Z"),
+            _make_mr(iid=2, ticket_id="TEST-2", updated_at="2026-05-01T00:00:00Z"),
+            _make_mr(iid=3, ticket_id="TEST-3", updated_at="2026-05-02T00:00:00Z"),
+        ]
+        gl = _make_gitlab_mock(merged_mrs=mrs)
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        service.sync(project="acme/backend")
+
+        assert gl.list_merge_requests.call_count == 1
+        kwargs = gl.list_merge_requests.call_args.kwargs
+        assert kwargs["state"] == "merged"
+        assert kwargs["created_after"] == "2026-05-01T00:00:00Z"
+        assert kwargs["project_id"] == "acme/backend"
+
+    def test_min_merged_at_falls_back_to_updated_at_when_merged_at_missing(
+        self, sqlite_mem_conn
+    ):
+        """Older MRs without ``merged_at`` fall back to ``updated_at``."""
+        mr = _make_mr(iid=1, ticket_id="TEST-1")
+        # Drop merged_at.
+        del mr["merged_at"]
+        mr["updated_at"] = "2026-04-15T00:00:00Z"
+        gl = _make_gitlab_mock(merged_mrs=[mr])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        service.sync(project="acme/backend")
+
+        kwargs = gl.list_merge_requests.call_args.kwargs
+        assert kwargs["created_after"] == "2026-04-15T00:00:00Z"
+
+    def test_min_merged_at_excludes_non_sentinel_branches(self, sqlite_mem_conn):
+        """``created_after`` is computed only over Sentinel-owned MRs."""
+        non_sentinel = {
+            "iid": 99,
+            "source_branch": "hotfix/x",
+            "target_branch": "main",
+            "updated_at": "2026-04-01T00:00:00Z",
+            "merged_at": "2026-04-01T00:00:00Z",
+            "merge_commit_sha": "deadbeef",
+            "state": "merged",
+            "title": "Hotfix",
+        }
+        sentinel_mr = _make_mr(
+            iid=1, ticket_id="TEST-1", updated_at="2026-05-10T00:00:00Z"
+        )
+        gl = _make_gitlab_mock(merged_mrs=[non_sentinel, sentinel_mr])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        service.sync(project="acme/backend")
+
+        kwargs = gl.list_merge_requests.call_args.kwargs
+        # NOT 2026-04-01 (the hotfix's merged_at) — only Sentinel MRs count.
+        assert kwargs["created_after"] == "2026-05-10T00:00:00Z"
+
+    def test_revert_classification_unchanged_after_hoist(
+        self, sqlite_mem_conn, event_bus
+    ):
+        """Revert detection still produces ``rolled_back`` with byte-identical
+        evidence shape on the canonical fixture."""
+        mr = _make_mr(
+            iid=10,
+            ticket_id="TEST-1",
+            title="Fix flaky test",
+            updated_at="2026-05-01T00:00:00Z",
+        )
+        revert = {
+            "iid": 200,
+            "state": "merged",
+            "title": 'Revert "Fix flaky test"',
+        }
+        gl = _make_gitlab_mock(merged_mrs=[mr], merge_requests=[revert])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=event_bus)
+
+        summary = service.sync(project="acme/backend")
+
+        assert summary.tag_counts == {"rolled_back": 1}
+        # Evidence dict is byte-identical to the pre-refactor classifier output.
+        import json as _json
+
+        row = sqlite_mem_conn.execute(
+            "SELECT outcome, outcome_evidence_json FROM executions "
+            "WHERE id='test-exec-1'"
+        ).fetchone()
+        assert row["outcome"] == "rolled_back"
+        evidence = _json.loads(row["outcome_evidence_json"])
+        assert evidence["outcome"] == "rolled_back"
+        assert evidence["mr_iid"] == 10
+        assert evidence["revert_mr_iid"] == 200
+        assert evidence["merge_commit_sha"] == "deadbeefcafe1234"
+
+    def test_revert_lookup_failure_records_one_error_for_many_mrs(
+        self, sqlite_mem_conn
+    ):
+        """list_merge_requests raises → 1 error recorded (not M), all MRs success."""
+        for i in range(2, 6):
+            _seed_execution(
+                sqlite_mem_conn,
+                execution_id=f"test-exec-{i}",
+                ticket_id=f"TEST-{i}",
+                created_at=f"2026-05-{i:02d}T00:00:00Z",
+            )
+        mrs = [
+            _make_mr(
+                iid=i,
+                ticket_id=f"TEST-{i}",
+                updated_at=f"2026-05-{i:02d}T00:00:00Z",
+                merge_commit_sha=f"sha{i:013d}",
+            )
+            for i in range(1, 6)
+        ]
+        gl = _make_gitlab_mock(merged_mrs=mrs)
+        gl.list_merge_requests.side_effect = requests.HTTPError("500")
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        summary = service.sync(project="acme/backend")
+
+        # All five MRs classified success (no revert match because empty list).
+        assert summary.executions_tagged == 5
+        assert summary.tag_counts == {"success": 5}
+        # One revert-lookup error (not five).
+        revert_errors = [e for e in summary.errors if "revert lookup" in e]
+        assert len(revert_errors) == 1
+
+
+# ---------------------------------------------------------------------------
 # 3. sync_state helpers
 # ---------------------------------------------------------------------------
 

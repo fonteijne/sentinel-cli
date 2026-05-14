@@ -267,6 +267,30 @@ class OutcomeSyncService:
         max_updated_at_handled: Optional[str] = None
         max_iid_handled: Optional[int] = None
 
+        # Hoist revert-candidate fetch: one paginated call per sync, narrowed
+        # by created_after = min(merged_at across Sentinel-owned MRs). Sentinel-
+        # owned MRs are the only ones that ever reach _find_revert_mr, so we
+        # filter to that subset before computing the bound. If none exist,
+        # skip the fetch entirely.
+        sentinel_mrs = [
+            m for m in mrs if _BRANCH_RE.match(m.get("source_branch", ""))
+        ]
+        if sentinel_mrs:
+            min_merged_at: Optional[str] = None
+            for m in sentinel_mrs:
+                ts = m.get("merged_at") or m.get("updated_at")
+                if ts is None:
+                    continue
+                if min_merged_at is None or ts < min_merged_at:
+                    min_merged_at = ts
+            revert_candidates = self._fetch_revert_candidates(
+                project=project,
+                created_after=min_merged_at,
+                summary=summary,
+            )
+        else:
+            revert_candidates = []
+
         for mr in mrs:
             summary.mrs_seen += 1
             try:
@@ -275,6 +299,7 @@ class OutcomeSyncService:
                     mr=mr,
                     summary=summary,
                     dry_run=dry_run,
+                    revert_candidates=revert_candidates,
                 )
             except Exception as exc:
                 msg = (
@@ -366,6 +391,7 @@ class OutcomeSyncService:
         mr: Dict[str, Any],
         summary: OutcomeSyncSummary,
         dry_run: bool,
+        revert_candidates: List[Dict[str, Any]],
     ) -> Tuple[bool, Optional[str], Optional[int]]:
         """Handle one MR. Returns ``(handled, updated_at, iid)``.
 
@@ -421,8 +447,8 @@ class OutcomeSyncService:
                 summary.errors.append(msg)
                 pipelines = []
 
-        # --- revert detection: best-effort, never abort on lookup failure ---
-        revert_mr = self._find_revert_mr(project=project, mr=mr, summary=summary)
+        # --- revert detection: pure scan over hoisted candidates ---
+        revert_mr = self._find_revert_mr(mr=mr, candidates=revert_candidates)
 
         # --- classify ---
         outcome, evidence = classify_outcome(mr, pipelines, revert_mr)
@@ -476,38 +502,65 @@ class OutcomeSyncService:
 
         return True, mr.get("updated_at"), mr.get("iid")
 
-    def _find_revert_mr(
+    def _fetch_revert_candidates(
         self,
         *,
         project: str,
-        mr: Dict[str, Any],
+        created_after: Optional[str],
         summary: OutcomeSyncSummary,
-    ) -> Optional[Dict[str, Any]]:
-        """Best-effort revert detection.
+    ) -> List[Dict[str, Any]]:
+        """Fetch the project's merged-MR list once per ``sync()``.
 
-        Heuristic (intentionally simple per Phase 3A "NOT Building"):
-        list the project's merged MRs and pick one whose title starts with
-        ``Revert "`` AND references either the original MR title or the
-        merge_commit_sha[:8].
-
-        A failure here is non-fatal: log + record + return None so the MR
-        gets classified as ``success``-or-better. Reverted-but-undetected is
-        a known limitation; richer detection is future work (PRD §"Auto-revert
-        detection beyond title prefix...").
+        Best-effort: a 5xx / network error is recorded once on
+        ``summary.errors`` and an empty list is returned, so every Sentinel-
+        owned MR processed in this sync is classified ``success``-or-better
+        rather than aborting the run. ``created_after`` narrows the GitLab
+        response to MRs created at or after the earliest candidate's
+        ``merged_at``; reverts created before that instant cannot logically
+        be reverts of any candidate in this batch.
         """
         try:
-            candidates = self._gitlab.list_merge_requests(
-                project_id=project, state="merged"
+            return self._gitlab.list_merge_requests(
+                project_id=project,
+                state="merged",
+                created_after=created_after,
             )
         except Exception as exc:
             msg = (
-                f"revert lookup (list_merge_requests) failed project={project} "
-                f"mr_iid={mr.get('iid')}: {exc}"
+                f"revert lookup (list_merge_requests) failed project={project}: "
+                f"{exc}"
             )
             logger.warning(msg)
             summary.errors.append(msg)
-            return None
+            return []
 
+    def _find_revert_mr(
+        self,
+        *,
+        mr: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Best-effort revert detection, pure scan (no HTTP).
+
+        Heuristic (intentionally simple per Phase 3A "NOT Building"):
+        scan the hoisted ``candidates`` list (already filtered by ``state``
+        and ``created_after`` upstream) and pick one whose title starts with
+        ``Revert "`` AND references either the original MR title or the
+        ``merge_commit_sha[:8]``.
+
+        Args:
+            mr: the source MR being classified.
+            candidates: pre-fetched merged-MR list from
+                ``_fetch_revert_candidates``. The caller is responsible for
+                narrowing this list (typically by ``created_after = min(merged_at)``
+                across Sentinel-owned MRs) so this scan is O(M*K) where K is
+                the count of merged MRs created after the earliest candidate.
+
+        Returns ``None`` when no candidate matches; the upstream classifier
+        then records ``success``-or-better. Reverted-but-undetected is a
+        known limitation; richer detection is future work (PRD §"Auto-revert
+        detection beyond title prefix...").
+        """
         original_title = mr.get("title", "") or ""
         merge_commit_sha = mr.get("merge_commit_sha", "") or ""
         sha_prefix = merge_commit_sha[:8] if merge_commit_sha else ""

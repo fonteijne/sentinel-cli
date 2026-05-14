@@ -371,6 +371,7 @@ class TestListMergeRequests:
             {"iid": 123, "title": "First MR"},
             {"iid": 124, "title": "Second MR"},
         ]
+        mock_response.headers = {"X-Total-Pages": "1"}
 
         with patch.object(
             gitlab_client.session, "get", return_value=mock_response
@@ -389,6 +390,7 @@ class TestListMergeRequests:
         """Test listing MRs with custom state."""
         mock_response = Mock()
         mock_response.json.return_value = []
+        mock_response.headers = {"X-Total-Pages": "1"}
 
         with patch.object(
             gitlab_client.session, "get", return_value=mock_response
@@ -403,6 +405,7 @@ class TestListMergeRequests:
         """Test listing MRs filtered by source branch."""
         mock_response = Mock()
         mock_response.json.return_value = []
+        mock_response.headers = {"X-Total-Pages": "1"}
 
         with patch.object(
             gitlab_client.session, "get", return_value=mock_response
@@ -420,11 +423,109 @@ class TestListMergeRequests:
         """Test listing MRs when none exist."""
         mock_response = Mock()
         mock_response.json.return_value = []
+        mock_response.headers = {"X-Total-Pages": "1"}
 
         with patch.object(gitlab_client.session, "get", return_value=mock_response):
             result = gitlab_client.list_merge_requests("test/project")
 
             assert result == []
+
+    def test_passes_created_after_when_provided(self, gitlab_client):
+        """``created_after`` kwarg is forwarded as a query param."""
+        mock_response = Mock()
+        mock_response.json.return_value = []
+        mock_response.headers = {"X-Total-Pages": "1"}
+
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ) as mock_get:
+            gitlab_client.list_merge_requests(
+                "test/project",
+                state="merged",
+                created_after="2026-05-01T00:00:00Z",
+            )
+
+            params = mock_get.call_args.kwargs["params"]
+            assert params["state"] == "merged"
+            assert params["created_after"] == "2026-05-01T00:00:00Z"
+            assert params["order_by"] == "created_at"
+            assert params["sort"] == "asc"
+
+    def test_passes_no_created_after_when_omitted(self, gitlab_client):
+        """Default invocation must not send ``created_after`` (back-compat)."""
+        mock_response = Mock()
+        mock_response.json.return_value = []
+        mock_response.headers = {"X-Total-Pages": "1"}
+
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ) as mock_get:
+            gitlab_client.list_merge_requests("test/project")
+
+            params = mock_get.call_args.kwargs["params"]
+            assert "created_after" not in params
+
+    def test_paginates_until_x_total_pages(self, gitlab_client):
+        """Concatenates all pages when X-Total-Pages > 1."""
+        page1 = Mock()
+        page1.json.return_value = [{"iid": 1}, {"iid": 2}]
+        page1.headers = {"X-Total-Pages": "2"}
+        page2 = Mock()
+        page2.json.return_value = [{"iid": 3}]
+        page2.headers = {"X-Total-Pages": "2"}
+
+        with patch.object(
+            gitlab_client.session, "get", side_effect=[page1, page2]
+        ) as mock_get:
+            result = gitlab_client.list_merge_requests(
+                "test/project", state="merged"
+            )
+
+        assert [r["iid"] for r in result] == [1, 2, 3]
+        assert mock_get.call_count == 2
+        assert mock_get.call_args_list[0].kwargs["params"]["page"] == 1
+        assert mock_get.call_args_list[1].kwargs["params"]["page"] == 2
+
+    def test_paginates_until_short_batch_when_no_total_pages_header(
+        self, gitlab_client
+    ):
+        """Without X-Total-Pages, stop when a page returns < per_page rows."""
+        full = Mock()
+        full.json.return_value = [{"iid": i} for i in range(100)]
+        full.headers = {}
+        short = Mock()
+        short.json.return_value = [{"iid": 100}]
+        short.headers = {}
+
+        with patch.object(
+            gitlab_client.session, "get", side_effect=[full, short]
+        ) as mock_get:
+            result = gitlab_client.list_merge_requests(
+                "test/project", state="merged"
+            )
+
+        assert len(result) == 101
+        assert mock_get.call_count == 2
+
+    def test_max_pages_safety_hatch_logs_and_breaks(self, gitlab_client, caplog):
+        """Hits ``max_pages``: logs a warning and stops fetching."""
+        full = Mock()
+        full.json.return_value = [{"iid": i} for i in range(100)]
+        full.headers = {}  # no X-Total-Pages, no termination by short batch
+
+        with patch.object(
+            gitlab_client.session, "get", return_value=full
+        ) as mock_get:
+            with caplog.at_level("WARNING"):
+                result = gitlab_client.list_merge_requests(
+                    "test/project", state="merged", max_pages=3
+                )
+
+        assert mock_get.call_count == 3
+        assert len(result) == 300
+        assert any(
+            "max_pages=3 safety hatch" in rec.getMessage() for rec in caplog.records
+        )
 
 
 class TestGetProjectId:
