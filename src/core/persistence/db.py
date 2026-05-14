@@ -15,6 +15,7 @@ plan §Patterns SQLITE_MIGRATION_PATTERN):
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -24,14 +25,70 @@ from typing import List, Optional
 
 _MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 _DEFAULT_DB_PATH = "~/.sentinel/sentinel.db"
+_KNOWN_DB_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
+
+logger = logging.getLogger(__name__)
+
+# Per-process flag: emit the resolved-path audit log only on first connect().
+# Re-importing the module (e.g. in fresh subprocesses) resets this. Tests
+# that need a clean slate should monkeypatch this back to False.
+_path_logged: bool = False
 
 
 def _resolve_path(path: Optional[str]) -> Path:
-    """Resolve the DB path. Precedence: explicit arg > env > default."""
-    raw = path or os.getenv("SENTINEL_DB_PATH") or _DEFAULT_DB_PATH
+    """Resolve the DB path. Precedence: explicit arg > env > default.
+
+    Side effects (defense-in-depth):
+      - On first call per process, logs the resolved path at INFO so
+        operators have a grep-able audit line ("source=arg|env|default").
+      - On first call per process, logs a WARNING if the resolved path's
+        suffix is not one of {.db, .sqlite, .sqlite3} -- typos like
+        ``SENTINEL_DB_PATH=/tmp/sentinel.txt`` surface without blocking.
+      - Surfaces ``OSError`` from ``Path.resolve`` (e.g. symlink loops)
+        as a ``ValueError`` with Sentinel-specific context.
+    """
+    global _path_logged
+
+    # Truthy check (mirrors prior ``or``-chain semantics: empty string
+    # falls through to env-var, then default).
+    if path:
+        raw, source = path, "arg"
+    elif env_val := os.getenv("SENTINEL_DB_PATH"):
+        raw, source = env_val, "env"
+    else:
+        raw, source = _DEFAULT_DB_PATH, "default"
+
     if raw == ":memory:":
+        # Short-circuit: in-memory DBs are always intentional, never logged
+        # (we'd just spam test output).
         return Path(":memory:")
-    return Path(raw).expanduser().resolve()
+
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        # ``OSError`` covers most resolution failures; CPython 3.11+
+        # specifically re-raises ``OSError(ELOOP)`` as ``RuntimeError`` from
+        # ``pathlib.Path.resolve`` on symlink loops, so we catch both.
+        raise ValueError(
+            f"SENTINEL_DB_PATH could not be resolved (source={source}, raw={raw!r}): {exc}"
+        ) from exc
+
+    if not _path_logged:
+        logger.info(
+            "Sentinel DB path: %s (source=%s)",
+            resolved,
+            source,
+        )
+        if resolved.suffix not in _KNOWN_DB_SUFFIXES:
+            logger.warning(
+                "Sentinel DB path has unusual suffix %r (expected one of %s); "
+                "proceeding anyway, but verify SENTINEL_DB_PATH is correct.",
+                resolved.suffix,
+                sorted(_KNOWN_DB_SUFFIXES),
+            )
+        _path_logged = True
+
+    return resolved
 
 
 def connect(path: Optional[str] = None) -> sqlite3.Connection:
