@@ -107,13 +107,13 @@ def test_supersede_chain_full_workflow(conn: sqlite3.Connection) -> None:
         overlay_path="prompts/overlays/drupal_developer.md",
         mr_url="https://gl.example.com/sentinel-team/sentinel/-/merge_requests/42",
     )
-    mark_promoted(conn, rule_id=rule_a_id, sha="aaa", promoted_by="alice")
+    mark_promoted(conn, rule_id=rule_a_id, sha="aaa1234", promoted_by="alice")
 
     row_a = conn.execute(
         "SELECT * FROM feedback_rules WHERE id = ?", (rule_a_id,)
     ).fetchone()
     assert row_a["status"] == "active"
-    assert row_a["promoted_to_overlay_sha"] == "aaa"
+    assert row_a["promoted_to_overlay_sha"] == "aaa1234"
     assert row_a["promoted_by"] == "alice"
     assert row_a["proposed_overlay_mr_url"].endswith("/42")
     assert row_a["superseded_by"] is None
@@ -143,7 +143,7 @@ def test_supersede_chain_full_workflow(conn: sqlite3.Connection) -> None:
     ).fetchone()
     assert row_a_after["status"] == "superseded"
     assert row_a_after["superseded_by"] == rule_b_id
-    assert row_a_after["promoted_to_overlay_sha"] == "aaa", (
+    assert row_a_after["promoted_to_overlay_sha"] == "aaa1234", (
         "supersession must NOT erase A's promotion audit"
     )
     assert row_a_after["promoted_by"] == "alice"

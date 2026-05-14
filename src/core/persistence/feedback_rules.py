@@ -18,15 +18,20 @@ Design invariants (plan §"Patterns to Mirror" / D4 / append-only invariant):
     crash mid-call cannot leave a row pointing at a successor whose own status
     is still 'probation'.
   - All write helpers bump ``updated_at`` to a fresh UTC ISO timestamp.
+  - ``mark_promoted`` validates ``sha`` against ``^[0-9a-f]{7,64}$`` before any
+    DB I/O. SHA is append-only per D4 — typos caught at the leaf can never
+    become a permanent ghost row.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
 _VALID_STATUS = frozenset({"probation", "active", "superseded", "revoked"})
+_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 
 
 def _utcnow_iso() -> str:
@@ -212,7 +217,15 @@ def mark_promoted(
     ``revoke_rule`` cannot race with the status check. Raises ``ValueError``
     if the row's prior status was not 'probation' (an already-active or
     revoked or superseded row must not be silently re-promoted).
+
+    Raises ``ValueError`` if ``sha`` does not match ``^[0-9a-f]{7,64}$`` (Git
+    short or full SHA, lowercase hex only). Validated *before* opening the
+    transaction so a malformed input never reaches DB I/O.
     """
+    if not _SHA_RE.fullmatch(sha):
+        raise ValueError(
+            f"sha must be 7-64 lowercase hex characters; got {sha!r}"
+        )
     now = _utcnow_iso()
     conn.execute("BEGIN IMMEDIATE")
     try:

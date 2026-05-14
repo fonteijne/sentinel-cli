@@ -195,7 +195,7 @@ def test_query_promotable_filters_by_confidence_and_status(
     rid_active = upsert_rule(
         conn, **_make_upsert_kwargs(signature="active-95", confidence=95)
     )
-    mark_promoted(conn, rule_id=rid_active, sha="abc", promoted_by="alice")
+    mark_promoted(conn, rule_id=rid_active, sha="abc1234", promoted_by="alice")
     # 4: probation conf=85 then revoked. Below: not 'probation'.
     rid_revoked = upsert_rule(
         conn, **_make_upsert_kwargs(signature="revoked-85", confidence=85)
@@ -263,28 +263,76 @@ def test_mark_promoted_flips_status_and_records_sha(conn: sqlite3.Connection) ->
     assert pre["promoted_by"] is None
     assert pre["promoted_at"] is None
 
-    mark_promoted(conn, rule_id=rid, sha="def456", promoted_by="alice")
+    mark_promoted(conn, rule_id=rid, sha="def4567", promoted_by="alice")
 
     after = _row_for(conn, rid)
     assert after["status"] == "active"
-    assert after["promoted_to_overlay_sha"] == "def456"
+    assert after["promoted_to_overlay_sha"] == "def4567"
     assert after["promoted_by"] == "alice"
     assert after["promoted_at"]
 
 
 def test_mark_promoted_rejects_non_probation(conn: sqlite3.Connection) -> None:
     rid = upsert_rule(conn, **_make_upsert_kwargs(signature="non-prob"))
-    mark_promoted(conn, rule_id=rid, sha="x", promoted_by="alice")  # status=active
+    mark_promoted(conn, rule_id=rid, sha="abcdef0", promoted_by="alice")  # status=active
 
     with pytest.raises(ValueError):
-        mark_promoted(conn, rule_id=rid, sha="y", promoted_by="alice")
+        mark_promoted(conn, rule_id=rid, sha="abcdef1", promoted_by="alice")
 
     rid_revoked = upsert_rule(
         conn, **_make_upsert_kwargs(signature="non-prob-revoked")
     )
     revoke_rule(conn, rule_id=rid_revoked, revoked_by="alice", reason="r")
     with pytest.raises(ValueError):
-        mark_promoted(conn, rule_id=rid_revoked, sha="z", promoted_by="alice")
+        mark_promoted(conn, rule_id=rid_revoked, sha="abcdef2", promoted_by="alice")
+
+
+@pytest.mark.parametrize(
+    "good_sha",
+    [
+        "a1b2c3d",                                   # 7-char short SHA (Git default)
+        "abcdef0123456789abcdef0123456789abcdef01",  # 40-char full SHA-1
+        "0" * 64,                                    # 64-char (future SHA-256 lower bound)
+    ],
+)
+def test_mark_promoted_accepts_valid_sha(
+    conn: sqlite3.Connection, good_sha: str
+) -> None:
+    rid = upsert_rule(
+        conn, **_make_upsert_kwargs(signature=f"sig-{good_sha[:8]}")
+    )
+    mark_promoted(conn, rule_id=rid, sha=good_sha, promoted_by="alice")
+    row = _row_for(conn, rid)
+    assert row["promoted_to_overlay_sha"] == good_sha
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    [
+        "",                                       # empty
+        "abc",                                    # too short (3 chars)
+        "abcdef",                                 # too short (6 chars, just under 7)
+        "ABCDEF1",                                # uppercase
+        "g1b2c3d",                                # non-hex char 'g'
+        "abc1234 ",                               # trailing whitespace
+        " abc1234",                               # leading whitespace
+        "abc 1234",                               # internal whitespace
+        "a" * 65,                                 # too long (65 chars)
+        "abc1234\n",                              # trailing newline
+    ],
+)
+def test_mark_promoted_rejects_invalid_sha(
+    conn: sqlite3.Connection, bad_sha: str
+) -> None:
+    rid = upsert_rule(
+        conn, **_make_upsert_kwargs(signature=f"sig-bad-{hash(bad_sha) & 0xff:x}")
+    )
+    with pytest.raises(ValueError, match="sha must be 7-64 lowercase hex"):
+        mark_promoted(conn, rule_id=rid, sha=bad_sha, promoted_by="alice")
+    # Critical: rejection must NOT have mutated the row.
+    row = _row_for(conn, rid)
+    assert row["status"] == "probation"
+    assert row["promoted_to_overlay_sha"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +436,7 @@ def test_list_rules_filters_correctly(conn: sqlite3.Connection) -> None:
         conn,
         **_make_upsert_kwargs(signature="act-1", scope="drupal", confidence=90),
     )
-    mark_promoted(conn, rule_id=rid_active, sha="s", promoted_by="alice")
+    mark_promoted(conn, rule_id=rid_active, sha="abcdef3", promoted_by="alice")
 
     rid_prob_drupal = upsert_rule(
         conn,

@@ -398,7 +398,7 @@ def test_extract_propose_promote_revoke_full_workflow(
             "mark-merged",
             str(rule_id),
             "--sha",
-            "def456",
+            "def4567",
             "--by",
             "alice",
         ],
@@ -413,7 +413,7 @@ def test_extract_propose_promote_revoke_full_workflow(
             (rule_id,),
         ).fetchone()
         assert row["status"] == "active"
-        assert row["promoted_to_overlay_sha"] == "def456"
+        assert row["promoted_to_overlay_sha"] == "def4567"
         assert row["promoted_by"] == "alice"
         assert row["promoted_at"] is not None
     finally:
@@ -451,7 +451,7 @@ def test_extract_propose_promote_revoke_full_workflow(
         assert row["revoked_by"] == "alice"
         assert row["revocation_reason"] == "policy change"
         # Audit columns from the prior promotion are preserved.
-        assert row["promoted_to_overlay_sha"] == "def456"
+        assert row["promoted_to_overlay_sha"] == "def4567"
     finally:
         conn.close()
 

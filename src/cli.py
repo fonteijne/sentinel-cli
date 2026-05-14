@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -1760,6 +1761,26 @@ def learning() -> None:
     pass
 
 
+_LEARNING_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+
+
+def _validate_sha(
+    ctx: click.Context, param: click.Parameter, value: str
+) -> str:
+    """Click callback for ``--sha`` on ``learning mark-merged``.
+
+    Format check only (no Git/GitLab round-trip). Catches operator typos at
+    parse time so an append-only promotion row never gets pinned to garbage.
+    Mirrors the leaf guard in ``feedback_rules.mark_promoted``.
+    """
+    if not _LEARNING_SHA_RE.fullmatch(value):
+        raise click.BadParameter(
+            "--sha must be 7-40 lowercase hex characters; "
+            "e.g. 'a1b2c3d' or full 40-char SHA"
+        )
+    return value
+
+
 def _learning_seed_synthetic_execution(
     conn: sqlite3.Connection, *, prefix: str
 ) -> str:
@@ -2097,7 +2118,12 @@ def learning_propose(scope: str, min_confidence: int, dry_run: bool) -> None:
 
 @learning.command("mark-merged")
 @click.argument("rule_id", type=int)
-@click.option("--sha", required=True, help="Commit SHA of the merged MR.")
+@click.option(
+    "--sha",
+    required=True,
+    callback=_validate_sha,
+    help="Commit SHA of the merged MR (7-40 lowercase hex chars).",
+)
 @click.option("--by", "by", required=True, help="Username of the merging maintainer.")
 def learning_mark_merged(rule_id: int, sha: str, by: str) -> None:
     """Flip a probation rule to 'active' after the maintainer merges its MR."""

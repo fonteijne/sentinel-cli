@@ -402,7 +402,7 @@ def test_mark_merged_flips_status(
 ) -> None:
     result = runner.invoke(
         cli,
-        ["learning", "mark-merged", "1", "--sha", "def456", "--by", "alice"],
+        ["learning", "mark-merged", "1", "--sha", "def4567", "--by", "alice"],
     )
 
     assert result.exit_code == 0, result.output
@@ -413,7 +413,7 @@ def test_mark_merged_flips_status(
             "WHERE id = 1"
         ).fetchone()
         assert row["status"] == "active"
-        assert row["promoted_to_overlay_sha"] == "def456"
+        assert row["promoted_to_overlay_sha"] == "def4567"
         assert row["promoted_by"] == "alice"
     finally:
         conn.close()
@@ -427,17 +427,48 @@ def test_mark_merged_on_active_errors(
         db_path_with_postmortems,
         status="active",
         confidence=85,
-        promoted_to_overlay_sha="aaa",
+        promoted_to_overlay_sha="aaa1234",
         promoted_by="prior",
     )
 
     result = runner.invoke(
         cli,
-        ["learning", "mark-merged", "1", "--sha", "bbb", "--by", "bob"],
+        ["learning", "mark-merged", "1", "--sha", "bbb1234", "--by", "bob"],
     )
 
     assert result.exit_code == 1, result.output
     assert "probation" in result.output.lower() or "Error" in result.output
+
+
+@pytest.mark.parametrize(
+    "bad_sha",
+    ["abc", "ABCDEF1", "g1b2c3d", "abcdef", "a" * 65],
+)
+def test_mark_merged_rejects_invalid_sha_at_cli(
+    runner: CliRunner,
+    db_path_with_promotable_rule: Path,
+    bad_sha: str,
+) -> None:
+    """Click callback must reject malformed SHAs with exit 2 + clear message,
+    and must NOT touch the DB (the row's status stays 'probation')."""
+    result = runner.invoke(
+        cli,
+        ["learning", "mark-merged", "1", "--sha", bad_sha, "--by", "alice"],
+    )
+    assert result.exit_code == 2, result.output
+    combined = (result.output or "") + (result.stderr if result.stderr_bytes else "")
+    assert "--sha must be 7-40 lowercase hex" in combined
+
+    # DB untouched.
+    conn = connect(str(db_path_with_promotable_rule))
+    try:
+        row = conn.execute(
+            "SELECT status, promoted_to_overlay_sha FROM feedback_rules WHERE id = 1"
+        ).fetchone()
+        assert row["status"] == "probation"
+        assert row["promoted_to_overlay_sha"] is None
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +533,7 @@ def test_list_no_filter_prints_all(
         signature="sig.active",
         status="active",
         confidence=90,
-        promoted_to_overlay_sha="x",
+        promoted_to_overlay_sha="x000001",
         promoted_by="y",
     )
     _seed_feedback_rule(
@@ -533,7 +564,7 @@ def test_list_filters_by_status(
         signature="sig.active",
         status="active",
         confidence=90,
-        promoted_to_overlay_sha="x",
+        promoted_to_overlay_sha="x000001",
         promoted_by="y",
     )
 
