@@ -89,12 +89,16 @@ class ProposalResult:
 
 
 def _branch_name_for(scope: str) -> str:
-    """``sentinel-learning/promote-<scope>-<YYYYMMDD-HHMM>`` (UTC).
+    """``sentinel-learning/promote-<scope>-<YYYYMMDD-HHMMSS>`` (UTC).
 
     UTC is non-negotiable: branch names with local-time suffixes break
-    deterministic ordering when the operator's TZ changes.
+    deterministic ordering when the operator's TZ changes. Second precision
+    (vs minute) ensures two retries within the same minute produce distinct
+    branch names — the failure path at ``propose_overlays`` deliberately
+    leaves a branch on disk for operator inspection, so a colliding name
+    would block the next attempt.
     """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"sentinel-learning/promote-{scope}-{stamp}"
 
 

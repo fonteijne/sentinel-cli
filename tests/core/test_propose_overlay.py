@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -398,9 +399,27 @@ def test_propose_branch_naming(
     )
     assert len(results) == 1
     assert re.match(
-        r"^sentinel-learning/promote-drupal-\d{8}-\d{4}$",
+        r"^sentinel-learning/promote-drupal-\d{8}-\d{6}$",
         results[0].branch_name,
     ), results[0].branch_name
+
+
+def test_branch_name_unique_across_seconds() -> None:
+    """Two ``_branch_name_for`` calls separated by ~1s must yield distinct
+    names. Regression guard for H3: minute-precision suffixes collide on a
+    same-minute retry after a failed real-run (the failure path in
+    ``propose_overlays`` deliberately leaves the branch on disk).
+    """
+    first = propose_module._branch_name_for("drupal")
+    time.sleep(1.05)
+    second = propose_module._branch_name_for("drupal")
+    assert first != second, (
+        f"branch names collided across a 1s gap: {first!r} == {second!r} "
+        "(_branch_name_for stamp precision regressed)"
+    )
+    pattern = r"^sentinel-learning/promote-drupal-\d{8}-\d{6}$"
+    assert re.match(pattern, first), first
+    assert re.match(pattern, second), second
 
 
 def test_propose_zero_rules_no_branch_creation(
