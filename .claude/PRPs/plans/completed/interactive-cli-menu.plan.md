@@ -481,17 +481,27 @@ poetry run pytest tests/ -v
 
 ## Completion Checklist
 
-- [ ] Task 1 — `questionary` added to `pyproject.toml`
-- [ ] Task 2 — `cli()` group has `invoke_without_command=True` and dispatches to `_run_menu`
-- [ ] Task 3 — `_run_menu` + 4 helpers + `_dispatch` implemented
-- [ ] Task 4 — Imports verified, file compiles
-- [ ] Task 5 — Helper unit tests pass
-- [ ] Task 6 — CliRunner integration tests pass
-- [ ] Task 7 — Manual smoke validated by user
+- [x] Task 1 — `questionary` added to `pyproject.toml`
+- [x] Task 2 — `cli()` group has `invoke_without_command=True` and dispatches to `_run_menu`
+- [x] Task 3 — `_run_menu` + 4 helpers + `_dispatch` implemented
+- [x] Task 4 — Imports verified, file compiles
+- [x] Task 5 — Helper unit tests pass (9 tests)
+- [x] Task 6 — CliRunner integration tests pass (13 tests)
+- [ ] Task 7 — Manual smoke validated by user (steps documented under Step-by-Step Tasks → Task 7)
 - [ ] User has run `poetry lock && poetry install` from host or sentinel-dev
-- [ ] Level 1, 2, 3 validations pass
-- [ ] Acceptance criteria met
+- [x] Level 1 (compileall, ruff on changed lines): zero new errors — all ruff hits in cli.py are pre-existing in unrelated regions
+- [x] Level 2 (tests/test_cli_menu.py): 22/22 pass
+- [x] Level 3 (full suite, ignoring pre-existing failures): same 26 pre-existing failures before and after; 1051 pass — no regressions introduced
+- [x] Acceptance criteria met (see implementation notes below)
 - [ ] Plan file moved to `.claude/PRPs/plans/completed/` after merge
+
+### Implementation Notes (Ralph iteration 1, 2026-05-14)
+
+- New helpers added to `src/cli.py` immediately above the `cli()` group: `_TICKET_ID_RE`, `_MENU_ACTIONS`, `_collect_loaded_tickets`, `_prompt_ticket`, `_prompt_new_ticket`, `_prompt_action`, `_dispatch`, `_run_menu`. The `cli()` group itself is now `invoke_without_command=True` with `@click.pass_context`.
+- `_prompt_ticket` returns either a `(project, ticket)` tuple, the literal sentinel `"__new__"`, or `None`. `_run_menu` handles all three branches.
+- The `+ new…` flow validates `^[A-Z][A-Z0-9_]*-\d+$`, derives the project key from the prefix, calls `ctx.invoke(projects_add)` for unknown projects, then re-reads `get_config()` so a freshly added project is picked up before continuing.
+- Reset goes through a `questionary.confirm(...)` gate; declining = no-op, confirming dispatches with `yes=True`.
+- The shared `questionary` test stub uses a queue so consecutive `select(...)` calls each consume the next canned value (initial naive per-call `_Stub` was rebuilt from the same list and always returned the first element).
 
 ---
 

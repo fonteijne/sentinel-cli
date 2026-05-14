@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import click
+import questionary
 
 
 from src.config_loader import get_config
@@ -180,15 +181,204 @@ def _get_version() -> str:
     return version("sentinel")
 
 
-@click.group()
+_TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*-\d+$")
+
+_MENU_ACTIONS = ["Debrief", "Plan", "Execute", "Execute --revise", "Reset"]
+
+
+def _collect_loaded_tickets() -> list[tuple[str, str]]:
+    """Return ``[(project_key, ticket_id), ...]`` for every active worktree.
+
+    Iterates the configured projects from :class:`ConfigLoader` and aggregates
+    each project's worktrees from :class:`WorktreeManager.list_worktrees`. The
+    returned list is sorted alphabetically by ``(project_key, ticket_id)`` so
+    the menu order is stable across invocations.
+    """
+    config = get_config()
+    worktree_mgr = WorktreeManager()
+    tickets: list[tuple[str, str]] = []
+    for project_key in config.get_all_projects().keys():
+        for ticket_id in worktree_mgr.list_worktrees(project_key):
+            tickets.append((project_key, ticket_id))
+    tickets.sort()
+    return tickets
+
+
+def _prompt_ticket(
+    tickets: list[tuple[str, str]],
+) -> tuple[str, str] | str | None:
+    """Prompt for a ticket selection from ``tickets`` plus a ``+ new…`` entry.
+
+    The visible label is the ticket ID verbatim — the worktree dirname is
+    the source of truth, and inventing a ``project_ticket`` form would
+    double-stamp prefixes for projects whose tickets already include the
+    project key (e.g. ``DHLEXS_DHLEXC`` / ``DHLEXS_DHLEXC-384``).
+
+    Returns the selected ``(project_key, ticket_id)`` tuple, the sentinel
+    string ``"__new__"`` when the user picks the new-ticket entry, or
+    ``None`` when the user hits ESC (back/exit at this top step).
+
+    Uses ``unsafe_ask()`` so Ctrl-C propagates as :class:`KeyboardInterrupt`
+    while ESC returns ``None`` — the caller distinguishes the two.
+    """
+    choices: list = [
+        questionary.Choice(title=t, value=(p, t)) for p, t in tickets
+    ]
+    if choices:
+        choices.append(questionary.Separator())
+    choices.append(questionary.Choice(title="+ new…", value="__new__"))
+    return questionary.select("Select a ticket:", choices=choices).unsafe_ask()
+
+
+def _parse_ticket_input(raw: str) -> tuple[str, str] | None:
+    """Parse free-text ticket input into ``(project_key, ticket_id)``.
+
+    Accepts two shapes (case-insensitive, whitespace stripped):
+
+    1. **Menu display form** — ``PROJECT_TICKETPREFIX-NUM`` (e.g.
+       ``DHLEXS_DHLEXC-384``). The prefix before the first ``_`` is matched
+       against the configured projects; if it matches, the rest is used as
+       the ticket ID. This is the form the menu shows for loaded worktrees,
+       so re-typing it round-trips correctly.
+    2. **Bare ticket form** — ``PROJECT-NUM`` (e.g. ``ACME-142``). The
+       project key is derived from the prefix. Suitable when the JIRA
+       project key equals the ticket-ID prefix.
+
+    Returns ``None`` for invalid shapes (caller emits the user-facing error).
+    """
+    text = raw.strip().upper()
+    if not text:
+        return None
+
+    if "_" in text:
+        candidate_project, _, rest = text.partition("_")
+        configured = set(get_config().get_all_projects().keys())
+        if candidate_project in configured and _TICKET_ID_RE.match(rest):
+            return (candidate_project, rest)
+
+    if _TICKET_ID_RE.match(text):
+        return (text.split("-", 1)[0], text)
+
+    return None
+
+
+def _prompt_new_ticket(ctx: click.Context) -> tuple[str, str] | None:
+    """Prompt for a free-text ticket ID and resolve its project.
+
+    See :func:`_parse_ticket_input` for accepted input shapes. If the
+    project key is unknown, invokes :func:`projects_add` to add it, then
+    re-reads the configuration before returning. Returns ``None`` if the
+    user hits ESC, types invalid input, or the project add is aborted.
+    """
+    raw = questionary.text(
+        "Ticket ID (e.g. ACME-142 or DHLEXS_DHLEXC-384):"
+    ).unsafe_ask()
+    if raw is None:
+        return None
+    parsed = _parse_ticket_input(raw)
+    if parsed is None:
+        click.echo("❌ Invalid ticket ID format (expected PROJECT-NUMBER)", err=True)
+        return None
+    project_key, ticket_id = parsed
+    config = get_config()
+    if project_key not in config.get_all_projects():
+        click.echo(f"\nℹ️  Project '{project_key}' is not configured — adding it now.")
+        ctx.invoke(projects_add)
+        # Re-read config in case ConfigLoader cached the old state.
+        config = get_config()
+        if project_key not in config.get_all_projects():
+            click.echo(f"❌ Project '{project_key}' was not added; aborting.", err=True)
+            return None
+    return (project_key, ticket_id)
+
+
+def _prompt_action(label: str) -> str | None:
+    """Prompt for the action menu. Returns one of ``_MENU_ACTIONS`` or ``None``.
+
+    ``None`` signals ESC — the caller treats it as "back to ticket select".
+    """
+    return questionary.select(
+        f"Action for {label}:", choices=list(_MENU_ACTIONS)
+    ).unsafe_ask()
+
+
+def _dispatch(
+    ctx: click.Context, project_key: str, ticket_id: str, action: str
+) -> bool:
+    """Route the selected action to the matching Click subcommand.
+
+    Returns ``True`` when the menu should exit (action ran or user gave a
+    real yes/no answer at the reset confirm), ``False`` when the user hit
+    ESC at the reset confirm and the caller should re-prompt the action.
+    """
+    if action == "Debrief":
+        ctx.invoke(debrief, ticket_id=ticket_id, project=project_key)
+    elif action == "Plan":
+        ctx.invoke(plan, ticket_id=ticket_id, project=project_key)
+    elif action == "Execute":
+        ctx.invoke(execute, ticket_id=ticket_id, project=project_key)
+    elif action == "Execute --revise":
+        ctx.invoke(execute, ticket_id=ticket_id, project=project_key, revise=True)
+    elif action == "Reset":
+        confirmed = questionary.confirm(
+            f"Reset {ticket_id}? This removes the worktree and local branch.",
+            default=False,
+        ).unsafe_ask()
+        if confirmed is None:
+            # ESC at the confirm = go back to the action menu.
+            return False
+        if confirmed:
+            ctx.invoke(reset, ticket_id=ticket_id, project=project_key, yes=True)
+    return True
+
+
+def _run_menu(ctx: click.Context) -> None:
+    """Two-step interactive menu fired when ``sentinel`` is run with no args.
+
+    Navigation:
+      * **ESC** — go back one step. ESC at the top (ticket select) exits.
+      * **Ctrl-C** — exit immediately, regardless of step.
+    """
+    try:
+        while True:
+            tickets = _collect_loaded_tickets()
+            selection = _prompt_ticket(tickets)
+            if selection is None:
+                return  # ESC at step 1 → exit
+            if selection == "__new__":
+                new_selection = _prompt_new_ticket(ctx)
+                if new_selection is None:
+                    continue  # ESC / invalid input → back to ticket select
+                project_key, ticket_id = new_selection
+            else:
+                project_key, ticket_id = selection  # type: ignore[misc]
+
+            # Action sub-loop so ESC at the reset confirm re-prompts the action.
+            while True:
+                action = _prompt_action(ticket_id)
+                if action is None:
+                    break  # ESC at action select → back to ticket select
+                if _dispatch(ctx, project_key, ticket_id, action):
+                    return  # Action ran (or reset was answered yes/no) — done
+                # else: ESC at reset confirm → re-prompt action menu
+    except KeyboardInterrupt:
+        # Ctrl-C anywhere — exit cleanly. Print a newline so the next shell
+        # prompt doesn't land on the partially-rendered questionary line.
+        click.echo()
+        return
+
+
+@click.group(invoke_without_command=True)
 @click.version_option(version=_get_version())
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """Sentinel - Autonomous agent orchestration for Jira tickets.
 
-    Sentinel automates the development workflow from Jira ticket to merge-ready code
-    using specialized AI agents.
+    Run with no arguments for an interactive menu of loaded tickets.
+    Use 'sentinel COMMAND --help' for non-interactive command details.
     """
-    pass
+    if ctx.invoked_subcommand is None:
+        _run_menu(ctx)
 
 
 @cli.command()
