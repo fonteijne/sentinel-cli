@@ -732,10 +732,60 @@ class TestChangedFilesScopedVerifier:
     def test_derive_changed_test_paths_no_diff_returns_empty(
         self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
     ):
-        """SHA == HEAD → no changes → fallback to broad scope."""
+        """SHA == HEAD with no working-tree changes → fallback to broad scope."""
         agent = DrupalDeveloperAgent()
         sha = agent._capture_pretask_sha(drupal_worktree)
         assert agent._derive_changed_test_paths(drupal_worktree, sha) == []
+
+    def test_derive_changed_test_paths_picks_up_uncommitted_changes(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Regression test for the actual production scenario.
+
+        At verifier time the developer agent has just written files to
+        the worktree but the per-task commit hasn't happened yet (commits
+        only land *after* tests pass). Diffing against ``<sha>..HEAD``
+        would return empty here because HEAD == sha, forcing the broad
+        fallback. Diffing the SHA directly against the working tree
+        picks up the unstaged write.
+        """
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        new_test = (
+            drupal_worktree
+            / "web/modules/custom/foo/tests/src/Unit/UncommittedTest.php"
+        )
+        new_test.write_text("<?php\nclass UncommittedTest {}\n")
+        # Deliberately do NOT commit. Worktree HEAD is unchanged.
+
+        paths = agent._derive_changed_test_paths(drupal_worktree, sha)
+        assert paths == [
+            "web/modules/custom/foo/tests/src/Unit/UncommittedTest.php"
+        ], (
+            "Diff base must compare SHA→working-tree, not SHA..HEAD — "
+            "uncommitted changes should still be picked up."
+        )
+
+    def test_derive_changed_test_paths_picks_up_staged_changes(
+        self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree
+    ):
+        """Staged-but-uncommitted changes are also picked up by the diff."""
+        agent = DrupalDeveloperAgent()
+        sha = agent._capture_pretask_sha(drupal_worktree)
+
+        new_test = (
+            drupal_worktree
+            / "web/modules/custom/foo/tests/src/Unit/StagedTest.php"
+        )
+        new_test.write_text("<?php\nclass StagedTest {}\n")
+        subprocess.run(["git", "add", "."], cwd=drupal_worktree, check=True)
+        # Staged but not committed — HEAD still at baseline.
+
+        paths = agent._derive_changed_test_paths(drupal_worktree, sha)
+        assert paths == [
+            "web/modules/custom/foo/tests/src/Unit/StagedTest.php"
+        ]
 
     def test_run_tests_uses_changed_paths_in_container(
         self, mock_config, mock_agent_sdk, mock_prompt, drupal_worktree

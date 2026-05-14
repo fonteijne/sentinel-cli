@@ -818,6 +818,60 @@ class TestUnifiedPlanFlow:
         state_info = agent._detect_plan_state("TEST-123", temp_worktree, "TEST")
         assert state_info["state"] == "nothing_changed"
 
+    def test_detect_plan_state_no_mr_no_new_context(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Plan exists, no MR, no new Jira context → nothing_changed.
+
+        Replaces the old behavior that forced state back to "initial" whenever
+        the MR lookup returned nothing (e.g. MR was closed, or a previous run
+        pushed the branch but failed before opening the MR). That collapse
+        triggered a full re-plan + push and caused remote-rejection failures.
+        """
+        agent = PlanGeneratorAgent()
+
+        plan_dir = temp_worktree / ".agents" / "plans"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "TEST-123.md").write_text("# Existing plan")
+
+        # No MR found
+        agent._get_mr_info = Mock(return_value=None)
+
+        # Jira: only Sentinel reports, no human follow-up
+        mock_jira.return_value.get_ticket_comments.return_value = [
+            {"author": "sentinel", "body": "h2. Sentinel Confidence Report\nScore: 92/100"},
+        ]
+
+        state_info = agent._detect_plan_state("TEST-123", temp_worktree, "TEST")
+        assert state_info["state"] == "nothing_changed"
+        assert state_info["mr_url"] is None
+        assert state_info["existing_plan"] == "# Existing plan"
+        # MR discussions must NOT have been queried — no MR exists
+        agent.gitlab.get_merge_request_discussions.assert_not_called()
+
+    def test_detect_plan_state_no_mr_with_new_context(
+        self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
+    ):
+        """Plan exists, no MR, but new Jira context → update (not initial)."""
+        agent = PlanGeneratorAgent()
+
+        plan_dir = temp_worktree / ".agents" / "plans"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "TEST-123.md").write_text("# Existing plan")
+
+        agent._get_mr_info = Mock(return_value=None)
+
+        mock_jira.return_value.get_ticket_comments.return_value = [
+            {"author": "sentinel", "body": "h2. Sentinel Confidence Report\nScore: 92/100"},
+            {"author": "client", "body": "Please also handle the edge case where X"},
+        ]
+
+        state_info = agent._detect_plan_state("TEST-123", temp_worktree, "TEST")
+        assert state_info["state"] == "update"
+        assert state_info["mr_url"] is None
+        assert len(state_info["new_comments"]) == 1
+        assert state_info["existing_plan"] == "# Existing plan"
+
     def test_run_update_with_investigation(
         self, mock_config, mock_agent_sdk, mock_prompt, mock_jira, mock_gitlab, temp_worktree
     ):

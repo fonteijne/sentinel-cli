@@ -283,7 +283,12 @@ This is the overview section.
                 "success": True,
                 "workflow": [{"name": "write_failing_test"}],
             }
-            mock_tests.return_value = {"success": True, "output": "", "return_code": 0}
+            mock_tests.return_value = {
+                "passed": True,
+                "test_results": "",
+                "structured_errors": [],
+                "return_code": 0,
+            }
 
             result = agent.implement_feature("Add login endpoint", {}, temp_worktree)
 
@@ -382,9 +387,10 @@ This is the overview section.
 
             result = agent.run_tests(temp_worktree)
 
-            assert result["success"] is True
+            assert result["passed"] is True
             assert result["return_code"] == 0
-            assert "PASSED" in result["output"]
+            assert "PASSED" in result["test_results"]
+            assert result["structured_errors"] == []
 
             mock_run.assert_called_once()
             call_args = mock_run.call_args
@@ -406,9 +412,9 @@ This is the overview section.
 
             result = agent.run_tests(temp_worktree)
 
-            assert result["success"] is False
+            assert result["passed"] is False
             assert result["return_code"] == 1
-            assert "FAILED" in result["output"]
+            assert "FAILED" in result["test_results"]
 
     def test_run_tests_timeout(
         self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
@@ -423,8 +429,8 @@ This is the overview section.
 
             result = agent.run_tests(temp_worktree)
 
-            assert result["success"] is False
-            assert "timed out" in result["output"]
+            assert result["passed"] is False
+            assert "timed out" in result["test_results"]
             assert result["return_code"] == -1
 
     def test_run_tests_exception(
@@ -438,8 +444,8 @@ This is the overview section.
 
             result = agent.run_tests(temp_worktree)
 
-            assert result["success"] is False
-            assert "Test execution error" in result["output"]
+            assert result["passed"] is False
+            assert "Test execution error" in result["test_results"]
             assert result["return_code"] == -1
 
     def test_commit_changes_basic(
@@ -525,9 +531,10 @@ This is the overview section.
              patch.object(agent, "run_tests") as mock_test:
 
             mock_test.return_value = {
-                "success": True,
+                "passed": True,
                 "return_code": 0,
-                "output": "All tests passed",
+                "test_results": "All tests passed",
+                "structured_errors": [],
             }
 
             result = agent.run(
@@ -557,7 +564,7 @@ This is the overview section.
             "success": True,
             "files_created": [],
             "files_modified": [],
-            "test_results": {"success": True},
+            "test_results": {"passed": True, "test_results": "", "structured_errors": [], "return_code": 0},
             "commit_message": "feat: task",
             "agent_response": "",
         }
@@ -575,7 +582,12 @@ This is the overview section.
                 success_result,  # Success - All tests passing
             ]
 
-            mock_test.return_value = {"success": True, "return_code": 0, "output": ""}
+            mock_test.return_value = {
+                "passed": True,
+                "return_code": 0,
+                "test_results": "",
+                "structured_errors": [],
+            }
 
             result = agent.run(
                 plan_file=sample_plan_file,
@@ -600,9 +612,10 @@ This is the overview section.
              patch.object(agent, "run_tests") as mock_test:
 
             mock_test.return_value = {
-                "success": True,
+                "passed": True,
                 "return_code": 0,
-                "output": "5 passed in 2.5s",
+                "test_results": "5 passed in 2.5s",
+                "structured_errors": [],
             }
 
             result = agent.run(
@@ -610,8 +623,8 @@ This is the overview section.
                 worktree_path=temp_worktree,
             )
 
-            assert result["test_results"]["success"] is True
-            assert "5 passed" in result["test_results"]["output"]
+            assert result["test_results"]["passed"] is True
+            assert "5 passed" in result["test_results"]["test_results"]
 
     def test_run_with_empty_plan(
         self, mock_config, mock_agent_sdk, mock_prompt, temp_worktree
@@ -623,7 +636,12 @@ This is the overview section.
         empty_plan.write_text("")
 
         with patch.object(agent, "run_tests") as mock_test:
-            mock_test.return_value = {"success": True, "return_code": 0, "output": ""}
+            mock_test.return_value = {
+                "passed": True,
+                "return_code": 0,
+                "test_results": "",
+                "structured_errors": [],
+            }
 
             result = agent.run(
                 plan_file=empty_plan,
@@ -642,7 +660,12 @@ This is the overview section.
         with patch.object(agent, "implement_feature"), \
              patch.object(agent, "run_tests") as mock_test:
 
-            mock_test.return_value = {"success": True, "return_code": 0, "output": ""}
+            mock_test.return_value = {
+                "passed": True,
+                "return_code": 0,
+                "test_results": "",
+                "structured_errors": [],
+            }
 
             # Should not raise exception with extra kwargs
             result = agent.run(

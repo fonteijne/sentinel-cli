@@ -425,8 +425,7 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
 
         # Reset session to avoid context contamination from previous conversations
         # (e.g., ticket analysis may have different context than plan generation)
-        self.session_id = None
-        self.messages.clear()
+        self._safe_reset_session()
 
         ticket_data = context.get("ticket_data", {})
         requirements = context.get("requirements", [])
@@ -1020,8 +1019,7 @@ The detailed plan has been committed to the repository at `{plan_path}`.
         logger.info(f"Investigating {len(new_comments)} new comment(s) for {ticket_id}")
 
         # Fresh session to avoid context contamination
-        self.session_id = None
-        self.messages.clear()
+        self._safe_reset_session()
 
         comments_text = "\n".join(
             f"### Comment by {c['author']} ({c.get('created', 'unknown')})\n{c['body']}\n"
@@ -1098,6 +1096,115 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
         logger.info(f"Investigation complete for {ticket_id}: {len(report)} chars")
         return report
 
+    def _investigate_confidence_questions(
+        self,
+        ticket_id: str,
+        questions: list[str],
+        existing_plan: str,
+        worktree_path: Path,
+    ) -> str:
+        """Investigate the Confidence Evaluator's clarifying questions against
+        the codebase. Returns markdown investigation report.
+
+        Mirrors ``investigate_comments`` — same prompt scaffold, same return
+        shape, same session-reset semantics — but the input is a list of
+        strings (evaluator's ``questions[]`` output), not comment dicts.
+
+        Args:
+            ticket_id: Jira ticket ID
+            questions: Clarifying questions raised by the Confidence Evaluator
+            existing_plan: Current plan content (for context)
+            worktree_path: Path to the git worktree (enables tool access)
+
+        Returns:
+            Investigation report as markdown, or "" when no questions provided
+        """
+        if not questions:
+            return ""
+
+        logger.info(
+            f"Investigating {len(questions)} confidence question(s) for {ticket_id}"
+        )
+
+        # Fresh session to avoid context contamination
+        self._safe_reset_session()
+
+        questions_text = "\n".join(
+            f"### Question {i+1}\n{q}\n" for i, q in enumerate(questions)
+        )
+
+        investigation_prompt = f"""You are investigating clarifying questions raised by the Confidence Evaluator for ticket {ticket_id}.
+
+**⚠️ DATA CONSTRAINT**: All ticket data and questions below were produced by an internal evaluator pass. Do NOT search for Jira access, environment variables, CLI tools, or external APIs. Work ONLY with the questions provided here and the codebase you can explore via tools.
+
+The Confidence Evaluator scored the current plan below threshold and emitted the questions below as the gaps it would need answered to raise confidence. Your job is to
+SEARCH THE CODEBASE to answer (or partially answer) each question with concrete evidence, then report your findings.
+
+## Evaluator Questions
+
+{questions_text}
+
+## Current Plan (for context only — do NOT rewrite it)
+
+{existing_plan}
+
+## Your Task
+
+1. **Treat each question as an actionable claim to verify** against the codebase. Typical shapes:
+   - "Does the project already have [thing]?"
+   - "Where is [pattern/module/helper] implemented?"
+   - "Which [library/approach] does this codebase use for X?"
+   - Specific gaps the evaluator flagged in the plan
+
+2. **For each question, search the codebase** using your tools:
+   - Use Grep to search for keywords, function names, class names mentioned
+   - Use Glob to find files matching described patterns
+   - Use Read to examine relevant files you find
+
+3. **Write your findings** in this exact format:
+
+## Investigation Report
+
+### Questions Investigated
+
+#### Question 1: [paraphrase of the evaluator's question]
+- **Search performed**: [what you searched for]
+- **Found**: [what you actually found, with file paths and line numbers]
+- **Relevance to plan**: [how this affects the implementation approach]
+
+[repeat for each question]
+
+### Summary of Findings
+[2-3 sentences summarizing what was found and how it should influence the plan]
+
+### Items NOT Found
+[Any questions that could not be answered from the codebase, or "None" if all answered]
+
+## RULES
+- Do NOT rewrite or generate a plan. You are ONLY investigating.
+- Do NOT explore the entire codebase. Only search for things mentioned in questions.
+- Keep your investigation focused: max 2-3 searches per question.
+- Include exact file paths and line numbers for everything you find.
+"""
+
+        response = self.send_message(
+            investigation_prompt,
+            cwd=str(worktree_path),
+            max_turns=15,
+        )
+
+        # Extract the report section if present
+        if "## Investigation Report" in response:
+            report = response[response.index("## Investigation Report"):]
+        else:
+            report = response
+
+        logger.info(
+            f"Confidence-question investigation complete for {ticket_id}: "
+            f"{len(report)} chars"
+        )
+        return report
+
     def _post_investigation_report(
         self,
         ticket_id: str,
@@ -1170,34 +1277,38 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
 
         existing_plan = plan_path.read_text()
 
-        # Check if MR exists
+        # Look up the MR (may not exist yet if a previous run failed before
+        # creating it, or was closed). A missing MR no longer forces a full
+        # regeneration — we still respect the existing plan and only re-run
+        # if Jira shows new context.
         mr_info = self._get_mr_info(ticket_id, project_key)
-        if not mr_info:
-            # Plan exists but no MR — treat as fresh (previous failed run)
-            return {"state": "initial", "existing_plan": existing_plan}
+        if mr_info:
+            project_path = mr_info["project_path"]
+            mr_iid = mr_info["mr_iid"]
+            mr_url = mr_info["mr_url"]
 
-        project_path = mr_info["project_path"]
-        mr_iid = mr_info["mr_iid"]
-        mr_url = mr_info["mr_url"]
+            # Check for unresolved MR discussions
+            discussions = self.gitlab.get_merge_request_discussions(
+                project_id=project_path,
+                mr_iid=mr_iid,
+                unresolved_only=True,
+            )
 
-        # Check for unresolved MR discussions
-        discussions = self.gitlab.get_merge_request_discussions(
-            project_id=project_path,
-            mr_iid=mr_iid,
-            unresolved_only=True,
-        )
+            if discussions:
+                return {
+                    "state": "has_feedback",
+                    "existing_plan": existing_plan,
+                    "mr_iid": mr_iid,
+                    "mr_url": mr_url,
+                    "project_path": project_path,
+                    "discussions": discussions,
+                }
+        else:
+            project_path = None
+            mr_iid = None
+            mr_url = None
 
-        if discussions:
-            return {
-                "state": "has_feedback",
-                "existing_plan": existing_plan,
-                "mr_iid": mr_iid,
-                "mr_url": mr_url,
-                "project_path": project_path,
-                "discussions": discussions,
-            }
-
-        # No discussions — check Jira for new context
+        # No discussions (or no MR) — check Jira for new context
         if ctx is None:
             ctx = TicketContextBuilder(self.jira, ticket_id)
         comments = ctx.comments
@@ -1512,8 +1623,7 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
 
             # Reset session — revise_plan used a tool-enabled session with a different cwd;
             # analyze_ticket is a standalone text-only call that must not resume it.
-            self.session_id = None
-            self.messages.clear()
+            self._safe_reset_session()
 
             t0 = time.monotonic()
             logger.info(f"[RUN] Step 2b: Analyzing ticket (post-revision)...")
@@ -1558,6 +1668,45 @@ SEARCH THE CODEBASE to verify and locate anything the client mentions, then repo
             logger.info(f"[RUN] Step 3: Confidence = {evaluation['confidence_score']}/100 ({time.monotonic() - t0:.1f}s)")
         else:
             logger.info(f"[RUN] Step 3: Skipped (--force)")
+
+        # Step 3.5: Confidence-miss auto-investigation (Phase 2B)
+        # Function-local import to avoid circular import (cli.py imports PlanGeneratorAgent at module level).
+        from src.cli import _auto_investigate_enabled
+
+        if (
+            evaluation
+            and not evaluation["passed"]
+            and not force
+            and _auto_investigate_enabled()
+            and evaluation.get("questions")
+        ):
+            t0 = time.monotonic()
+            logger.info(
+                f"[RUN] Step 3.5: Auto-investigating {len(evaluation['questions'])} confidence question(s)..."
+            )
+            findings = self._investigate_confidence_questions(
+                ticket_id,
+                evaluation["questions"],
+                plan_content,
+                worktree_path,
+            )
+            if findings:
+                logger.info(f"[RUN] Step 3.5: Regenerating plan with investigation findings...")
+                plan_content = self.generate_plan(
+                    ticket_id, analysis, plan_path, worktree_path,
+                    investigation_findings=findings,
+                    user_prompt=user_prompt,
+                )
+                logger.info(f"[RUN] Step 3.5: Re-evaluating confidence (capped to 1 retry)...")
+                evaluation = self._evaluate_confidence(
+                    plan_content, analysis, ticket_id, project_key
+                )
+                logger.info(
+                    f"[RUN] Step 3.5: Re-eval score = {evaluation['confidence_score']}/100 "
+                    f"({time.monotonic() - t0:.1f}s)"
+                )
+            else:
+                logger.info("[RUN] Step 3.5: Investigation produced no findings; skipping regeneration")
 
         # Step 4: Commit and push
         t0 = time.monotonic()

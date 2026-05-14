@@ -63,22 +63,24 @@ Append-only log. Each entry resolves an open question from the handover §5 or a
 
 ---
 
-## D4 — Widening PR location/approver: deferred to Phase 2
+## D4 — Widening PR location/approver: Sentinel repo, Sentinel maintainer, always-draft, never-auto-merge
 
-**Date:** 2026-05-05
+**Date:** 2026-05-05 (deferred); resolved 2026-05-09 (Phase 2C kickoff)
 **Resolves:** Handover §5 Q4
-**Status:** Deferred
+**Status:** Accepted
 
 **Context.** When a `project:<KEY>` rule earns its way to `<stack>` scope (Appendix D.3), an overlay PR opens somewhere and someone approves it. Design proposed Sentinel repo + Sentinel maintainer.
 
-**Decision.** Do not decide now. Phase 1 only writes project-scoped observations; no widening happens. Resolve this right before the overlay-PR proposer is built in Phase 2.
+**Revisit trigger (now triggered).** Starting work on Phase 2 task "Overlay PR proposer" (handover §8 / design §8 task 11). The `sentinel-distiller-expert` and `sentinel-cli-rules-expert` agents block on this decision.
 
-**Revisit trigger.** Starting work on Phase 2 task "Overlay PR proposer" (handover §8 / design §8 task 11). The `sentinel-distiller-expert` and `sentinel-cli-rules-expert` agents block on this decision.
+**Decision.**
+1. **Target repo: the Sentinel repo (this repo), not the originating project.** The overlay files (`prompts/overlays/<stack>_*.md`) live here, so the PR must land here.
+2. **Approver: the Sentinel maintainer pool.** The originating project's reviewer does NOT block. Distinct projects fed evidence into the cluster, but the durable rule travels with Sentinel itself.
+3. **MR is always `draft=True` on creation.** The proposer never un-drafts. Merge is a human action — `sentinel learning mark-merged <rule_id> --sha <sha> --by <user>` flips persistence state from `probation` → `active` after the human merges in GitLab. (Mirrors D7 — never un-draft incomplete or unverified work.)
+4. **No automatic widening from `project:<KEY>` to `<stack>` in Phase 2C.** Project-scoped rules (`project:<KEY>` scope) are out of Phase 2C scope (Appendix D, future phase). Phase 2C only promotes `<stack>`-scoped rules from `feedback_rules.status='probation'` to a draft overlay PR.
+5. **When the project-scoped path lands (future phase), this decision is revisited only for the `project → stack` widening flow.** The mechanism here (target = Sentinel repo, approver = maintainer pool, always-draft) remains unchanged.
 
-**What to decide then.**
-- Which repo the widening PR targets (Sentinel vs the originating project).
-- Who approves (Sentinel maintainer, dual approval with the flagging reviewer, or the originating project's team).
-- Whether widening ever happens automatically in CI or always requires human click.
+**Implementation pointer.** `src/core/learning/propose_overlay.py` reads target from config key `sentinel.repo_project_path` (e.g. `"sentinel-team/sentinel"`). The proposer fails loudly with exit 1 if the key is missing AND `OVERLAY_PROPOSER_ENABLED=1`.
 
 ---
 

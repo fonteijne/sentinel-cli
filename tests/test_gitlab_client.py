@@ -526,3 +526,220 @@ class TestMarkAsReady:
                 call_args = mock_put.call_args
                 payload = call_args.kwargs["json"]
                 assert payload["title"] == "Test MR"
+
+
+class TestMarkAsDraft:
+    """Test mark_as_draft method."""
+
+    def test_mark_as_draft_already_draft_is_noop(self, gitlab_client):
+        """Test that an already-draft MR is not updated."""
+        get_response = Mock()
+        get_response.json.return_value = {"title": "Draft: Foo"}
+
+        with patch.object(gitlab_client.session, "get", return_value=get_response):
+            with patch.object(
+                gitlab_client.session, "put"
+            ) as mock_put:
+                result = gitlab_client.mark_as_draft("test/project", 123)
+
+                # update_merge_request must not be called
+                mock_put.assert_not_called()
+                # Returned dict has the original title
+                assert result["title"] == "Draft: Foo"
+
+    def test_mark_as_draft_already_draft_case_insensitive(self, gitlab_client):
+        """Test idempotence with lowercase 'draft:' prefix."""
+        get_response = Mock()
+        get_response.json.return_value = {"title": "draft: foo"}
+
+        with patch.object(gitlab_client.session, "get", return_value=get_response):
+            with patch.object(
+                gitlab_client.session, "put"
+            ) as mock_put:
+                result = gitlab_client.mark_as_draft("test/project", 123)
+
+                mock_put.assert_not_called()
+                assert result["title"] == "draft: foo"
+
+    def test_mark_as_draft_adds_prefix_when_ready(self, gitlab_client):
+        """Test that the draft prefix is added to a ready MR."""
+        get_response = Mock()
+        get_response.json.return_value = {"title": "Foo Bar"}
+
+        update_response = Mock()
+        update_response.json.return_value = {"title": "Draft: Foo Bar"}
+
+        with patch.object(gitlab_client.session, "get", return_value=get_response):
+            with patch.object(
+                gitlab_client.session, "put", return_value=update_response
+            ) as mock_put:
+                gitlab_client.mark_as_draft("test/project", 123)
+
+                call_args = mock_put.call_args
+                payload = call_args.kwargs["json"]
+                assert payload["title"] == "Draft: Foo Bar"
+
+    def test_mark_as_draft_preserves_unicode_title(self, gitlab_client):
+        """Test that unicode characters survive the prefix addition."""
+        get_response = Mock()
+        get_response.json.return_value = {"title": "Add 日本語 support"}
+
+        update_response = Mock()
+        update_response.json.return_value = {"title": "Draft: Add 日本語 support"}
+
+        with patch.object(gitlab_client.session, "get", return_value=get_response):
+            with patch.object(
+                gitlab_client.session, "put", return_value=update_response
+            ) as mock_put:
+                gitlab_client.mark_as_draft("test/project", 123)
+
+                call_args = mock_put.call_args
+                payload = call_args.kwargs["json"]
+                assert payload["title"] == "Draft: Add 日本語 support"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: list_merged_mrs_since + list_pipelines_for_commit
+# ---------------------------------------------------------------------------
+
+
+class TestListMergedMrsSince:
+    """Phase 3A — merged-MR pagination + URL encoding + error propagation."""
+
+    def test_paginates_via_x_total_pages_header(self, gitlab_client):
+        """X-Total-Pages=2 → walk page=1 then page=2; results concatenated."""
+        page1 = Mock()
+        page1.json.return_value = [{"iid": 1, "updated_at": "2026-01-01T00:00:00Z"}]
+        page1.headers = {"X-Total-Pages": "2"}
+
+        page2 = Mock()
+        page2.json.return_value = [{"iid": 2, "updated_at": "2026-01-02T00:00:00Z"}]
+        page2.headers = {"X-Total-Pages": "2"}
+
+        with patch.object(
+            gitlab_client.session, "get", side_effect=[page1, page2]
+        ) as mock_get:
+            result = gitlab_client.list_merged_mrs_since(
+                "acme/backend", updated_after="2026-01-01T00:00:00Z"
+            )
+
+        assert len(result) == 2
+        assert [mr["iid"] for mr in result] == [1, 2]
+        assert mock_get.call_count == 2
+        # First call is page=1, second is page=2.
+        assert mock_get.call_args_list[0].kwargs["params"]["page"] == 1
+        assert mock_get.call_args_list[1].kwargs["params"]["page"] == 2
+
+    def test_falls_back_to_short_page_when_header_missing(self, gitlab_client):
+        """No X-Total-Pages → loop terminates when batch < per_page."""
+        # Page 1 returns exactly per_page=2 rows → must loop again.
+        page1 = Mock()
+        page1.json.return_value = [{"iid": 1}, {"iid": 2}]
+        page1.headers = {}  # no X-Total-Pages
+
+        # Page 2 returns 1 row (< per_page) → loop terminates.
+        page2 = Mock()
+        page2.json.return_value = [{"iid": 3}]
+        page2.headers = {}
+
+        with patch.object(
+            gitlab_client.session, "get", side_effect=[page1, page2]
+        ) as mock_get:
+            result = gitlab_client.list_merged_mrs_since(
+                "acme/backend",
+                updated_after="2026-01-01T00:00:00Z",
+                per_page=2,
+            )
+
+        assert [mr["iid"] for mr in result] == [1, 2, 3]
+        assert mock_get.call_count == 2
+
+    def test_url_encoding_and_required_params(self, gitlab_client):
+        """URL encodes project path; params include the canonical query set."""
+        mock_response = Mock()
+        mock_response.json.return_value = []  # empty page → loop terminates
+        mock_response.headers = {"X-Total-Pages": "1"}
+
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ) as mock_get:
+            gitlab_client.list_merged_mrs_since(
+                "acme/backend",
+                updated_after="2026-05-01T00:00:00Z",
+                per_page=50,
+            )
+
+        # URL contains percent-encoded project path.
+        url = mock_get.call_args.args[0]
+        assert "acme%2Fbackend" in url
+
+        params = mock_get.call_args.kwargs["params"]
+        assert params["state"] == "merged"
+        assert params["order_by"] == "updated_at"
+        assert params["sort"] == "asc"
+        assert params["updated_after"] == "2026-05-01T00:00:00Z"
+        assert params["per_page"] == 50
+        assert params["page"] == 1
+
+    def test_raise_for_status_propagates(self, gitlab_client):
+        """An HTTP error from the underlying session must propagate."""
+        mock_response = Mock()
+        mock_response.raise_for_status.side_effect = requests.HTTPError("500")
+        mock_response.headers = {}
+
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ):
+            with pytest.raises(requests.HTTPError):
+                gitlab_client.list_merged_mrs_since(
+                    "acme/backend", updated_after="2026-01-01T00:00:00Z"
+                )
+
+
+class TestListPipelinesForCommit:
+    """Phase 3A — single-shot pipeline lookup for a merge commit."""
+
+    def test_basic_call(self, gitlab_client):
+        """Single GET; returns the parsed JSON list verbatim."""
+        mock_response = Mock()
+        mock_response.json.return_value = [
+            {"id": 99, "status": "failed", "ref": "main"},
+            {"id": 100, "status": "success", "ref": "main"},
+        ]
+
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ) as mock_get:
+            result = gitlab_client.list_pipelines_for_commit(
+                "acme/backend", sha="abc123"
+            )
+
+        assert mock_get.call_count == 1
+        assert len(result) == 2
+        assert result[0]["id"] == 99
+
+    def test_url_encoding_and_params(self, gitlab_client):
+        """URL is %2F-encoded; ref defaults to 'main' and is overridable."""
+        mock_response = Mock()
+        mock_response.json.return_value = []
+
+        # Default ref='main'.
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ) as mock_get:
+            gitlab_client.list_pipelines_for_commit("acme/backend", sha="deadbeef")
+
+        url = mock_get.call_args.args[0]
+        assert "acme%2Fbackend" in url
+        params = mock_get.call_args.kwargs["params"]
+        assert params["sha"] == "deadbeef"
+        assert params["ref"] == "main"
+
+        # Override ref.
+        with patch.object(
+            gitlab_client.session, "get", return_value=mock_response
+        ) as mock_get2:
+            gitlab_client.list_pipelines_for_commit(
+                "acme/backend", sha="deadbeef", ref="release/2026.05"
+            )
+        assert mock_get2.call_args.kwargs["params"]["ref"] == "release/2026.05"

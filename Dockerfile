@@ -33,12 +33,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zsh \
     && rm -rf /var/lib/apt/lists/*
 
-# SSH config: accept host keys automatically for git clone over SSH
-RUN mkdir -p /root/.ssh \
-    && printf "Host *\n    StrictHostKeyChecking accept-new\n    UserKnownHostsFile /root/.ssh/known_hosts\n" \
-       > /root/.ssh/config \
-    && chmod 700 /root/.ssh \
-    && chmod 600 /root/.ssh/config
+# SSH config: pre-seed known hosts and point ssh at a writable system-wide
+# known_hosts file. /root/.ssh is bind-mounted read-only at runtime
+# (see docker-compose.yml), so any UserKnownHostsFile under it cannot be
+# written and host-key prompts would repeat on every git operation.
+RUN ssh-keyscan -H gitlab.hosted-tools.com >> /etc/ssh/ssh_known_hosts \
+    && printf "Host *\n    StrictHostKeyChecking accept-new\n    UserKnownHostsFile /etc/ssh/ssh_known_hosts\n    GlobalKnownHostsFile /etc/ssh/ssh_known_hosts\n" \
+       >> /etc/ssh/ssh_config
 
 # Install Docker CLI + Compose plugin (DooD — no daemon, talks to host via socket)
 RUN install -m 0755 -d /etc/apt/keyrings \

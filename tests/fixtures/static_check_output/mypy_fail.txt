@@ -1,0 +1,5 @@
+src/example/service.py:14: error: Incompatible return value type (got "str", expected "int")  [return-value]
+src/example/service.py:27:5: error: Argument 1 to "load" has incompatible type "str"; expected "int"  [arg-type]
+src/example/handlers.py:42: error: Item "None" of "Optional[User]" has no attribute "name"  [union-attr]
+src/example/legacy.py:88: error: Name "missing_helper" is not defined
+Found 4 errors in 3 files (checked 12 source files)

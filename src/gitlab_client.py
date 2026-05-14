@@ -238,6 +238,68 @@ class GitLabClient:
         result: List[Dict[str, Any]] = response.json()
         return result
 
+    def list_merged_mrs_since(
+        self,
+        project_id: str,
+        *,
+        updated_after: str,
+        per_page: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List merged MRs updated at or after ``updated_after`` (ISO-8601 UTC).
+
+        Uses ``order_by=updated_at, sort=asc`` so callers can advance a watermark
+        to the LAST returned MR's ``updated_at`` without losing rows that share
+        the same timestamp on the page boundary.
+
+        Pagination: walks `?page=N` until ``X-Total-Pages`` is exhausted (or, if
+        that header is missing, until a page returns fewer than ``per_page`` rows).
+        """
+        project_path = project_id.replace("/", "%2F")
+        url = f"{self.base_url}/api/v4/projects/{project_path}/merge_requests"
+        results: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            params: Dict[str, Any] = {
+                "state": "merged",
+                "order_by": "updated_at",
+                "sort": "asc",
+                "updated_after": updated_after,
+                "per_page": per_page,
+                "page": page,
+            }
+            response = self.session.get(url, params=params)
+            response.raise_for_status()
+            batch: List[Dict[str, Any]] = response.json()
+            results.extend(batch)
+            total_pages_hdr = response.headers.get("X-Total-Pages")
+            if total_pages_hdr is not None:
+                if page >= int(total_pages_hdr):
+                    break
+            elif len(batch) < per_page:
+                break
+            page += 1
+        return results
+
+    def list_pipelines_for_commit(
+        self,
+        project_id: str,
+        *,
+        sha: str,
+        ref: str = "main",
+    ) -> List[Dict[str, Any]]:
+        """List pipelines on ``ref`` for a given commit SHA.
+
+        Used by the regression detector: a merged MR is `regressed` if any
+        pipeline for the merge commit on the target ref has status='failed'.
+        """
+        project_path = project_id.replace("/", "%2F")
+        url = f"{self.base_url}/api/v4/projects/{project_path}/pipelines"
+        params: Dict[str, Any] = {"sha": sha, "ref": ref}
+        response = self.session.get(url, params=params)
+        response.raise_for_status()
+        result: List[Dict[str, Any]] = response.json()
+        return result
+
     def get_project_id(self, project_path: str) -> int:
         """Get numeric project ID from project path.
 
@@ -279,6 +341,32 @@ class GitLabClient:
 
         # Remove draft prefix
         new_title = current_title.replace("Draft: ", "").replace("draft: ", "")
+
+        return self.update_merge_request(project_id, mr_iid, title=new_title)
+
+    def mark_as_draft(self, project_id: str, mr_iid: int) -> Dict[str, Any]:
+        """Revert a merge request back to draft. Idempotent — no-op if already draft.
+
+        Args:
+            project_id: GitLab project ID or path
+            mr_iid: Merge request internal ID
+
+        Returns:
+            Updated merge request data (or current data if already draft)
+
+        Raises:
+            requests.HTTPError: If API request fails
+        """
+        # Get current MR
+        mr_data = self.get_merge_request(project_id, mr_iid)
+        current_title = mr_data.get("title", "")
+
+        # Already a draft — no-op
+        if current_title.lower().startswith("draft:"):
+            return mr_data
+
+        # Add draft prefix
+        new_title = f"Draft: {current_title}"
 
         return self.update_merge_request(project_id, mr_iid, title=new_title)
 

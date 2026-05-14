@@ -187,14 +187,14 @@ class TestCreateWorktree:
             mock_run.side_effect = [
                 Mock(returncode=0),  # git status
                 Mock(returncode=0, stdout="sentinel/feature/ACME-123\n"),  # git rev-parse --abbrev-ref HEAD
-                Mock(returncode=0),  # git rev-parse --verify origin/... (remote exists)
-                Mock(returncode=0),  # git merge --ff-only
+                Mock(returncode=0, stderr=""),  # git fetch origin +refs/heads/<branch>:refs/sentinel-sync/<branch>
+                Mock(returncode=0, stderr=""),  # git reset --hard refs/sentinel-sync/<branch>
             ]
 
             result = worktree_manager.create_worktree("ACME-123", "ACME")
 
             assert result == worktree_dir
-            # Should call: git status, rev-parse HEAD, rev-parse remote, merge --ff-only
+            # Should call: git status, rev-parse HEAD, git fetch (sync ref), git reset --hard
             assert mock_run.call_count == 4
 
     @patch("subprocess.run")
@@ -211,12 +211,12 @@ class TestCreateWorktree:
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git status to fail, then succeed for worktree add, rev-parse local, rev-parse remote, checkout
+            # Mock git status to fail, then succeed for worktree add, rev-parse local, fetch sync ref, checkout
             mock_run.side_effect = [
                 subprocess.CalledProcessError(1, "git status"),
                 Mock(returncode=0),  # git worktree add
                 Mock(returncode=1),  # git rev-parse (local branch doesn't exist)
-                Mock(returncode=1),  # git rev-parse (remote branch doesn't exist)
+                Mock(returncode=1, stderr=""),  # git fetch sync ref (origin doesn't have branch)
                 Mock(returncode=0),  # git checkout -b
             ]
 
@@ -241,11 +241,11 @@ class TestCreateWorktree:
         with patch.object(
             worktree_manager, "ensure_bare_clone", return_value=bare_dir
         ):
-            # Mock git worktree add, git rev-parse local, rev-parse remote, git checkout -b
+            # Mock git worktree add, git rev-parse local, fetch sync ref, git checkout -b
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
                 Mock(returncode=1),  # git rev-parse (local branch doesn't exist)
-                Mock(returncode=1),  # git rev-parse (remote branch doesn't exist)
+                Mock(returncode=1, stderr=""),  # git fetch sync ref (origin doesn't have branch)
                 Mock(returncode=0),  # git checkout -b
             ]
 
@@ -276,8 +276,8 @@ class TestCreateWorktree:
                 Mock(returncode=0),  # git worktree add
                 Mock(returncode=0),  # git rev-parse --verify (branch exists locally)
                 Mock(returncode=0),  # git checkout
-                Mock(returncode=0),  # git rev-parse --verify origin/... (remote exists)
-                Mock(returncode=0),  # git merge --ff-only
+                Mock(returncode=0, stderr=""),  # git fetch origin +refs/heads/<branch>:refs/sentinel-sync/<branch>
+                Mock(returncode=0, stderr=""),  # git reset --hard refs/sentinel-sync/<branch>
             ]
 
             worktree_manager.create_worktree("ACME-123", "ACME")
@@ -289,11 +289,20 @@ class TestCreateWorktree:
             assert "sentinel/feature/ACME-123" in checkout_call
             assert "-b" not in checkout_call
 
-            # Verify merge --ff-only was called to sync with remote
-            merge_call = mock_run.call_args_list[4][0][0]
-            assert "merge" in merge_call
-            assert "--ff-only" in merge_call
-            assert "origin/sentinel/feature/ACME-123" in merge_call
+            # Verify the sync went through fetch + reset --hard against the
+            # Sentinel-owned ref (not merge --ff-only against origin/<branch>,
+            # which silently no-ops on bare-clone-backed worktrees).
+            fetch_call = mock_run.call_args_list[3][0][0]
+            assert "fetch" in fetch_call
+            assert "origin" in fetch_call
+            assert any(
+                "refs/sentinel-sync/sentinel/feature/ACME-123" in arg
+                for arg in fetch_call
+            )
+            reset_call = mock_run.call_args_list[4][0][0]
+            assert "reset" in reset_call
+            assert "--hard" in reset_call
+            assert "refs/sentinel-sync/sentinel/feature/ACME-123" in reset_call
 
     @patch("subprocess.run")
     def test_create_worktree_remote_branch(
@@ -309,19 +318,21 @@ class TestCreateWorktree:
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
                 Mock(returncode=1),  # git rev-parse --verify (local branch doesn't exist)
-                Mock(returncode=0),  # git rev-parse --verify (remote branch EXISTS)
-                Mock(returncode=0),  # git checkout -b ... origin/...
+                Mock(returncode=0, stderr=""),  # git fetch origin +refs/heads/<branch>:refs/sentinel-sync/<branch>
+                Mock(returncode=0),  # git checkout -b <branch> refs/sentinel-sync/<branch>
             ]
 
             worktree_manager.create_worktree("ACME-123", "ACME")
 
-            # Verify git checkout -b was called with remote ref as start point
+            # Verify git checkout -b used the Sentinel-owned sync ref as
+            # start point (not origin/<branch>, which is unreliable on
+            # bare-clone-backed worktrees).
             checkout_call = mock_run.call_args_list[3][0][0]
             assert "git" in checkout_call
             assert "checkout" in checkout_call
             assert "-b" in checkout_call
             assert "sentinel/feature/ACME-123" in checkout_call
-            assert "origin/sentinel/feature/ACME-123" in checkout_call
+            assert "refs/sentinel-sync/sentinel/feature/ACME-123" in checkout_call
 
     @patch("subprocess.run")
     def test_create_worktree_new_branch(
@@ -336,12 +347,12 @@ class TestCreateWorktree:
         ):
             # Mock git worktree add to succeed
             # Mock git rev-parse to fail (local branch doesn't exist)
-            # Mock git rev-parse to fail (remote branch doesn't exist)
+            # Mock git fetch sync ref to fail (origin doesn't have branch)
             # Mock git checkout -b to succeed
             mock_run.side_effect = [
                 Mock(returncode=0),  # git worktree add
                 Mock(returncode=1),  # git rev-parse --verify (local branch doesn't exist)
-                Mock(returncode=1),  # git rev-parse --verify (remote branch doesn't exist)
+                Mock(returncode=1, stderr=""),  # git fetch sync ref (origin doesn't have branch)
                 Mock(returncode=0),  # git checkout -b
             ]
 
@@ -401,6 +412,48 @@ class TestCreateWorktree:
 
             # No merge call — only worktree add, rev-parse local, checkout, rev-parse remote
             assert mock_run.call_count == 4
+
+    @patch("subprocess.run")
+    def test_create_worktree_existing_wrong_branch_remote(
+        self, mock_run, worktree_manager, temp_workspace
+    ):
+        """Existing worktree stuck on default branch is recovered by checking
+        out the feature branch from origin (does NOT re-run `git worktree add`)."""
+        bare_dir = temp_workspace / "acme"
+        bare_dir.mkdir(parents=True)
+        worktree_dir = bare_dir / "ACME-123"
+        worktree_dir.mkdir(parents=True)
+
+        with patch.object(
+            worktree_manager, "ensure_bare_clone", return_value=bare_dir
+        ):
+            mock_run.side_effect = [
+                Mock(returncode=0),  # git status
+                Mock(returncode=0, stdout="main\n"),  # git rev-parse --abbrev-ref HEAD (wrong branch)
+                Mock(returncode=1),  # git rev-parse --verify <branch> (no local)
+                Mock(returncode=0, stderr=""),  # git fetch origin +refs/heads/<branch>:refs/sentinel-sync/<branch>
+                Mock(returncode=0),  # git checkout -b <branch> refs/sentinel-sync/<branch>
+            ]
+
+            result = worktree_manager.create_worktree("ACME-123", "ACME")
+
+            assert result == worktree_dir
+            # 5 calls — note: NO `git worktree add` because the worktree already exists
+            assert mock_run.call_count == 5
+            for call_args in mock_run.call_args_list:
+                cmd = call_args[0][0]
+                assert not (cmd[0] == "git" and "worktree" in cmd and "add" in cmd), (
+                    "git worktree add must not run when worktree already exists"
+                )
+
+            # Final call should be a checkout off the Sentinel-owned sync ref
+            # (not origin/<branch>, which doesn't exist as a real ref in
+            # bare-clone-backed worktrees).
+            checkout_call = mock_run.call_args_list[4][0][0]
+            assert "checkout" in checkout_call
+            assert "-b" in checkout_call
+            assert "sentinel/feature/ACME-123" in checkout_call
+            assert "refs/sentinel-sync/sentinel/feature/ACME-123" in checkout_call
 
 
 class TestCleanupWorktree:

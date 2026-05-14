@@ -25,10 +25,14 @@ Two commits against `main`:
 | Stack vs project scope (Appendix D) | ✅ Scope values, physical homes, widening rules |
 | Prompt budget + caching (Appendix E) | ✅ 12k-token static cap, cache boundary placement |
 | Agent roster for implementation | 🟡 Designed in conversation, **not yet in any file** — see §6 below |
-| Phase 1 code | ❌ Not started |
-| Migration `003_postmortems.sql` | ❌ Not written |
-| FeedbackDistiller subagent | ❌ Not written (Phase 2) |
-| `sentinel rules` CLI | ❌ Not written (Phase 2) |
+| Phase 1 code (verifier-retry loop, cap-out, postmortem insert) | ✅ Implemented and reviewer-approved (756 tests passing, zero regressions) |
+| Migration `003_postmortems.sql` | ✅ Applied |
+| Phase 2A — Pitfalls visible (read path; tasks 8 + 9) | ✅ Implemented |
+| Phase 2B — Closed loops (tasks 12 + 13) | ✅ Implemented |
+| Phase 2C — Promotion path (tasks 10 + 11; FeedbackDistiller; `sentinel rules` CLI) | ✅ Implemented |
+| Phase 2 sub-phase split (2A/2B/2C) | ✅ Documented in design doc §8 / §10 |
+| Phase 3 sub-phase split (3A/3B/3C; task 18 deferred) | ✅ Documented in design doc §8 / §10 |
+| Phase 3 code | ❌ Not started — gate is open, 3A is next |
 
 ## 3. The design document — table of contents
 
@@ -88,14 +92,42 @@ The design conversation agreed on a 5-agent Phase 1 roster. Not yet written to a
 
 ### Phase 2 — create only after Phase 1 gate passes
 
-- `sentinel-distiller-expert` — FeedbackDistiller subagent design, prompt, JSON schema, calibration.
-- `sentinel-retrieval-expert` — prompt budget, cache boundary, ranking query, `executions.rules_snapshot_json` freezing.
-- `sentinel-cli-rules-expert` — `sentinel rules {show,list,search,active-at,supersede,revoke}`.
+Phase 2 is split into three independently shippable sub-phases (design doc §8). Plan each as a separate `prp-plan` invocation; the full Phase 2 in one synthesis turn has been observed to stall.
+
+| Sub-phase | Tasks (§8) | Owning agents (this section) | Independent of |
+|---|---|---|---|
+| **2A — Pitfalls visible** (read path) | 8, 9 | `sentinel-retrieval-expert`, `sentinel-learning-integrator` (loader + event seam) | 2B; must precede 2C |
+| **2B — Closed loops** (planner feedback) | 12, 13 | `sentinel-learning-integrator` (event + post_execute), planner-side work in `plan_generator.py` | 2A and 2C entirely |
+| **2C — Promotion path** (write + human gate) | 10, 11 | `sentinel-distiller-expert`, `sentinel-cli-rules-expert`, `sentinel-persistence-expert` | 2B; depends on 2A |
+
+- `sentinel-distiller-expert` — FeedbackDistiller subagent design, prompt, JSON schema, calibration. (2C)
+- `sentinel-retrieval-expert` — prompt budget, cache boundary, ranking query, `executions.rules_snapshot_json` freezing. (2A)
+- `sentinel-cli-rules-expert` — `sentinel rules {show,list,search,active-at,supersede,revoke}`. (2C; the inspector CLI for 2A is `sentinel postmortems list`, owned by the integrator.)
+
+**`prp-plan` invocations** (run each in a fresh session):
+- 2A: `prp-plan "Phase 2A of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`
+- 2B: `prp-plan "Phase 2B of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`
+- 2C: `prp-plan "Phase 2C of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`
 
 ### Phase 3 — create only after Phase 2 gate passes
 
-- `sentinel-outcome-poller-expert` — `check_merge_outcomes`, `check_pipeline_failures`, `sentinel outcomes sync`, `project_sync_state` watermarking.
-- `sentinel-skill-library-expert` — Voyager-style subagent skill promotion under `commands/`.
+Phase 3 is split into three independently shippable sub-phases (design doc §8). Plan each as a separate `prp-plan` invocation; the existing single-shot artifact at `.claude/PRPs/plans/phase-3-cautious-autonomy.plan.md` predates the split — treat it as background, not as the source of truth.
+
+| Sub-phase | Tasks (§8) | Owning agents (this section) | Independent of |
+|---|---|---|---|
+| **3A — Outcome ingestion** (pull path) | 14, 15 | `sentinel-outcome-poller-expert`, `sentinel-learning-integrator` (event + CLI seam), `sentinel-persistence-expert` (migration) | Nothing — must precede 3B and 3C |
+| **3B — Outcome-weighted memory** | 16 | `sentinel-persistence-expert`, `sentinel-retrieval-expert` (consistency with §C.6 formula) | 3C; depends on 3A |
+| **3C — Skill promotion** | 17 | `sentinel-skill-library-expert`, `sentinel-cli-rules-expert` | 3B; depends on 3A |
+
+- `sentinel-outcome-poller-expert` — `check_merge_outcomes`, `check_pipeline_failures`, `sentinel outcomes sync`, `project_sync_state` watermarking. (3A)
+- `sentinel-skill-library-expert` — Voyager-style subagent skill promotion under `commands/`. (3C)
+
+**Task 18** (optional Letta / Mem0) is gated and not part of any sub-phase. Revisit only if SQLite measurably caps out.
+
+**`prp-plan` invocations** (run each in a fresh session):
+- 3A: `prp-plan "Phase 3A of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`
+- 3B: `prp-plan "Phase 3B of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`
+- 3C: `prp-plan "Phase 3C of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`
 
 ### Reviewer invocation policy (not every PR)
 
@@ -122,11 +154,27 @@ The reviewer agent checks these before blessing "Phase 1 done, Phase 2 may start
 
 ## 8. Next actions — prioritized for the next session
 
-1. **Decide the open questions in §5.** No code until they're answered.
-2. **Create the 5 Phase 1 agents** (§6). Do `sentinel-learning-reviewer` first so it can review the others' initial PRs.
-3. **Write `docs/learning-system-agents.md`** if the team wants the agent roster committed rather than living in chat history + this handover. The conversation explicitly deferred this; bring it up as an early decision.
-4. **Start Phase 1 task 1:** structured test-output adapter in `base_developer.run_tests()`. This is the unblocker for every other Phase 1 task.
-5. **Do not** start Phase 2 work, even opportunistically, while Phase 1 is in flight. The gate is deliberate.
+Phase 1 and Phase 2 (2A/2B/2C) are complete. The gate to Phase 3 is open. The action list below is the live one; the historical Phase 1 / Phase 2 startup checklists have been retired and are preserved in git history.
+
+1. **Resolve open question §5.6 before 3A code starts:** is `project_sync_state` per Sentinel installation or per repo? Default per installation. This is the only §5 question that gates 3A — others (retry cap, distiller model, probation injection, widening PR location, overlay character cap) were resolved during Phase 1/2 implementation. Append a decision entry to `agent-learning-from-feedback-DECISIONS.md`.
+2. **Plan Phase 3A** (`prp-plan "Phase 3A of sentinel/docs/agent-learning-from-feedback-2026-05-03.md"`) in a fresh session. The existing artifact at `.claude/PRPs/plans/phase-3-cautious-autonomy.plan.md` predates the sub-phase split — archive or rename to `.archive` before re-planning so prp-plan writes a fresh per-sub-phase file.
+3. **Implement 3A** (`prp-implement <plan-file>`), reviewer-approve, observe `OutcomeRecorded` events flowing on a fixture project before opening the gate to 3B and 3C.
+4. **Plan and implement 3B** once 3A is merged and outcome rows are accumulating. 3B writes confidence; it is meaningless before 3A produces signal.
+5. **Plan and implement 3C** after 3A is merged. Recommended after 3B so promotion candidates are picked from outcome-weighted confidence rather than raw observation counts.
+6. **Do not** plan Phase 3 in a single shot, and do not pull Task 18 (Letta / Mem0) into any sub-phase. Task 18 is gated and only revisited if SQLite measurably caps out.
+
+### 8.1 Phase 2A follow-up — flip the feature flag (2026-05-08)
+
+Phase 2A landed (`.claude/PRPs/plans/completed/phase-2a-pitfalls-visible.plan.md`; report at `.claude/PRPs/reports/phase-2a-pitfalls-visible-report.md`). It ships with `POSTMORTEM_INJECTION=0` as the default.
+
+**Action**: after the PR merges and CI observes `tests/integration/test_postmortem_injection.py` consistently green for at least one full execution cycle, flip the default in `src/prompt_loader.py::_postmortem_injection_enabled` from `'0'` to `'1'` (or remove the env-var gate entirely) in a one-line follow-up PR.
+
+**Why a separate PR**: the flag's purpose is rollback, not perpetual gating (plan §Risks "Reviewer signal erosion"). Bundling the flip with other work makes rollback non-trivial. A standalone one-line PR keeps revert cheap if the planner-prompt change misbehaves in production.
+
+**Pre-flip checklist**:
+- CI green on `tests/integration/test_postmortem_injection.py` (the exit-criterion fixture).
+- A real Sentinel run on a Drupal project with at least one postmortem in the DB shows the `## Known pitfalls` block in the planner prompt (manual validation level 6).
+- Reviewer-policy invocation done if the flip touches `src/prompt_loader.py` (it does).
 
 ## 9. Pointers — key file:line references
 

@@ -1,5 +1,6 @@
 """Git worktree manager for isolated feature development."""
 
+import logging
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -7,8 +8,17 @@ from typing import Optional
 from src.attachment_manager import AttachmentManager
 from src.config_loader import get_config
 
+logger = logging.getLogger(__name__)
+
 # Branch prefix for all Sentinel-created branches
 BRANCH_PREFIX = "sentinel/feature"
+
+# Sentinel-owned ref namespace used to mirror origin's branch tip into the
+# bare clone in a way that's portable across bare and regular clones. Bare
+# clones don't populate ``refs/remotes/origin/*``, so any code that looks up
+# ``origin/<branch>`` returns "not a ref" and silently no-ops. Fetching into
+# our own ref under ``refs/sentinel-sync/`` sidesteps that entirely.
+_SYNC_REF_PREFIX = "refs/sentinel-sync"
 
 
 def get_branch_name(ticket_id: str) -> str:
@@ -130,20 +140,74 @@ class WorktreeManager:
 
         return bare_clone_dir
 
-    def _sync_branch_with_remote(self, worktree_dir: Path, branch_name: str) -> None:
-        """Fast-forward local branch to match remote if remote is ahead."""
-        remote_ref = f"origin/{branch_name}"
-        ref_check = subprocess.run(
-            ["git", "rev-parse", "--verify", remote_ref],
+    def _fetch_remote_branch_ref(
+        self, worktree_dir: Path, branch_name: str
+    ) -> Optional[str]:
+        """Fetch origin's tip of ``branch_name`` into a Sentinel-owned ref.
+
+        Returns the local ref name on success (e.g.
+        ``refs/sentinel-sync/sentinel/feature/ACME-123``), or ``None`` when
+        origin doesn't have that branch. The caller can then ``checkout -b``
+        or ``reset --hard`` to that ref.
+
+        Why this exists: bare clones (which back our worktrees) configure
+        ``fetch = +refs/heads/*:refs/heads/*`` and don't populate
+        ``refs/remotes/origin/*``. So ``git rev-parse --verify origin/<branch>``
+        returns "not a ref" in a worktree, even when origin has the branch —
+        and any code branching on that returns false silently. This helper
+        sidesteps the issue by fetching into our own ref namespace, which
+        works the same way regardless of whether the underlying clone uses
+        remote-tracking refs.
+        """
+        sync_ref = f"{_SYNC_REF_PREFIX}/{branch_name}"
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", f"+refs/heads/{branch_name}:{sync_ref}"],
             cwd=worktree_dir,
             capture_output=True,
+            text=True,
         )
-        if ref_check.returncode == 0:
-            subprocess.run(
-                ["git", "merge", "--ff-only", remote_ref],
-                cwd=worktree_dir,
-                capture_output=True,
+        if fetch.returncode != 0:
+            # Most likely cause: branch doesn't exist on origin. Treat as
+            # "no remote branch" and let the caller decide what to do
+            # (typically: create from default branch instead).
+            logger.debug(
+                "No origin/%s — fetch returned rc=%d: %s",
+                branch_name, fetch.returncode, fetch.stderr.strip(),
             )
+            return None
+        return sync_ref
+
+    def _sync_branch_with_remote(
+        self, worktree_dir: Path, branch_name: str
+    ) -> None:
+        """Force-align worktree's branch to origin's tip.
+
+        Sentinel owns the lifecycle of feature branches, so when local has
+        diverged from origin we always pick origin. The previous
+        implementation used ``git merge --ff-only`` without ``check=True``,
+        which silently failed on divergence and left the worktree behind
+        origin — the next ``git push`` then failed with non-fast-forward.
+        ``reset --hard`` is the right semantics here: branches are
+        throwaway, origin is canonical.
+        """
+        sync_ref = self._fetch_remote_branch_ref(worktree_dir, branch_name)
+        if sync_ref is None:
+            # No origin branch — nothing to sync to. Leave worktree alone.
+            return
+
+        reset = subprocess.run(
+            ["git", "reset", "--hard", sync_ref],
+            cwd=worktree_dir,
+            capture_output=True,
+            text=True,
+        )
+        if reset.returncode != 0:
+            logger.error(
+                "Failed to align worktree to origin/%s: %s",
+                branch_name, reset.stderr.strip(),
+            )
+            return
+        logger.info("Worktree aligned to origin/%s via %s", branch_name, sync_ref)
 
     def create_worktree(self, ticket_id: str, project_key: str) -> Path:
         """Create a git worktree for a ticket.
@@ -168,6 +232,8 @@ class WorktreeManager:
 
         # Worktree directory
         worktree_dir = bare_clone_dir / ticket_id
+        branch_name = get_branch_name(ticket_id)
+        skip_worktree_add = False
 
         # Check if worktree already exists
         if worktree_dir.exists():
@@ -179,32 +245,38 @@ class WorktreeManager:
                     capture_output=True,
                     check=True,
                 )
-                # Sync with remote in case remote is ahead (e.g. after setup reset)
+                # Worktree is valid — check what branch it's on
                 branch_result = subprocess.run(
                     ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                     cwd=worktree_dir,
                     capture_output=True,
                     text=True,
                 )
-                if branch_result.returncode == 0:
-                    self._sync_branch_with_remote(
-                        worktree_dir, branch_result.stdout.strip()
-                    )
-                return worktree_dir
+                current_branch = (
+                    branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+                )
+
+                if current_branch == branch_name:
+                    # Already on the feature branch — sync with remote and return
+                    self._sync_branch_with_remote(worktree_dir, branch_name)
+                    return worktree_dir
+
+                # Wrong branch (e.g. previous run died after `git worktree add`
+                # but before the feature branch was checked out). Fall through to
+                # branch resolution below WITHOUT re-adding the worktree.
+                skip_worktree_add = True
             except subprocess.CalledProcessError:
                 # Invalid worktree, remove and recreate
                 import shutil
                 shutil.rmtree(worktree_dir)
 
-        # Create worktree from default branch
-        subprocess.run(
-            ["git", "worktree", "add", str(worktree_dir), default_branch],
-            cwd=bare_clone_dir,
-            check=True,
-        )
-
-        # Create or checkout feature branch
-        branch_name = get_branch_name(ticket_id)
+        if not skip_worktree_add:
+            # Create worktree from default branch
+            subprocess.run(
+                ["git", "worktree", "add", str(worktree_dir), default_branch],
+                cwd=bare_clone_dir,
+                check=True,
+            )
 
         # Check if branch already exists
         result = subprocess.run(
@@ -222,15 +294,14 @@ class WorktreeManager:
             )
             self._sync_branch_with_remote(worktree_dir, branch_name)
         else:
-            # Check if branch exists on remote (e.g. after a reset)
-            remote_ref = f"origin/{branch_name}"
-            remote_result = subprocess.run(
-                ["git", "rev-parse", "--verify", remote_ref],
-                cwd=worktree_dir,
-                capture_output=True,
-            )
+            # Check if branch exists on origin (e.g. after a reset, or when
+            # the user pushed work from elsewhere). Use the helper so this
+            # works on bare-clone-backed worktrees too — see
+            # ``_fetch_remote_branch_ref`` for why a direct
+            # ``rev-parse origin/<branch>`` is unreliable here.
+            remote_ref = self._fetch_remote_branch_ref(worktree_dir, branch_name)
 
-            if remote_result.returncode == 0:
+            if remote_ref is not None:
                 # Remote branch exists — create local branch tracking it
                 subprocess.run(
                     ["git", "checkout", "-b", branch_name, remote_ref],

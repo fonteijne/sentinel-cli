@@ -34,7 +34,7 @@ def mock_agent_sdk():
     with patch("src.agents.base_agent.AgentSDKWrapper") as mock:
         wrapper = Mock()
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": "Test LLM response",
                 "tool_uses": [],
@@ -134,7 +134,7 @@ class TestConfidenceEvaluatorAgent:
 
     def test_evaluate_returns_valid_schema(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test that evaluate returns all expected keys."""
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": HIGH_CONFIDENCE_RESPONSE,
                 "tool_uses": [],
@@ -155,7 +155,7 @@ class TestConfidenceEvaluatorAgent:
 
     def test_evaluate_invest_criteria_complete(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test that all 6 INVEST criteria are present."""
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": HIGH_CONFIDENCE_RESPONSE,
                 "tool_uses": [],
@@ -178,7 +178,7 @@ class TestConfidenceEvaluatorAgent:
         """Test that evaluator is called with cwd=None (no codebase access)."""
         calls = []
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             calls.append({"cwd": cwd})
             return {
                 "content": HIGH_CONFIDENCE_RESPONSE,
@@ -196,7 +196,7 @@ class TestConfidenceEvaluatorAgent:
 
     def test_evaluate_high_confidence(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test high confidence score for well-specified plan."""
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": HIGH_CONFIDENCE_RESPONSE,
                 "tool_uses": [],
@@ -214,7 +214,7 @@ class TestConfidenceEvaluatorAgent:
 
     def test_evaluate_low_confidence(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test low confidence score for vague plan."""
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": LOW_CONFIDENCE_RESPONSE,
                 "tool_uses": [],
@@ -233,7 +233,7 @@ class TestConfidenceEvaluatorAgent:
 
     def test_evaluate_handles_invalid_json(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test graceful handling of invalid JSON response."""
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": "This is not valid JSON at all",
                 "tool_uses": [],
@@ -256,7 +256,7 @@ class TestConfidenceEvaluatorAgent:
             "gaps": ["Missing info"],
         })
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": partial_response,
                 "tool_uses": [],
@@ -284,7 +284,7 @@ class TestConfidenceEvaluatorAgent:
             "summary": "Test",
         })
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": response_with_float,
                 "tool_uses": [],
@@ -302,7 +302,7 @@ class TestConfidenceEvaluatorAgent:
         """Test that existing ticket comments are included in evaluation prompt."""
         prompts_received = []
 
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             prompts_received.append(prompt)
             return {
                 "content": HIGH_CONFIDENCE_RESPONSE,
@@ -328,7 +328,7 @@ class TestConfidenceEvaluatorAgent:
 
     def test_run_delegates_to_evaluate(self, mock_config, mock_agent_sdk, mock_prompt):
         """Test that run() delegates to evaluate()."""
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": HIGH_CONFIDENCE_RESPONSE,
                 "tool_uses": [],

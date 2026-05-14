@@ -921,11 +921,25 @@ Return the task list now, one task per line:"""
         if pretask_sha is None:
             return []
 
+        # Two reasons we don't use ``<pretask_sha>..HEAD`` here:
+        #
+        # 1. The per-task commit only lands AFTER tests pass — at verifier
+        #    time the agent's writes are still in the worktree (modified)
+        #    or merely on disk (brand-new files), so HEAD == pretask_sha
+        #    and a HEAD-anchored diff is empty every time → broad fallback
+        #    on every task → the very condition this scoping is meant to
+        #    avoid.
+        # 2. ``git diff <sha>`` compares <sha> to the working tree
+        #    (including the index), which catches *modifications* to
+        #    tracked files. But it does NOT catch brand-new untracked
+        #    files — and brand-new test files are exactly what TDD
+        #    produces. Untracked files have to be picked up via
+        #    ``git ls-files --others --exclude-standard`` and unioned in.
         try:
             diff = subprocess.run(
                 [
                     "git", "diff", "--name-only", "--diff-filter=AM",
-                    f"{pretask_sha}..HEAD", "--", test_glob,
+                    pretask_sha, "--", test_glob,
                 ],
                 cwd=worktree_path,
                 capture_output=True,
@@ -935,7 +949,16 @@ Return the task list now, one task per line:"""
             impl = subprocess.run(
                 [
                     "git", "diff", "--name-only", "--diff-filter=AM",
-                    f"{pretask_sha}..HEAD",
+                    pretask_sha,
+                ],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            untracked = subprocess.run(
+                [
+                    "git", "ls-files", "--others", "--exclude-standard",
                 ],
                 cwd=worktree_path,
                 capture_output=True,
@@ -946,15 +969,31 @@ Return the task list now, one task per line:"""
             logger.debug("git diff failed while deriving test paths: %s", e)
             return []
 
-        if diff.returncode != 0 or impl.returncode != 0:
+        if (
+            diff.returncode != 0
+            or impl.returncode != 0
+            or untracked.returncode != 0
+        ):
             logger.debug(
-                "git diff returned non-zero (test=%d impl=%d) — falling back",
-                diff.returncode, impl.returncode,
+                "git diff/ls-files returned non-zero "
+                "(test=%d impl=%d untracked=%d) — falling back",
+                diff.returncode, impl.returncode, untracked.returncode,
             )
             return []
 
-        direct = [p for p in diff.stdout.splitlines() if p]
-        impl_paths = [p for p in impl.stdout.splitlines() if p]
+        # Untracked files split into test vs non-test by glob match.
+        untracked_paths = [p for p in untracked.stdout.splitlines() if p]
+        untracked_tests = [
+            p for p in untracked_paths if fnmatch.fnmatch(p, test_glob)
+        ]
+        untracked_non_tests = [
+            p for p in untracked_paths if not fnmatch.fnmatch(p, test_glob)
+        ]
+
+        direct = [p for p in diff.stdout.splitlines() if p] + untracked_tests
+        impl_paths = (
+            [p for p in impl.stdout.splitlines() if p] + untracked_non_tests
+        )
 
         # Modules whose tests are already directly covered. We don't want
         # to also list the module's whole tests/ dir from inference —

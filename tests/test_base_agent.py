@@ -1,5 +1,6 @@
 """Unit tests for BaseAgent and agent base classes."""
 
+import logging
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -46,7 +47,7 @@ def mock_agent_sdk():
     with patch("src.agents.base_agent.AgentSDKWrapper") as mock:
         wrapper = Mock()
         # Mock the async method with a coroutine matching actual signature
-        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        async def mock_execute(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             return {
                 "content": "Test response from LLM",
                 "tool_uses": [],
@@ -185,7 +186,7 @@ class TestBaseAgent:
     ):
         """Test send_message when Agent SDK raises exception."""
         # Mock to raise exception
-        async def mock_execute_error(prompt, session_id=None):
+        async def mock_execute_error(prompt, session_id=None, system_prompt=None, cwd=None, max_turns=None, timeout=None):
             raise RuntimeError("Agent SDK error")
 
         mock_agent_sdk.execute_with_tools = mock_execute_error
@@ -388,3 +389,85 @@ class TestReviewAgent:
         assert agent.model == "claude-sonnet-4-5"
         assert hasattr(agent, "send_message")
         assert hasattr(agent, "execute_command")
+
+
+class TestSetProjectReloadSeam:
+    """Phase 2A Task 9: BaseAgent.set_project re-loads the system prompt
+    with stack context (so the planner gets the ``## Known pitfalls`` block).
+    """
+
+    def test_set_project_without_stack_type_leaves_prompt_unchanged(
+        self, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """No ``stack_type`` in project config → static prompt is preserved."""
+        agent = ConcreteAgent("test_agent")
+        original_prompt = agent.system_prompt
+        mock_config.get_project_config.return_value = {}
+
+        agent.set_project("ACME")
+
+        assert agent.system_prompt == original_prompt
+        assert agent._project == "ACME"
+        mock_agent_sdk.set_project.assert_called_once_with("ACME")
+
+    def test_set_project_with_stack_type_reloads(
+        self, monkeypatch, sqlite_mem_conn, postmortem_factory,
+        mock_config, mock_agent_sdk, mock_prompt,
+    ):
+        """``stack_type`` present + a postmortem in DB → prompt re-loads with pitfalls."""
+        from src.core.persistence.postmortems import insert_postmortem
+
+        # Insert a high-confidence drupal postmortem so the renderer has something
+        # to put in the ## Known pitfalls block.
+        insert_postmortem(
+            sqlite_mem_conn,
+            **postmortem_factory(
+                stack_type="drupal",
+                failure_signature="phpstan undefined method Foo::bar()",
+                confidence=80,
+            ),
+        )
+        sqlite_mem_conn.commit()
+
+        agent = ConcreteAgent("test_agent")
+        # The init-time mock_prompt returned a static string; clear its side_effects
+        # so the re-load goes through the real load_agent_prompt → real renderer.
+        mock_prompt.side_effect = lambda *a, **kw: (
+            "## STATIC BASE\n\n## Known pitfalls\n- 1. drupal — phpstan undefined method Foo::bar()\n"
+            if kw.get("stack_type") and kw.get("conn") is not None
+            else "Test system prompt"
+        )
+
+        mock_config.get_project_config.return_value = {"stack_type": "drupal"}
+        monkeypatch.setenv("POSTMORTEM_INJECTION", "1")
+        monkeypatch.setattr(
+            "src.core.persistence.connect", lambda *a, **kw: sqlite_mem_conn
+        )
+        # apply_migrations is a no-op once already applied; let it run.
+
+        agent.set_project("ACME")
+
+        assert "## Known pitfalls" in agent.system_prompt
+        assert "phpstan undefined method" in agent.system_prompt
+
+    def test_set_project_db_failure_keeps_static_prompt(
+        self, monkeypatch, caplog, mock_config, mock_agent_sdk, mock_prompt
+    ):
+        """DB ``connect()`` raises → warning logged, static prompt preserved."""
+        agent = ConcreteAgent("test_agent")
+        original_prompt = agent.system_prompt
+        mock_config.get_project_config.return_value = {"stack_type": "drupal"}
+
+        def boom(*_a, **_kw):
+            raise RuntimeError("DB unavailable")
+
+        monkeypatch.setattr("src.core.persistence.connect", boom)
+
+        with caplog.at_level(logging.WARNING, logger="src.agents.base_agent"):
+            agent.set_project("ACME")
+
+        assert agent.system_prompt == original_prompt
+        assert any(
+            "stack-aware prompt re-load failed" in rec.message
+            for rec in caplog.records
+        )

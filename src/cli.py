@@ -3,7 +3,10 @@
 import logging
 import os
 import shutil
+import sqlite3
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -22,8 +25,111 @@ from src.agents.python_developer import PythonDeveloperAgent
 from src.agents.drupal_developer import DrupalDeveloperAgent
 from src.agents.security_reviewer import SecurityReviewerAgent
 from src.agents.drupal_reviewer import DrupalReviewerAgent
+from src.agents.base_developer import (
+    DeveloperCappedOutException,
+    MAX_ATTEMPTS,
+    RegressionContext,
+)
+from src.core.events import EventBus, ReviewerHandoffTriggered
+from src.core.execution.post_execute import (
+    TicketContext as LearningTicketContext,
+    register_post_execute_subscribers,
+)
+from src.core.learning.cache_invalidator import register_prompt_cache_invalidator
+from src.core.persistence import apply_migrations, connect, list_postmortems
+from src.prompt_loader import get_prompt_loader
 from src.ticket_context import TicketContextBuilder
 from src.utils.adf_parser import parse_adf_to_text
+
+
+def _verifier_loop_enabled() -> bool:
+    """Phase 1 feature flag — set DEV_VERIFIER_LOOP=1 to enable Loop A.
+
+    Re-defined here at module scope so cli.py is self-contained and we don't
+    couple the CLI to the agent's private flag check.
+    """
+    return os.getenv("DEV_VERIFIER_LOOP", "0") == "1"
+
+
+def _loop_c_enabled() -> bool:
+    """Phase 2B feature flag — set LOOP_C_ENABLED=1 to enable Reviewer→Planner handoff."""
+    return os.getenv("LOOP_C_ENABLED", "0") == "1"
+
+
+def _auto_investigate_enabled() -> bool:
+    """Phase 2B feature flag — set AUTO_INVESTIGATE_ENABLED=1 to enable confidence-miss auto-investigation."""
+    return os.getenv("AUTO_INVESTIGATE_ENABLED", "0") == "1"
+
+
+def _loop_c_blocker_threshold() -> int:
+    """Phase 2B threshold — minimum blocker count to trigger Loop C handoff (default 1)."""
+    return int(os.getenv("LOOP_C_BLOCKER_THRESHOLD", "1"))
+
+
+def _extraction_enabled() -> bool:
+    """Phase 2C feature flag — set EXTRACTION_ENABLED=1 to allow DB writes.
+
+    Read at call time so flipping the env var takes effect on the next
+    invocation. Default off until exit-criterion fixture passes. Mirrors
+    the ``POSTMORTEM_INJECTION`` pattern in ``src/prompt_loader.py``.
+    """
+    return os.getenv("EXTRACTION_ENABLED", "0") == "1"
+
+
+def _overlay_proposer_enabled() -> bool:
+    """Phase 2C feature flag — set OVERLAY_PROPOSER_ENABLED=1 to allow git
+    push + draft MR creation against the Sentinel repo. Default off.
+    """
+    return os.getenv("OVERLAY_PROPOSER_ENABLED", "0") == "1"
+
+
+def _outcome_sync_enabled() -> bool:
+    """Phase 3A feature flag — set OUTCOME_SYNC_ENABLED=1 to enable
+    pull-on-demand outcome ingestion at the start of plan/execute and via
+    the explicit `sentinel outcomes sync` subcommand.
+
+    Default off until the exit-criterion fixture (one merged MR + one
+    reverted MR + one post-merge-CI failure) tags correctly. Mirrors the
+    EXTRACTION_ENABLED / OVERLAY_PROPOSER_ENABLED pattern.
+    """
+    return os.getenv("OUTCOME_SYNC_ENABLED", "0") == "1"
+
+
+def _extract_blockers(reviewer_agent: str, reviewer_result: dict) -> list[dict]:
+    """Filter findings to blocker-severity items per reviewer rules.
+
+    Drupal: severity in {BLOCKER, MAJOR}.
+    Security: severity == 'critical', plus 'high' if count > 5 (mirrors
+    security_reviewer veto rule).
+    """
+    findings = reviewer_result.get("findings", [])
+    if reviewer_agent == "drupal_reviewer":
+        return [f for f in findings if f.get("severity") in {"BLOCKER", "MAJOR"}]
+    if reviewer_agent == "security_reviewer":
+        critical = [f for f in findings if f.get("severity") == "critical"]
+        high = [f for f in findings if f.get("severity") == "high"]
+        return critical + (high if len(high) > 5 else [])
+    return []
+
+
+def _format_finding_class(reviewer_agent: str, blockers: list[dict]) -> str:
+    """Comma-join the top-3 blockers' class field. Hard cap 80 chars; suffix '…' if truncated."""
+
+    def _class_of(f: dict) -> str:
+        if reviewer_agent == "security_reviewer":
+            return str(f.get("category", "unknown"))
+        # drupal_reviewer: prefer machine-readable id, fall back to the first
+        # word of the title; never carry reviewer free-form prose into prompts.
+        token = f.get("id") or f.get("title")
+        if not token:
+            return "unknown"
+        return str(token).strip().split()[0]
+
+    classes = [_class_of(f) for f in blockers[:3]]
+    joined = ",".join(classes)
+    if len(joined) <= 80:
+        return joined
+    return joined[:79] + "…"
 
 
 # Setup logging
@@ -117,6 +223,14 @@ def plan(ticket_id: str, project: Optional[str] = None, revise: bool = False, fo
 
         click.echo(f"📋 Planning ticket: {ticket_id}")
         click.echo(f"🏗️  Project: {project}")
+
+        # Phase 3A: pull-on-demand outcome ingestion. Non-fatal — sync
+        # failures must never block planning. Gated on OUTCOME_SYNC_ENABLED.
+        if _outcome_sync_enabled():
+            try:
+                _run_outcome_sync_preflight(project=None)
+            except Exception as e:
+                logger.warning("outcome sync preflight failed: %s", e)
 
         # Step 1: Fetch Jira ticket (before creating worktree to validate ticket exists)
         click.echo("\n1️⃣  Fetching Jira ticket...")
@@ -296,10 +410,10 @@ def _format_decision_log(ticket_id: str, iteration: int, dev_result: dict, sec_r
         f"- **Tasks failed:** {dev_result['tasks_failed']}",
     ]
 
-    # Test results — keys: success (bool), output (str), return_code (int)
+    # Test results — keys: passed (bool), test_results (str), structured_errors (list), return_code (int)
     test_results = dev_result.get("test_results")
     if test_results:
-        if test_results.get("success"):
+        if test_results.get("passed"):
             lines.append("- **Tests:** passing")
         else:
             lines.append(f"- **Tests:** failing (exit code {test_results.get('return_code', '?')})")
@@ -360,7 +474,7 @@ def _format_revision_log(ticket_id: str, result: dict) -> str:
 
     test_results = result.get("test_results", {})
     if test_results:
-        if test_results.get("success"):
+        if test_results.get("passed"):
             lines.append("- **Tests:** passing")
         else:
             lines.append(f"- **Tests:** failing (exit code {test_results.get('return_code', '?')})")
@@ -505,6 +619,14 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             click.echo("   Run 'sentinel plan' first to create the worktree")
             sys.exit(1)
 
+        # Phase 3A: pull-on-demand outcome ingestion. Non-fatal — sync
+        # failures must never block execution. Gated on OUTCOME_SYNC_ENABLED.
+        if _outcome_sync_enabled():
+            try:
+                _run_outcome_sync_preflight(project=None)
+            except Exception as e:
+                logger.warning("outcome sync preflight failed: %s", e)
+
         # Run revision workflow if --revise flag is set
         if revise:
             click.echo(f"🔄 Revising implementation for: {ticket_id}")
@@ -517,10 +639,84 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             project_config = config.get_project_config(project)
             stack_type = project_config.get("stack_type", "")
 
+            # Open SQLite + apply migrations regardless of flag — schema
+            # presence is a pre-condition for tests and for downstream phases.
+            execution_id = str(uuid.uuid4())
+            db_conn = connect()
+            apply_migrations(db_conn)
+            db_conn.execute(
+                "INSERT INTO executions (id, ticket_id, kind, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    execution_id,
+                    ticket_id,
+                    "execute",
+                    "running",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            db_conn.commit()
+
             if stack_type and stack_type.startswith("drupal"):
                 developer = DrupalDeveloperAgent()
             else:
                 developer = PythonDeveloperAgent()
+
+            # Loop A wiring is gated on the flag. When off, we still hold the
+            # connection open (and applied migrations above) so the schema
+            # invariant holds, but we don't attach the bus to the developer —
+            # the agent's flag check in ``implement_feature`` falls back to
+            # single-shot in that case.
+            bus: Optional[EventBus] = None
+            if _verifier_loop_enabled() or _loop_c_enabled():
+                from src.gitlab_client import GitLabClient
+
+                if _verifier_loop_enabled():
+                    logger.info(
+                        "DEV_VERIFIER_LOOP=1 — Loop A active (verifier-retry capped at %d)",
+                        MAX_ATTEMPTS,
+                    )
+                    click.echo("🔁 Verifier-retry loop ACTIVE")
+                if _loop_c_enabled():
+                    logger.info("LOOP_C_ENABLED=1 — Reviewer→Planner handoff active")
+                bus = EventBus(db_conn)
+                git_url = project_config.get("git_url", "")
+                gitlab_project = (
+                    GitLabClient.extract_project_path(git_url) if git_url else None
+                )
+                source_branch = get_branch_name(ticket_id)
+                _gitlab_for_bus = GitLabClient()
+
+                def _resolve_mr_iid_revise() -> Optional[int]:
+                    if not gitlab_project:
+                        return None
+                    try:
+                        mrs = _gitlab_for_bus.list_merge_requests(
+                            project_id=gitlab_project,
+                            source_branch=source_branch,
+                        )
+                        return mrs[0]["iid"] if mrs else None
+                    except Exception as exc:
+                        logger.warning("MR IID lookup failed: %s", exc)
+                        return None
+
+                register_post_execute_subscribers(
+                    bus,
+                    conn=db_conn,
+                    gitlab_client=_gitlab_for_bus,
+                    ticket_context=LearningTicketContext(
+                        execution_id=execution_id,
+                        stack_type=stack_type or "unknown",
+                        gitlab_project=gitlab_project,
+                        mr_iid=None,
+                        mr_iid_resolver=_resolve_mr_iid_revise,
+                    ),
+                )
+                register_prompt_cache_invalidator(bus, get_prompt_loader())
+                # Loop A is what binds the bus to the developer for verifier-retry
+                # events; Loop C alone uses the bus only for handoff publishing.
+                if _verifier_loop_enabled():
+                    developer.set_event_bus(bus, execution_id)
 
             # Set up container environment for test execution
             env_mgr = EnvironmentManager()
@@ -536,7 +732,15 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                     click.echo(f"   ⚠️  Container setup failed: {e} (tests will run on host)")
 
             try:
-                result = developer.run_revision(ticket_id=ticket_id, worktree_path=worktree_path, user_prompt=prompt)
+                try:
+                    result = developer.run_revision(ticket_id=ticket_id, worktree_path=worktree_path, user_prompt=prompt)
+                except DeveloperCappedOutException:
+                    click.echo(
+                        f"\n⏸  Sentinel paused — developer capped at {MAX_ATTEMPTS} attempts. "
+                        "Postmortem recorded; MR set to draft.",
+                        err=True,
+                    )
+                    sys.exit(1)
 
                 if result.get("feedback_count", 0) == 0:
                     click.echo("   ℹ No unresolved discussions found")
@@ -560,7 +764,7 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                 click.echo(f"   ✓ Posted {responses_posted} response(s) to discussions")
 
                 test_results = result.get("test_results", {})
-                if test_results.get("success"):
+                if test_results.get("passed"):
                     click.echo("   ✓ All tests passing")
                 else:
                     click.echo("   ⚠️  Some tests failing - review needed")
@@ -615,6 +819,17 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                             else:
                                 click.echo("\n⚠️  Drupal review has unresolved findings — will post to MR for human review")
                                 drupal_findings_to_post = drupal_result
+                                if _loop_c_enabled() and bus is not None:
+                                    blockers = _extract_blockers("drupal_reviewer", drupal_result)
+                                    if len(blockers) >= _loop_c_blocker_threshold():
+                                        bus.publish(ReviewerHandoffTriggered(
+                                            execution_id=execution_id,
+                                            ts="",
+                                            reviewer_agent="drupal_reviewer",
+                                            finding_class=_format_finding_class("drupal_reviewer", blockers),
+                                            blocker_count=len(blockers),
+                                            next_actor="planner",
+                                        ))
 
                 # Push changes to remote
                 click.echo("\n4️⃣  Pushing changes to remote...")
@@ -762,6 +977,24 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             project_config = config.get_project_config(project)
             stack_type = project_config.get("stack_type", "")
 
+            # Open SQLite + apply migrations regardless of flag — schema
+            # presence is a pre-condition for tests and for downstream phases.
+            execution_id = str(uuid.uuid4())
+            db_conn = connect()
+            apply_migrations(db_conn)
+            db_conn.execute(
+                "INSERT INTO executions (id, ticket_id, kind, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    execution_id,
+                    ticket_id,
+                    "execute",
+                    "running",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            db_conn.commit()
+
             if stack_type and stack_type.startswith("drupal"):
                 developer = DrupalDeveloperAgent()
                 click.echo(f"   Using Drupal developer agent (stack: {stack_type})")
@@ -774,18 +1007,134 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             if env_info and env_info.active:
                 developer.set_environment(env_mgr, ticket_id)
 
+            # Bus wiring is gated on Loop A or Loop C flags. Schema is always
+            # present (above); when both flags are off we skip the bus entirely
+            # and the developer stays on its single-shot path.
+            bus = None  # type: ignore[no-redef]  # parallel branch in same function
+            if _verifier_loop_enabled() or _loop_c_enabled():
+                from src.gitlab_client import GitLabClient
+
+                if _verifier_loop_enabled():
+                    logger.info(
+                        "DEV_VERIFIER_LOOP=1 — Loop A active (verifier-retry capped at %d)",
+                        MAX_ATTEMPTS,
+                    )
+                    click.echo("🔁 Verifier-retry loop ACTIVE")
+                if _loop_c_enabled():
+                    logger.info("LOOP_C_ENABLED=1 — Reviewer→Planner handoff active")
+                bus = EventBus(db_conn)
+                git_url = project_config.get("git_url", "")
+                gitlab_project = (
+                    GitLabClient.extract_project_path(git_url) if git_url else None
+                )
+                source_branch = get_branch_name(ticket_id)
+                _gitlab_for_bus = GitLabClient()
+
+                def _resolve_mr_iid_execute() -> Optional[int]:
+                    if not gitlab_project:
+                        return None
+                    try:
+                        mrs = _gitlab_for_bus.list_merge_requests(
+                            project_id=gitlab_project,
+                            source_branch=source_branch,
+                        )
+                        return mrs[0]["iid"] if mrs else None
+                    except Exception as exc:
+                        logger.warning("MR IID lookup failed: %s", exc)
+                        return None
+
+                register_post_execute_subscribers(
+                    bus,
+                    conn=db_conn,
+                    gitlab_client=_gitlab_for_bus,
+                    ticket_context=LearningTicketContext(
+                        execution_id=execution_id,
+                        stack_type=stack_type or "unknown",
+                        gitlab_project=gitlab_project,
+                        mr_iid=None,
+                        mr_iid_resolver=_resolve_mr_iid_execute,
+                    ),
+                )
+                register_prompt_cache_invalidator(bus, get_prompt_loader())
+                # Loop A is what binds the bus to the developer for verifier-retry
+                # events; Loop C alone uses the bus only for handoff publishing.
+                if _verifier_loop_enabled():
+                    developer.set_event_bus(bus, execution_id)
+
             security = SecurityReviewerAgent()
             drupal_findings_to_post = None
+            regression_ctx: Optional[RegressionContext] = None
 
             for iteration in range(1, max_iterations + 1):
                 click.echo(f"\n   Iteration {iteration}/{max_iterations}")
+                if regression_ctx is not None and not regression_ctx.is_empty():
+                    click.echo(
+                        f"   ↺ Carrying {len(regression_ctx.errors)} "
+                        f"regression(s) from iteration "
+                        f"{regression_ctx.iteration_n} into developer prompts"
+                    )
 
                 # Developer implements features
                 click.echo("   🔨 Developer: Implementing features...")
-                dev_result = developer.run(plan_file=plan_file, worktree_path=worktree_path, user_prompt=prompt)
+                try:
+                    dev_result = developer.run(
+                        plan_file=plan_file,
+                        worktree_path=worktree_path,
+                        user_prompt=prompt,
+                        regressions=regression_ctx,
+                    )
+                except DeveloperCappedOutException:
+                    click.echo(
+                        f"\n⏸  Sentinel paused — developer capped at {MAX_ATTEMPTS} attempts. "
+                        "Postmortem recorded; MR set to draft.",
+                        err=True,
+                    )
+                    sys.exit(1)
+                # Bootstrap precondition: config was broken before any task ran.
+                # No tasks were dispatched; this is not a developer-agent failure.
+                if dev_result.get("aborted") == "baseline_config_broken":
+                    click.echo(
+                        "\n❌ Bootstrap precondition failed: config import was broken before this run started",
+                        err=True,
+                    )
+                    parsed = dev_result.get("baseline_failure") or []
+                    if parsed:
+                        for err in parsed:
+                            click.echo(f"   • [{err.get('rule')}] {err.get('message')}", err=True)
+                    else:
+                        # No structured match — show the *tail* of the drush
+                        # output. drush's actual exception (and stack trace)
+                        # is always near the end; the head is verbose
+                        # bootstrap noise that's useless for diagnosis.
+                        raw = (dev_result.get("config_validation") or {}).get("output") or ""
+                        if raw:
+                            tail = raw[-1500:] if len(raw) > 1500 else raw
+                            click.echo("   drush output (last 1500 chars):", err=True)
+                            for line in tail.splitlines():
+                                click.echo(f"      {line}", err=True)
+                    click.echo(
+                        "   No tasks were dispatched. Fix the config in a separate commit, then re-run.",
+                        err=True,
+                    )
+                    sys.exit(2)
+
                 click.echo(f"      ✓ {dev_result['tasks_completed']} tasks completed")
                 if dev_result['tasks_failed'] > 0:
                     click.echo(f"      ⚠ {dev_result['tasks_failed']} tasks failed")
+
+                # Capture cross-iteration regressions: structured errors from
+                # any tasks that failed in this iteration become additional
+                # acceptance criteria for the next iteration's task prompts.
+                this_iter_errors = list(
+                    dev_result.get("regression_errors") or []
+                )
+                if this_iter_errors:
+                    regression_ctx = RegressionContext(
+                        iteration_n=iteration,
+                        errors=this_iter_errors,
+                    )
+                else:
+                    regression_ctx = None
 
                 # Gate: abort if no tasks succeeded — nothing to review or push
                 if dev_result['tasks_completed'] == 0:
@@ -851,6 +1200,17 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                             else:
                                 click.echo("\n⚠️  Drupal review has unresolved findings — will post to MR for human review")
                                 drupal_findings_to_post = drupal_result
+                                if _loop_c_enabled() and bus is not None:
+                                    blockers = _extract_blockers("drupal_reviewer", drupal_result)
+                                    if len(blockers) >= _loop_c_blocker_threshold():
+                                        bus.publish(ReviewerHandoffTriggered(
+                                            execution_id=execution_id,
+                                            ts="",
+                                            reviewer_agent="drupal_reviewer",
+                                            finding_class=_format_finding_class("drupal_reviewer", blockers),
+                                            blocker_count=len(blockers),
+                                            next_actor="planner",
+                                        ))
                                 break
                     else:
                         break
@@ -863,6 +1223,17 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
                     else:
                         click.echo("\n❌ Max iterations reached without approval", err=True)
                         click.echo("   Manual review required. Check security findings.")
+                        if _loop_c_enabled() and bus is not None:
+                            blockers = _extract_blockers("security_reviewer", sec_result)
+                            if len(blockers) >= _loop_c_blocker_threshold():
+                                bus.publish(ReviewerHandoffTriggered(
+                                    execution_id=execution_id,
+                                    ts="",
+                                    reviewer_agent="security_reviewer",
+                                    finding_class=_format_finding_class("security_reviewer", blockers),
+                                    blocker_count=len(blockers),
+                                    next_actor="planner",
+                                ))
                         sys.exit(1)
 
             # Push changes to remote
@@ -1304,6 +1675,479 @@ def status(project: Optional[str] = None) -> None:
     except Exception as e:
         logger.error(f"Status command failed: {e}", exc_info=True)
         click.echo(f"\n❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.group()
+def postmortems() -> None:
+    """Inspect the postmortems table written by the developer cap-out path."""
+    pass
+
+
+@postmortems.command("list")
+@click.option("--stack", "-s", default=None, help="Filter by stack_type (e.g. drupal).")
+@click.option("--limit", "-n", type=click.IntRange(1, 200), default=20)
+@click.option("--min-confidence", "-c", type=click.IntRange(0, 100), default=0)
+def postmortems_list(stack: Optional[str], limit: int, min_confidence: int) -> None:
+    """List active (non-superseded) postmortems."""
+    try:
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            rows = list_postmortems(
+                conn, stack=stack, min_confidence=min_confidence, limit=limit
+            )
+            if not rows:
+                click.echo("No postmortems matched.")
+                return
+            click.echo(f"📓 Postmortems ({len(rows)})\n")
+            for r in rows:
+                click.echo(
+                    f"  #{r['id']:>4}  conf={r['confidence']:>3}  "
+                    f"stack={r['stack_type']:<10}  agent={r['agent']:<22}  "
+                    f"{r['failure_signature']}"
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("postmortems list failed: %s", exc, exc_info=True)
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2C: `sentinel learning` group
+#
+# Subcommands: extract → propose → mark-merged / revoke / list. The first two
+# are flag-gated (EXTRACTION_ENABLED / OVERLAY_PROPOSER_ENABLED, both default
+# off) so dry-runs are always safe; the audit-trail-significant `mark-merged`
+# and `revoke` are immediate effects, but require explicit `--by` and
+# `--reason` (revoke) for attribution.
+#
+# Heavy imports (event bus, learning modules) are deferred into the subcommand
+# bodies so `import src.cli` stays cheap for `--help`.
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def learning() -> None:
+    """Phase 2C: extract → propose → mark-merged / revoke pipeline."""
+    pass
+
+
+def _learning_seed_synthetic_execution(
+    conn: sqlite3.Connection, *, prefix: str
+) -> str:
+    """Seed an ``executions`` row with a synthetic id and return that id.
+
+    The bus's ``events.execution_id`` is a FK to ``executions(id)``. Phase 2C
+    publishes from offline learning runs that have no real execution row, so
+    the CLI inserts a synthetic one (kind='learning', status='completed') for
+    the duration of the run. The id is generated once here so the caller can
+    pass it to both ``extract_clusters`` / ``propose_overlays`` (event payload)
+    and the seed INSERT (FK target) — keeping them aligned.
+    """
+    utc_iso = datetime.now(timezone.utc).isoformat()
+    execution_id = f"{prefix}-{utc_iso}"
+    conn.execute(
+        "INSERT INTO executions (id, ticket_id, kind, status, created_at) "
+        "VALUES (?, ?, 'learning', 'completed', ?)",
+        (execution_id, prefix.upper(), utc_iso),
+    )
+    conn.commit()
+    return execution_id
+
+
+def _discover_known_projects(conn: sqlite3.Connection) -> list[str]:
+    """Return all project paths that have ever been synced (Phase 3A).
+
+    The watermark table is the only authoritative source — a project shows
+    up here once its first sync has run. Empty list means "no known
+    projects"; the caller is expected to print a friendly message rather
+    than silently no-op.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT project FROM project_sync_state ORDER BY project"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _print_outcome_sync_summary(summary: object) -> None:
+    """Pretty-print an ``OutcomeSyncSummary`` to stdout (Phase 3A).
+
+    Defensive ``getattr`` access keeps this helper decoupled from the
+    summary dataclass's import path — the CLI imports the service lazily
+    inside the subcommand body.
+    """
+    project = getattr(summary, "project", "?")
+    mrs_seen = getattr(summary, "mrs_seen", 0)
+    executions_tagged = getattr(summary, "executions_tagged", 0)
+    tag_counts = getattr(summary, "tag_counts", {}) or {}
+    watermark = getattr(summary, "watermark_advanced_to", None)
+    errors = getattr(summary, "errors", []) or []
+    dry_run = getattr(summary, "dry_run", False)
+
+    suffix = " (dry-run)" if dry_run else ""
+    click.echo(f"📦 {project}{suffix}")
+    click.echo(f"   mrs_seen:          {mrs_seen}")
+    click.echo(f"   executions_tagged: {executions_tagged}")
+    if tag_counts:
+        for tag in sorted(tag_counts):
+            click.echo(f"     {tag}: {tag_counts[tag]}")
+    click.echo(f"   watermark_advanced_to: {watermark}")
+    for err in errors:
+        click.echo(f"   ⚠ {err}", err=True)
+
+
+def _run_outcome_sync_preflight(project: Optional[str]) -> None:
+    """Run an outcome sync as a non-fatal pre-flight (Phase 3A).
+
+    Opens its own short-lived connection so it never collides with a
+    caller that already holds one (plan/execute may pass ``db_conn``
+    around). Heavy imports are deferred. The pre-flight intentionally
+    passes ``event_bus=None`` to keep the events table uncluttered during
+    the plan/execute hot path; the explicit ``outcomes sync`` subcommand
+    is where event publication happens.
+
+    All exceptions propagate — call sites wrap in ``try/except`` and log a
+    warning. Sync failures must never block plan or execute.
+    """
+    from src.core.learning.outcome_sync import OutcomeSyncService  # noqa: PLC0415
+    from src.gitlab_client import GitLabClient  # noqa: PLC0415
+
+    conn = connect()
+    try:
+        apply_migrations(conn)
+        service = OutcomeSyncService(conn, GitLabClient(), event_bus=None)
+        projects = [project] if project else _discover_known_projects(conn)
+        for proj in projects:
+            service.sync(project=proj)
+    finally:
+        conn.close()
+
+
+def _resolve_sentinel_repo_root() -> Path:
+    """Return the Sentinel repo root, validated by reading ``pyproject.toml``.
+
+    ``cli.py`` lives at ``<repo-root>/src/cli.py`` so ``parents[1]`` is the
+    repo root. We confirm by reading ``pyproject.toml`` and checking that the
+    package name is ``sentinel`` — fails loudly if a future move silently
+    changes the layout.
+    """
+    candidate = Path(__file__).resolve().parents[1]
+    pyproject = candidate / "pyproject.toml"
+    if not pyproject.exists():
+        raise RuntimeError(
+            f"Sentinel repo root resolution failed: {pyproject} not found"
+        )
+    text = pyproject.read_text(encoding="utf-8")
+    if 'name = "sentinel"' not in text:
+        raise RuntimeError(
+            f"Sentinel repo root resolution failed: {pyproject} does not "
+            'declare name = "sentinel"'
+        )
+    return candidate
+
+
+@learning.command("extract")
+@click.option(
+    "--days",
+    type=click.IntRange(1, 365),
+    default=30,
+    help="Window in days (default 30).",
+)
+@click.option(
+    "--min-observations",
+    type=click.IntRange(2, 50),
+    default=3,
+    help="Minimum cluster size (default 3).",
+)
+@click.option(
+    "--min-projects",
+    type=click.IntRange(1, 50),
+    default=2,
+    help="Minimum distinct projects in cluster (default 2).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Print clusters and would-be UPSERTs; do not write.",
+)
+def learning_extract(
+    days: int,
+    min_observations: int,
+    min_projects: int,
+    dry_run: bool,
+) -> None:
+    """Cluster recent postmortems and UPSERT feedback_rules at probation."""
+    if not _extraction_enabled() and not dry_run:
+        click.echo(
+            "EXTRACTION_ENABLED=0 — pass --dry-run to preview, or set "
+            "EXTRACTION_ENABLED=1 to write.",
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            from src.core.events import EventBus  # noqa: PLC0415
+            from src.core.learning.extract import extract_clusters  # noqa: PLC0415
+
+            event_bus: Optional[EventBus]
+            execution_id: Optional[str]
+            if dry_run:
+                event_bus = None
+                execution_id = None
+            else:
+                execution_id = _learning_seed_synthetic_execution(
+                    conn, prefix="learning-extract"
+                )
+                event_bus = EventBus(conn)
+
+            summary = extract_clusters(
+                conn,
+                days=days,
+                min_observations=min_observations,
+                min_projects=min_projects,
+                dry_run=dry_run,
+                event_bus=event_bus,  # type: ignore[arg-type]
+                execution_id=execution_id,
+            )
+            click.echo(f"Clusters considered: {summary.considered}")
+            click.echo(f"  ↳ accepted:         {summary.accepted}")
+            click.echo(f"  ↳ pure-symptom:     {summary.rejected_pure_symptom}")
+            click.echo(
+                f"  ↳ below thresholds: {summary.rejected_below_thresholds}"
+            )
+            for r in summary.rules:
+                click.echo(
+                    f"  rule#{r.rule_id:>4}  conf={r.confidence:>3}  "
+                    f"obs={r.observation_count:>2}  "
+                    f"proj={r.distinct_projects:>2}  "
+                    f"{r.scope}/{r.agent_target}  {r.signature}"
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("learning extract failed: %s", exc, exc_info=True)
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@learning.command("propose")
+@click.option(
+    "--scope",
+    default="drupal",
+    help="Stack scope (default 'drupal').",
+)
+@click.option(
+    "--min-confidence",
+    type=click.IntRange(0, 100),
+    default=80,
+    help="Promotion floor (default 80).",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Render the overlay edit and revert; do not push or open MR.",
+)
+def learning_propose(scope: str, min_confidence: int, dry_run: bool) -> None:
+    """Open a draft MR against the Sentinel repo for promotable rules."""
+    if not _overlay_proposer_enabled() and not dry_run:
+        click.echo(
+            "OVERLAY_PROPOSER_ENABLED=0 — pass --dry-run to preview, or set "
+            "OVERLAY_PROPOSER_ENABLED=1 to push + open MR.",
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        # Resolve repo root once and validate via pyproject.toml. Done before
+        # opening the DB so a misconfigured install fails loudly without
+        # touching SQLite.
+        repo_root = _resolve_sentinel_repo_root()
+
+        # Config check for the non-dry-run write path. Dry-run does NOT need
+        # a configured project path — operators may want to preview the
+        # overlay edit on a workstation that's never going to push.
+        repo_project_path: Optional[str] = (
+            get_config().get_sentinel_repo_project_path()
+        )
+        if not dry_run and not repo_project_path:
+            click.echo(
+                "❌ sentinel.repo_project_path is not configured. The "
+                "proposer cannot open a draft MR without a target project. "
+                "Set it in config.local.yaml under `sentinel.repo_project_path` "
+                "(e.g. \"sentinel-team/sentinel\").",
+                err=True,
+            )
+            sys.exit(1)
+
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            from src.core.events import EventBus  # noqa: PLC0415
+            from src.core.learning.propose_overlay import (  # noqa: PLC0415
+                propose_overlays,
+            )
+            from src.gitlab_client import GitLabClient  # noqa: PLC0415
+
+            event_bus: Optional[EventBus]
+            execution_id: Optional[str]
+            gitlab_client: object
+            if dry_run:
+                event_bus = None
+                execution_id = None
+                # The dry-run path does not call create_merge_request; pass a
+                # placeholder rather than trying to construct GitLabClient
+                # (which raises if GITLAB_API_TOKEN is unset).
+                gitlab_client = object()
+            else:
+                execution_id = _learning_seed_synthetic_execution(
+                    conn, prefix="learning-propose"
+                )
+                event_bus = EventBus(conn)
+                gitlab_client = GitLabClient()
+
+            results = propose_overlays(
+                conn,
+                gitlab_client=gitlab_client,
+                repo_root=repo_root,
+                repo_project_path=repo_project_path or "",
+                scope=scope,
+                min_confidence=min_confidence,
+                dry_run=dry_run,
+                event_bus=event_bus,  # type: ignore[arg-type]
+                execution_id=execution_id,
+            )
+            if not results:
+                click.echo(
+                    f"No rules ready to propose for scope={scope!r} "
+                    f"(min_confidence={min_confidence})."
+                )
+                return
+            click.echo(
+                f"Proposed {len(results)} rule(s) for scope={scope!r}:"
+            )
+            for r in results:
+                click.echo(
+                    f"  rule#{r.rule_id:>4}  branch={r.branch_name}  "
+                    f"mr={r.mr_url}  overlay={r.overlay_path}"
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("learning propose failed: %s", exc, exc_info=True)
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@learning.command("mark-merged")
+@click.argument("rule_id", type=int)
+@click.option("--sha", required=True, help="Commit SHA of the merged MR.")
+@click.option("--by", "by", required=True, help="Username of the merging maintainer.")
+def learning_mark_merged(rule_id: int, sha: str, by: str) -> None:
+    """Flip a probation rule to 'active' after the maintainer merges its MR."""
+    try:
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            from src.core.persistence import mark_promoted  # noqa: PLC0415
+
+            mark_promoted(conn, rule_id=rule_id, sha=sha, promoted_by=by)
+            click.echo(
+                f"Rule #{rule_id} marked merged at sha {sha} by {by}."
+            )
+        finally:
+            conn.close()
+    except ValueError as exc:
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error("learning mark-merged failed: %s", exc, exc_info=True)
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@learning.command("revoke")
+@click.argument("rule_id", type=int)
+@click.option("--by", "by", required=True, help="Username of the revoker.")
+@click.option("--reason", required=True, help="Free-text reason for the audit ledger.")
+def learning_revoke(rule_id: int, by: str, reason: str) -> None:
+    """Flip a rule's status to 'revoked'. Append-only — does NOT delete."""
+    try:
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            from src.core.events import EventBus, FeedbackRuleRevoked  # noqa: PLC0415
+            from src.core.persistence import revoke_rule  # noqa: PLC0415
+
+            revoke_rule(conn, rule_id=rule_id, revoked_by=by, reason=reason)
+            execution_id = _learning_seed_synthetic_execution(
+                conn, prefix="learning-revoke"
+            )
+            bus = EventBus(conn)
+            bus.publish(
+                FeedbackRuleRevoked(
+                    execution_id=execution_id,
+                    rule_id=rule_id,
+                    revoked_by=by,
+                    reason=reason,
+                )
+            )
+            click.echo(f"Rule #{rule_id} revoked by {by}.")
+        finally:
+            conn.close()
+    except ValueError as exc:
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        logger.error("learning revoke failed: %s", exc, exc_info=True)
+        click.echo(f"\n❌ Error: {exc}", err=True)
+        sys.exit(1)
+
+
+@learning.command("list")
+@click.option(
+    "--status",
+    type=click.Choice(["probation", "active", "superseded", "revoked"]),
+    default=None,
+    help="Filter by status (default: all).",
+)
+@click.option("--scope", default=None, help="Filter by scope (e.g. 'drupal').")
+@click.option(
+    "--limit",
+    type=click.IntRange(1, 200),
+    default=50,
+    help="Maximum rows to return (default 50).",
+)
+def learning_list(status: Optional[str], scope: Optional[str], limit: int) -> None:
+    """Inspect feedback_rules — the canonical durable-rule store."""
+    try:
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            from src.core.persistence import list_rules  # noqa: PLC0415
+
+            rows = list_rules(conn, status=status, scope=scope, limit=limit)
+            if not rows:
+                click.echo("No rules matched.")
+                return
+            click.echo(f"📚 Feedback rules ({len(rows)})\n")
+            for r in rows:
+                click.echo(
+                    f"  #{r['id']:>4}  {r['status']:<11}  "
+                    f"conf={r['confidence']:>3}  "
+                    f"{r['scope']}/{r['agent_target']:<22}  "
+                    f"{r['signature']}"
+                )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("learning list failed: %s", exc, exc_info=True)
+        click.echo(f"\n❌ Error: {exc}", err=True)
         sys.exit(1)
 
 
@@ -2556,6 +3400,112 @@ def projects_profile(project_key: str, refresh: bool, show: bool, no_llm: bool) 
     except Exception as e:
         logger.error(f"Projects profile failed: {e}", exc_info=True)
         click.echo(f"❌ Error: {e}", err=True)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: `sentinel outcomes` group
+#
+# Pull-on-demand outcome ingestion. Tags executions with merge / revert /
+# post-merge-CI status by polling GitLab. Flag-gated on OUTCOME_SYNC_ENABLED;
+# `--dry-run` always works regardless of the flag so previews are safe.
+#
+# Heavy imports (GitLabClient, OutcomeSyncService, EventBus) live inside the
+# subcommand body — `import src.cli` must stay cheap for `--help`.
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def outcomes() -> None:
+    """Phase 3A: pull merge / revert / post-merge-CI outcomes from GitLab."""
+    pass
+
+
+@outcomes.command("sync")
+@click.option(
+    "--project",
+    "-p",
+    default=None,
+    help="Project path (e.g., acme/backend). If omitted, sync every "
+         "project that has a row in project_sync_state.",
+)
+@click.option(
+    "--since",
+    type=click.DateTime(formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"]),
+    default=None,
+    help="Override watermark; only sync outcomes updated_after this date.",
+)
+@click.option(
+    "--all",
+    "all_history",  # avoid shadowing builtin
+    is_flag=True,
+    default=False,
+    help="Backfill from epoch (ignores watermark). Use sparingly.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Preview tags + watermark advance; do not write or publish events.",
+)
+def outcomes_sync(
+    project: Optional[str],
+    since: Optional[datetime],
+    all_history: bool,
+    dry_run: bool,
+) -> None:
+    """Sync GitLab outcomes into executions.outcome (Phase 3A)."""
+    if not _outcome_sync_enabled() and not dry_run:
+        click.echo(
+            "OUTCOME_SYNC_ENABLED=0 — pass --dry-run to preview, or set "
+            "OUTCOME_SYNC_ENABLED=1 to write.",
+            err=True,
+        )
+        sys.exit(2)
+    try:
+        conn = connect()
+        try:
+            apply_migrations(conn)
+            from src.core.events import EventBus  # noqa: PLC0415
+            from src.core.learning.outcome_sync import OutcomeSyncService  # noqa: PLC0415
+            from src.gitlab_client import GitLabClient  # noqa: PLC0415
+
+            event_bus: Optional[EventBus]
+            if dry_run:
+                event_bus = None
+            else:
+                # Seeded row exists to satisfy events.execution_id FK during
+                # publish; the id itself is consumed via the bus, not passed
+                # through OutcomeSyncService.sync().
+                _learning_seed_synthetic_execution(conn, prefix="outcomes-sync")
+                event_bus = EventBus(conn)
+
+            service = OutcomeSyncService(conn, GitLabClient(), event_bus=event_bus)
+            since_iso = (
+                since.replace(tzinfo=timezone.utc).isoformat() if since else None
+            )
+            if project:
+                projects = [project]
+            else:
+                projects = _discover_known_projects(conn)
+                if not projects:
+                    click.echo(
+                        "No projects in project_sync_state — pass --project "
+                        "explicitly."
+                    )
+                    return
+            for proj in projects:
+                summary = service.sync(
+                    project=proj,
+                    since=since_iso,
+                    full_backfill=all_history,
+                    dry_run=dry_run,
+                )
+                _print_outcome_sync_summary(summary)
+        finally:
+            conn.close()
+    except Exception as e:
+        click.echo(f"❌ outcomes sync failed: {e}", err=True)
         sys.exit(1)
 
 
