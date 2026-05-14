@@ -365,6 +365,14 @@ def parse_drush_config_validation(output: str) -> list[StructuredError]:
         for m in _DRUSH_MODULE_REQUIRES.finditer(output):
             module = m.group(1).strip()
             dep = m.group(2).strip()
+            # The lazy `[\w\- ]+?` capture in _DRUSH_MODULE_REQUIRES /
+            # _DRUSH_MODULE_DOES_NOT_EXIST legally matches whitespace-only spans
+            # because the character class includes ` `. Tightening the regex risks
+            # regressions on real drush prose (e.g. multi-word names like
+            # "Drupal Symfony Mailer"), so we drop empty captures at the boundary
+            # instead. See issue M2 in feat-sentinel-learning-system-review.md.
+            if not module or not dep:
+                continue
             key = ("requires", f"{module}->{dep}")
             if key in seen:
                 continue
@@ -386,6 +394,9 @@ def parse_drush_config_validation(output: str) -> list[StructuredError]:
 
         for m in _DRUSH_MODULE_DOES_NOT_EXIST.finditer(output):
             module = m.group(1).strip()
+            # Same boundary guard as above — drop whitespace-only captures.
+            if not module:
+                continue
             # Skip if the same module already matched the stronger
             # "requires" pattern at the same offset.
             key = ("missing", module)

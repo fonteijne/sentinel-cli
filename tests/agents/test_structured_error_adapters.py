@@ -389,6 +389,42 @@ class TestParseDrushConfigValidation:
         assert out[0]["rule"] == "drush.config.missing_module"
         assert "responsive_preview" in out[0]["message"]
 
+    def test_empty_module_name_is_silently_dropped(self) -> None:
+        # The lazy `[\w\- ]+?` regex legally matches whitespace-only spans
+        # because the character class includes a literal space. Real-world
+        # drush prose with odd spacing must NOT produce polluting bullets
+        # like "module '' is referenced..." — the parser drops them at the
+        # boundary instead. See issue M2 in
+        # feat-sentinel-learning-system-review.md.
+
+        # 1. HTML-wrapped variant with empty <em>.
+        malformed_html = (
+            '<li class="messages__item">Unable to install the '
+            '<em class="placeholder">  </em> module since it does '
+            'not exist.</li>'
+        )
+        assert parse_drush_config_validation(malformed_html) == []
+
+        # 2. Plaintext variant with double-spacing (empty module slot).
+        malformed_plain = (
+            "Unable to install the  module since it does not exist."
+        )
+        assert parse_drush_config_validation(malformed_plain) == []
+
+        # 3. Requires-variant: either side empty must drop the entry.
+        malformed_requires = (
+            "Unable to install the  module since it requires the  module."
+        )
+        assert parse_drush_config_validation(malformed_requires) == []
+
+        # 4. Mixed: a malformed line alongside a valid one must yield only
+        # the valid bullet (we do not regress on the surrounding loop).
+        mixed = malformed_plain + "\n" + _DRUSH_MISSING
+        out = parse_drush_config_validation(mixed)
+        assert len(out) == 1
+        assert out[0]["rule"] == "drush.config.missing_module"
+        assert "responsive_preview" in out[0]["message"]
+
     def test_already_installed_exception(self) -> None:
         # Real-world output from a dirty-DB Sentinel run.
         sample = (
