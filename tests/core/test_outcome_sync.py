@@ -19,6 +19,7 @@ the plan.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -663,3 +664,91 @@ class TestSyncStateHelpers:
         assert row["last_synced_at"] == "2026-05-02T00:00:00Z"
         assert row["last_seen_mr_iid"] == 2
         assert row["last_seen_updated_at"] == "2026-05-01T00:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# 4. M5 — sync(deadline=...) cooperative cancellation
+# ---------------------------------------------------------------------------
+
+
+class TestSyncDeadline:
+    """M5: cooperative deadline plumbed into ``OutcomeSyncService.sync()``."""
+
+    def test_deadline_in_past_short_circuits_before_first_mr(
+        self, sqlite_mem_conn, caplog
+    ):
+        """deadline in the past => log + return without iterating MRs."""
+        import time
+
+        gl = _make_gitlab_mock(merged_mrs=[_make_mr(iid=1)])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+        past = time.monotonic() - 1.0
+
+        with caplog.at_level(logging.WARNING):
+            summary = service.sync(project="acme/backend", deadline=past)
+
+        # Loop entered but immediate break => mrs_seen stays at 0.
+        assert summary.mrs_seen == 0
+        # Watermark must NOT advance.
+        assert summary.watermark_advanced_to is None
+        # Loud WARNING from the deadline-check (either the revert-fetch
+        # checkpoint for sentinel MRs or the per-MR loop for non-sentinel).
+        assert any(
+            "deadline reached" in rec.message for rec in caplog.records
+        ), f"expected deadline WARNING; got {[r.message for r in caplog.records]}"
+
+    def test_deadline_none_is_unbounded(self, sqlite_mem_conn):
+        """deadline=None preserves pre-M5 behavior (default arg)."""
+        gl = _make_gitlab_mock(merged_mrs=[_make_mr(iid=1)])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+        # No deadline kwarg passed.
+        summary = service.sync(project="acme/backend")
+        assert summary.mrs_seen == 1
+
+    def test_deadline_mid_loop_advances_only_past_handled_mrs(
+        self, sqlite_mem_conn
+    ):
+        """Idempotency: watermark only advances past MRs processed before the cap.
+
+        Two MRs returned by GitLab; the first sync runs with a deadline-in-
+        the-past so zero MRs are handled and the watermark is not advanced.
+        A second UNBOUNDED sync confirms both MRs are then processed and
+        the watermark reflects the latest one.
+        """
+        import time
+
+        mr1 = _make_mr(
+            iid=1, ticket_id="TEST-1", updated_at="2026-05-01T00:00:00Z"
+        )
+        mr2 = _make_mr(
+            iid=2, ticket_id="TEST-2", updated_at="2026-05-02T00:00:00Z"
+        )
+        # Seed an execution row for each ticket so the per-MR processing
+        # has work to do (advances the watermark only past handled MRs).
+        _seed_execution(
+            sqlite_mem_conn,
+            execution_id="e1",
+            ticket_id="TEST-1",
+            created_at="2026-04-01T00:00:00Z",
+        )
+        _seed_execution(
+            sqlite_mem_conn,
+            execution_id="e2",
+            ticket_id="TEST-2",
+            created_at="2026-04-02T00:00:00Z",
+        )
+        gl = _make_gitlab_mock(merged_mrs=[mr1, mr2])
+        service = OutcomeSyncService(sqlite_mem_conn, gl, event_bus=None)
+
+        # First call: deadline-in-past => 0 MRs handled, watermark stays None.
+        summary1 = service.sync(
+            project="acme/backend", deadline=time.monotonic() - 1.0
+        )
+        assert summary1.mrs_seen == 0
+        assert summary1.watermark_advanced_to is None
+
+        # Second call: unbounded => both MRs handled, watermark = max
+        # updated_at across handled MRs.
+        summary2 = service.sync(project="acme/backend")
+        assert summary2.mrs_seen == 2
+        assert summary2.watermark_advanced_to == "2026-05-02T00:00:00Z"

@@ -171,3 +171,121 @@ def test_plan_preflight_swallows_sync_exceptions(
 
     # If we got here without `raised=True`, the guard correctly swallowed.
     assert raised is False
+
+
+# ---------------------------------------------------------------------------
+# 5. M5 — preflight time budget
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_budget_default_is_30(monkeypatch: pytest.MonkeyPatch):
+    """Default budget is 30s when env var is unset."""
+    from src.cli import _outcome_sync_preflight_budget_seconds
+
+    monkeypatch.delenv(
+        "OUTCOME_SYNC_PREFLIGHT_BUDGET_SECONDS", raising=False
+    )
+    assert _outcome_sync_preflight_budget_seconds() == 30.0
+
+
+def test_preflight_budget_zero_or_negative_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """0 / negative / non-numeric values are coerced to default (cannot disable)."""
+    from src.cli import _outcome_sync_preflight_budget_seconds
+
+    for bad in ("0", "-1", "abc", ""):
+        monkeypatch.setenv("OUTCOME_SYNC_PREFLIGHT_BUDGET_SECONDS", bad)
+        assert _outcome_sync_preflight_budget_seconds() == 30.0
+
+
+def test_preflight_logs_loud_warning_when_budget_exhausted(
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    """Two known projects + clock that advances past the deadline mid-loop
+    => loud WARNING listing the remaining project.
+    """
+    import time as time_module
+
+    from src.cli import _run_outcome_sync_preflight
+    from src.core.persistence import connect, upsert_sync_state
+
+    # Seed two known projects so _discover_known_projects returns 2.
+    conn = connect(str(db_path))
+    try:
+        upsert_sync_state(
+            conn,
+            project="acme/alpha",
+            last_synced_at="2026-01-01T00:00:00Z",
+            last_seen_mr_iid=None,
+            last_seen_updated_at=None,
+        )
+        upsert_sync_state(
+            conn,
+            project="acme/beta",
+            last_synced_at="2026-01-01T00:00:00Z",
+            last_seen_mr_iid=None,
+            last_seen_updated_at=None,
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("OUTCOME_SYNC_PREFLIGHT_BUDGET_SECONDS", "1")
+
+    # Drive monotonic deterministically: start=0, deadline check at iter 0
+    # sees t=0 (within budget=1s) so the first sync() runs; subsequent calls
+    # see t=100 (past the deadline) so the second iteration logs the WARNING.
+    real_monotonic = time_module.monotonic
+    fake_clock = iter([0.0, 0.0, 100.0, 100.0, 100.0, 100.0])
+
+    def _fake_monotonic() -> float:
+        try:
+            return next(fake_clock)
+        except StopIteration:
+            return real_monotonic()
+
+    # Mock GitLabClient so the first sync() call is fast.
+    fake_gitlab = MagicMock()
+    fake_gitlab.list_merged_mrs_since.return_value = []
+    fake_gitlab.list_pipelines_for_commit.return_value = []
+    fake_gitlab.list_merge_requests.return_value = []
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(
+            time_module, "monotonic", _fake_monotonic
+        ), patch(
+            "src.gitlab_client.GitLabClient", return_value=fake_gitlab
+        ):
+            _run_outcome_sync_preflight(project=None)
+
+    budget_warnings = [
+        rec for rec in caplog.records
+        if "preflight budget exhausted" in rec.message
+    ]
+    assert budget_warnings, (
+        f"expected budget WARNING; got {[r.message for r in caplog.records]}"
+    )
+    # WARNING line must include the seeded project so an operator can see
+    # which project is still pending.
+    formatted = budget_warnings[0].getMessage()
+    assert "acme/" in formatted, f"expected project name in WARNING: {formatted!r}"
+    # Required fields per the plan's WARNING contract.
+    for token in ("synced=", "remaining=", "elapsed=", "budget=", "remaining_projects="):
+        assert token in formatted, f"missing {token!r} in WARNING: {formatted!r}"
+
+
+def test_preflight_returns_cleanly_when_no_known_projects(
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """First-run / empty DB: preflight is a clean no-op (no GitLab call)."""
+    from src.cli import _run_outcome_sync_preflight
+
+    monkeypatch.setenv("OUTCOME_SYNC_PREFLIGHT_BUDGET_SECONDS", "30")
+    fake_gitlab = MagicMock()
+    with patch("src.gitlab_client.GitLabClient", return_value=fake_gitlab):
+        _run_outcome_sync_preflight(project=None)
+
+    fake_gitlab.list_merged_mrs_since.assert_not_called()

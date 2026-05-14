@@ -95,6 +95,25 @@ def _outcome_sync_enabled() -> bool:
     return os.getenv("OUTCOME_SYNC_ENABLED", "0") == "1"
 
 
+def _outcome_sync_preflight_budget_seconds() -> float:
+    """M5 budget — total wall-clock cap for the outcome-sync preflight.
+
+    Read at call time so flipping the env var takes effect on the next
+    `plan`/`execute`. Default 30 seconds. Mirrors the
+    OUTCOME_SYNC_ENABLED / EXTRACTION_ENABLED env-flag pattern.
+
+    Values <= 0 (and non-numeric) are coerced to the default (operators
+    cannot disable the cap accidentally; explicit unbounded mode is the
+    unguarded `sentinel outcomes sync` subcommand).
+    """
+    raw = os.getenv("OUTCOME_SYNC_PREFLIGHT_BUDGET_SECONDS", "30")
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return 30.0
+    return parsed if parsed > 0 else 30.0
+
+
 def _extract_blockers(reviewer_agent: str, reviewer_result: dict) -> list[dict]:
     """Filter findings to blocker-severity items per reviewer rules.
 
@@ -1817,7 +1836,14 @@ def _run_outcome_sync_preflight(project: Optional[str]) -> None:
 
     All exceptions propagate — call sites wrap in ``try/except`` and log a
     warning. Sync failures must never block plan or execute.
+
+    M5: bounded by ``OUTCOME_SYNC_PREFLIGHT_BUDGET_SECONDS`` (default 30s).
+    When the budget is exhausted, a single WARNING is logged listing the
+    remaining projects and the loop returns. Per-project sync stops at
+    its next MR boundary; watermark idempotency is preserved by the
+    service's existing ``max_updated_at_handled`` invariant.
     """
+    import time  # noqa: PLC0415
     from src.core.learning.outcome_sync import OutcomeSyncService  # noqa: PLC0415
     from src.gitlab_client import GitLabClient  # noqa: PLC0415
 
@@ -1826,8 +1852,27 @@ def _run_outcome_sync_preflight(project: Optional[str]) -> None:
         apply_migrations(conn)
         service = OutcomeSyncService(conn, GitLabClient(), event_bus=None)
         projects = [project] if project else _discover_known_projects(conn)
-        for proj in projects:
-            service.sync(project=proj)
+        if not projects:
+            return
+
+        budget_s = _outcome_sync_preflight_budget_seconds()
+        start = time.monotonic()
+        deadline = start + budget_s
+        synced = 0
+        for i, proj in enumerate(projects):
+            if time.monotonic() >= deadline:
+                remaining = projects[i:]
+                elapsed = time.monotonic() - start
+                logger.warning(
+                    "outcome sync preflight budget exhausted: "
+                    "synced=%d/%d remaining=%d elapsed=%.1fs budget=%.1fs "
+                    "remaining_projects=%s",
+                    synced, len(projects), len(remaining),
+                    elapsed, budget_s, remaining,
+                )
+                break
+            service.sync(project=proj, deadline=deadline)
+            synced += 1
     finally:
         conn.close()
 

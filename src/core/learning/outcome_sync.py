@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -222,6 +223,7 @@ class OutcomeSyncService:
         since: Optional[str] = None,
         full_backfill: bool = False,
         dry_run: bool = False,
+        deadline: Optional[float] = None,
     ) -> OutcomeSyncSummary:
         """Sync outcomes for ``project``.
 
@@ -234,6 +236,14 @@ class OutcomeSyncService:
                 are provided.
             dry_run: do everything except UPDATE the DB and publish events.
                 Counters still increment so the CLI can preview impact.
+            deadline: optional ``time.monotonic()`` deadline (M5 cooperative
+                cancellation). When provided and ``time.monotonic() >=
+                deadline``, the per-MR loop short-circuits and a partial
+                summary is returned. Watermark only advances past MRs whose
+                ``_process_mr`` returned ``handled=True``, so the next sync
+                resumes cleanly. ``None`` (default) keeps pre-M5 unbounded
+                behavior — ``sentinel outcomes sync`` (operator-driven) and
+                all existing callers are unaffected.
 
         Returns:
             ``OutcomeSyncSummary`` with per-project counts. Never raises on
@@ -276,6 +286,14 @@ class OutcomeSyncService:
             m for m in mrs if _BRANCH_RE.match(m.get("source_branch", ""))
         ]
         if sentinel_mrs:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "outcome_sync deadline reached before revert-candidate "
+                    "fetch: project=%s sentinel_mrs=%d — skipping revert "
+                    "detection and returning partial summary",
+                    project, len(sentinel_mrs),
+                )
+                return summary
             min_merged_at: Optional[str] = None
             for m in sentinel_mrs:
                 ts = m.get("merged_at") or m.get("updated_at")
@@ -292,6 +310,13 @@ class OutcomeSyncService:
             revert_candidates = []
 
         for mr in mrs:
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "outcome_sync deadline reached mid-project: project=%s "
+                    "mrs_seen=%d mrs_remaining=%d — returning partial summary",
+                    project, summary.mrs_seen, len(mrs) - summary.mrs_seen,
+                )
+                break
             summary.mrs_seen += 1
             try:
                 handled, mr_updated_at, mr_iid = self._process_mr(
