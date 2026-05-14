@@ -526,9 +526,16 @@ Return the task list now, one task per line:"""
             Dictionary with success, files_created, files_modified,
             test_results, commit_message, agent_response.
         """
-        # Snapshot the worktree HEAD *before* the developer agent runs so
-        # the post-task verifier can scope phpunit to files this task
-        # actually changed. ``None`` preserves legacy broad-scope behavior.
+        # Snapshot the worktree HEAD *before* the developer agent runs.
+        #
+        # Single-shot path: this is the diff base for the post-task verifier.
+        # Loop A path: this is the LOOP-ENTRY sentinel only — each attempt
+        # re-captures its own diff base inside _implement_feature_with_loop
+        # so the verifier scope reflects what *this attempt* changed (not
+        # what's accumulated since loop entry, which can drift if the SDK
+        # commits via Bash between attempts). See _warn_if_sha_drifted.
+        #
+        # ``None`` from the helper preserves legacy broad-scope behavior.
         pretask_sha = self._capture_pretask_sha(worktree_path)
 
         if not _verifier_loop_enabled():
@@ -708,6 +715,13 @@ Return the task list now, one task per line:"""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             logger.info("Loop A attempt %d/%d for task: %s", attempt, MAX_ATTEMPTS, task)
 
+            # Re-capture HEAD at the top of each attempt so the verifier's
+            # changed-files scope reflects what *this attempt* changed, not
+            # what's accumulated since loop entry. The outer ``pretask_sha``
+            # remains as the loop-entry sentinel for drift detection only.
+            attempt_sha = self._capture_pretask_sha(worktree_path)
+            self._warn_if_sha_drifted(pretask_sha, attempt_sha, attempt)
+
             prompt = (
                 tdd_prompt
                 if attempt == 1
@@ -728,7 +742,7 @@ Return the task list now, one task per line:"""
                 elif tool_name == "Edit":
                     files_modified.append(tool_use.get("input", {}).get("file_path", ""))
 
-            test_result = self.run_tests(worktree_path, pretask_sha=pretask_sha)
+            test_result = self.run_tests(worktree_path, pretask_sha=attempt_sha)
             static_result = self.run_static_checks(worktree_path)
 
             test_errors = test_result.get("structured_errors", []) or []
@@ -902,6 +916,35 @@ Return the task list now, one task per line:"""
             return None
         sha = result.stdout.strip()
         return sha or None
+
+    def _warn_if_sha_drifted(
+        self,
+        loop_entry_sha: Optional[str],
+        attempt_sha: Optional[str],
+        attempt: int,
+    ) -> None:
+        """Emit a single advisory warning if HEAD moved between loop entry
+        and the start of this attempt.
+
+        A drift means the developer SDK created a git commit during a prior
+        attempt (Bash tool is allowed). The per-attempt re-capture in
+        ``_implement_feature_with_loop`` already gives the verifier the
+        semantically correct diff base; this warning exists only so
+        operators can see mid-loop commits in the logs.
+
+        No-op when either SHA is ``None`` — that means git capture failed,
+        which is reported separately at debug level by
+        ``_capture_pretask_sha``; we have no signal to report.
+        """
+        if loop_entry_sha is None or attempt_sha is None:
+            return
+        if loop_entry_sha == attempt_sha:
+            return
+        logger.warning(
+            "Loop A: HEAD moved between attempt %d and loop entry "
+            "(loop_entry=%s, attempt=%s); using attempt-anchored diff base",
+            attempt, loop_entry_sha[:8], attempt_sha[:8],
+        )
 
     def _derive_changed_test_paths(
         self,

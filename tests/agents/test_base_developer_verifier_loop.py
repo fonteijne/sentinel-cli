@@ -7,6 +7,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
@@ -278,6 +279,115 @@ def test_loop_retries_with_structured_feedback_then_passes(
     assert "boom" in second_prompt
     assert result["success"] is True
     assert result["attempts"] == 2
+
+
+def test_loop_recaptures_pretask_sha_per_attempt(
+    mock_config, mock_agent_sdk, mock_prompt, temp_worktree, monkeypatch
+):
+    """H7: each Loop A attempt threads its own per-attempt SHA into run_tests.
+
+    Simulates a mid-loop developer commit between attempts 1 and 2: the first
+    two ``git rev-parse HEAD`` invocations (loop-entry capture in
+    ``implement_feature`` and attempt-1 re-capture) return the same SHA,
+    while the attempt-2 re-capture returns a different SHA. We assert that
+    ``run_tests`` was called with each attempt's own SHA.
+
+    NOTE: ``agent.run_tests`` is patched outright, so ``_derive_changed_test_paths``
+    never runs and only ``_capture_pretask_sha``'s ``git rev-parse HEAD``
+    calls hit the subprocess mock — three total over a 2-attempt run.
+    """
+    monkeypatch.setenv("DEV_VERIFIER_LOOP", "1")
+    agent = PythonDeveloperAgent()
+
+    sdk_calls: list[str] = []
+
+    async def fake_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        sdk_calls.append(prompt)
+        return {"content": "iter", "tool_uses": []}
+
+    agent.agent_sdk.execute_with_tools = fake_execute
+
+    sha_sequence = ["sha-loop-entry", "sha-loop-entry", "sha-attempt-2"]
+    mocks = [Mock(returncode=0, stdout=s, stderr="") for s in sha_sequence]
+
+    with patch("src.agents.base_developer.subprocess.run") as mock_run, \
+         patch.object(agent, "execute_command") as exec_cmd, \
+         patch.object(agent, "run_tests") as run_tests, \
+         patch.object(agent, "run_static_checks") as run_static:
+        mock_run.side_effect = mocks
+        exec_cmd.return_value = {"success": True, "workflow": []}
+        run_tests.side_effect = [
+            _failing_test_result(),
+            _passing_test_result(),
+        ]
+        run_static.side_effect = [
+            _passing_static_result(),
+            _passing_static_result(),
+        ]
+
+        result = agent.implement_feature("task", {}, temp_worktree)
+
+    # Fail loudly if a future refactor adds another subprocess.run callsite.
+    assert mock_run.call_count == 3, (
+        f"expected exactly 3 git rev-parse HEAD calls "
+        f"(loop entry + 2 per-attempt), got {mock_run.call_count}"
+    )
+
+    assert run_tests.call_args_list[0].kwargs["pretask_sha"] == "sha-loop-entry"
+    assert run_tests.call_args_list[1].kwargs["pretask_sha"] == "sha-attempt-2"
+    assert result["success"] is True
+    assert result["attempts"] == 2
+
+
+def test_loop_warns_on_mid_loop_sha_drift(
+    mock_config, mock_agent_sdk, mock_prompt, temp_worktree, monkeypatch, caplog
+):
+    """H7: a single WARNING fires on the attempt where HEAD has drifted.
+
+    The warning message must mention the attempt number and both short SHAs.
+    """
+    monkeypatch.setenv("DEV_VERIFIER_LOOP", "1")
+    caplog.set_level(logging.WARNING, logger="src.agents.base_developer")
+    agent = PythonDeveloperAgent()
+
+    async def fake_execute(prompt, session_id=None, system_prompt=None, cwd=None):
+        return {"content": "iter", "tool_uses": []}
+
+    agent.agent_sdk.execute_with_tools = fake_execute
+
+    sha_sequence = ["sha-loop-entry", "sha-loop-entry", "sha-attempt-2"]
+    mocks = [Mock(returncode=0, stdout=s, stderr="") for s in sha_sequence]
+
+    with patch("src.agents.base_developer.subprocess.run") as mock_run, \
+         patch.object(agent, "execute_command") as exec_cmd, \
+         patch.object(agent, "run_tests") as run_tests, \
+         patch.object(agent, "run_static_checks") as run_static:
+        mock_run.side_effect = mocks
+        exec_cmd.return_value = {"success": True, "workflow": []}
+        run_tests.side_effect = [
+            _failing_test_result(),
+            _passing_test_result(),
+        ]
+        run_static.side_effect = [
+            _passing_static_result(),
+            _passing_static_result(),
+        ]
+
+        agent.implement_feature("task", {}, temp_worktree)
+
+    drift_records = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "HEAD moved" in r.getMessage()
+    ]
+    assert len(drift_records) == 1, (
+        f"expected exactly one drift warning; got {len(drift_records)}: "
+        f"{[r.getMessage() for r in drift_records]}"
+    )
+    msg = drift_records[0].getMessage()
+    # Both short SHAs and the attempt number must appear in the message.
+    assert "sha-loop" in msg
+    assert "sha-atte" in msg
+    assert "attempt 2" in msg
 
 
 def test_loop_caps_at_three_when_developer_fails_forever(
