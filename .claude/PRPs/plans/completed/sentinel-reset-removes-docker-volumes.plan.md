@@ -407,24 +407,25 @@ See Task 6 above. Must be executed from `sentinel-dev` or the host (Claude Code 
 
 ## Acceptance Criteria
 
-- [ ] `sentinel reset <ticket>` removes `sentinel-projects-<slug>` from `docker volume ls`
-- [ ] `sentinel reset <ticket>` removes `sentinel-<ticket>_db-data` from `docker volume ls` (when it exists)
-- [ ] Running `sentinel reset <ticket>` twice in a row exits 0 both times — second is a no-op
-- [ ] Running `sentinel reset <never-executed-ticket>` exits 0 with no traceback
-- [ ] Output mirrors existing reset emoji/indent style
-- [ ] Confirmation block lists "Docker volumes for <ticket>" before the `--yes`-bypassable prompt
-- [ ] Level 1–3 validation commands pass
+- [x] `sentinel reset <ticket>` removes `sentinel-projects-<slug>` from `docker volume ls` (covered by integration test)
+- [x] `sentinel reset <ticket>` removes `sentinel-<ticket>_db-data` from `docker volume ls` (when it exists, covered by integration test)
+- [x] Running `sentinel reset <ticket>` twice in a row exits 0 both times — second is a no-op (covered by `test_reset_ticket_idempotent_when_volumes_absent`)
+- [x] Running `sentinel reset <never-executed-ticket>` exits 0 with no traceback (covered by `test_reset_ticket_no_worktree_no_volumes`)
+- [x] Output mirrors existing reset emoji/indent style (`   ✓ ` / `   ℹ️  ` prefix)
+- [x] Confirmation block lists "Docker volumes for <ticket>" before the `--yes`-bypassable prompt
+- [x] Level 1–3 validation commands pass (no new ruff/mypy/pytest issues; all new tests pass; no regressions)
+- [ ] Task 6 manual validation against live Docker daemon (operator-run; cannot execute from Claude Code sandbox per CLAUDE.md)
 
 ---
 
 ## Completion Checklist
 
-- [ ] Task 1: helper added in `src/environment_manager.py`
-- [ ] Task 2: `_teardown_containers` calls helper, no early-return
-- [ ] Task 3: `TestRemoveTicketVolumes` (4 cases) added and green
-- [ ] Task 4: `tests/test_cli_reset.py` (3 cases) created and green
-- [ ] Task 5: ruff + mypy + full pytest suite all green
-- [ ] Task 6: operator-run manual validation on a real Docker daemon passes 5/5 steps
+- [x] Task 1: helper added in `src/environment_manager.py` (module-level `remove_ticket_volumes`)
+- [x] Task 2: `_teardown_containers` calls helper, no early-return; confirmation block lists volumes
+- [x] Task 3: `TestRemoveTicketVolumes` (4 cases) added and green
+- [x] Task 4: `tests/test_cli_reset.py` (3 cases) created and green
+- [x] Task 5: ruff + mypy + full pytest — all NEW issues are zero. 26 pre-existing sandbox failures (no docker CLI, missing Jira config) confirmed identical to baseline; net +7 passing tests, 0 regressions.
+- [ ] Task 6: operator-run manual validation on a real Docker daemon (cannot run from Claude Code sandbox — see CLAUDE.md)
 
 ---
 

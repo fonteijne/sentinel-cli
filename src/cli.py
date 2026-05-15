@@ -1671,12 +1671,18 @@ def _teardown_containers(
 
     Looks for docker-compose.sentinel.yml in the worktree and runs
     docker compose down. Also cleans up orphan containers by project name.
+    Then idempotently removes the per-ticket Docker volumes (the external
+    ``sentinel-projects-<slug>`` volume that compose ignores, plus the
+    compose-managed ``<project>_db-data`` volume) so reset is a real wipe.
     """
     from src.compose_runner import ComposeRunner
-    from src.environment_manager import SENTINEL_COMPOSE_FILE
+    from src.environment_manager import SENTINEL_COMPOSE_FILE, remove_ticket_volumes
 
     worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
     compose_project = f"sentinel-{ticket_id}".lower()
+
+    handled_compose = False
+    docker_available = True
 
     if worktree_path:
         compose_file = worktree_path / SENTINEL_COMPOSE_FILE
@@ -1690,18 +1696,30 @@ def _teardown_containers(
                     click.echo("   ✓ Containers stopped and removed")
                 else:
                     click.echo(f"   ⚠️  Container teardown issue: {result.stderr}")
-                return
+                handled_compose = True
             except RuntimeError:
                 # Docker Compose not available — try orphan cleanup
                 pass
 
-    # Fallback: clean up by project name even without compose file
-    try:
-        runner = ComposeRunner(project_name=compose_project)
-        runner.cleanup_orphans()
-        click.echo("   ✓ No active containers found (or cleaned up orphans)")
-    except RuntimeError:
-        click.echo("   ℹ️  Docker not available — skipping container cleanup")
+    if not handled_compose:
+        # Fallback: clean up by project name even without compose file
+        try:
+            runner = ComposeRunner(project_name=compose_project)
+            runner.cleanup_orphans()
+            click.echo("   ✓ No active containers found (or cleaned up orphans)")
+        except RuntimeError:
+            click.echo("   ℹ️  Docker not available — skipping container cleanup")
+            docker_available = False
+
+    if not docker_available:
+        click.echo("   ℹ️  Docker not available — skipping volume cleanup")
+        return
+
+    removed = remove_ticket_volumes(ticket_id, compose_project)
+    for vol in removed:
+        click.echo(f"   ✓ Removed volume {vol}")
+    if not removed:
+        click.echo("   ℹ️  No volumes to remove")
 
 
 def _reset_ticket(
@@ -1719,6 +1737,7 @@ def _reset_ticket(
     # Confirmation
     click.echo("\nThis will remove:")
     click.echo(f"  • Containers for {ticket_id} (if running)")
+    click.echo(f"  • Docker volumes for {ticket_id} (if present)")
     click.echo(f"  • Worktree for {ticket_id}")
     click.echo(f"  • Local branch {get_branch_name(ticket_id)}")
     click.echo("\n⚠️  Any uncommitted changes will be lost!")
