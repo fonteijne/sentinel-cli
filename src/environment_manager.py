@@ -514,3 +514,63 @@ class EnvironmentManager:
                         f"Post-start command failed in {svc_name}: "
                         f"{cmd}\n{result.stderr}"
                     )
+
+
+def remove_ticket_volumes(ticket_id: str, compose_project: str) -> list[str]:
+    """Idempotently remove the per-ticket Docker volumes for ``ticket_id``.
+
+    Two volumes belong to a ticket:
+
+    * ``sentinel-projects-<slug>`` — the per-ticket *external* project
+      volume seeded from the worktree. Compose's ``down --volumes``
+      ignores this one because it's declared ``external: true`` in the
+      generated compose file (see ``src/lando_translator.py``), so it
+      must be removed explicitly.
+    * ``<compose_project>_db-data`` — the compose-managed DB volume.
+      ``down --volumes`` *would* remove it when the compose file exists,
+      but the reset path can be invoked when the compose file is gone
+      (partially-failed execute, never-executed ticket). Removing it
+      explicitly here covers that gap.
+
+    Both calls are best-effort: a missing volume is the expected
+    idempotent path (logged at DEBUG), an in-use volume or other failure
+    is logged at WARNING and we keep going. Failing reset over a
+    stranded volume isn't worth it — mirror's ``EnvironmentManager._remove_volume``.
+
+    Args:
+        ticket_id: Ticket ID. Slugified to compute the project volume
+            name (``[^a-z0-9_-]`` collapsed to ``-``); same rule as
+            ``EnvironmentManager._volume_name_for``.
+        compose_project: The compose project name. PRECONDITION: must
+            already be lowercased by the caller (the CLI does
+            ``f"sentinel-{ticket_id}".lower()``); we don't re-lower
+            here so there's a single source of truth.
+
+    Returns:
+        List of volume names that were actually removed. May be empty
+        if both volumes were absent.
+    """
+    project_slug = re.sub(r"[^a-z0-9_-]", "-", ticket_id.lower())
+    candidates = [
+        f"sentinel-projects-{project_slug}",
+        f"{compose_project}_db-data",
+    ]
+
+    removed: list[str] = []
+    for name in candidates:
+        result = subprocess.run(
+            ["docker", "volume", "rm", name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            removed.append(name)
+            continue
+
+        stderr = result.stderr.strip()
+        if "No such volume" in stderr or "no such volume" in stderr:
+            logger.debug(f"Volume '{name}' already absent: {stderr}")
+        else:
+            logger.warning(f"Could not remove volume '{name}': {stderr}")
+
+    return removed

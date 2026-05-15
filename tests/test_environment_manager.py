@@ -7,7 +7,12 @@ import pytest
 import yaml
 
 from src.compose_runner import ComposeResult, ServiceStatus
-from src.environment_manager import EnvironmentManager, EnvironmentInfo, SENTINEL_COMPOSE_FILE
+from src.environment_manager import (
+    EnvironmentManager,
+    EnvironmentInfo,
+    SENTINEL_COMPOSE_FILE,
+    remove_ticket_volumes,
+)
 
 
 @pytest.fixture
@@ -312,3 +317,89 @@ class TestGetEnvironmentInfo:
     def test_get_info_not_exists(self, env_mgr):
         info = env_mgr.get_environment_info("NONEXISTENT")
         assert info is None
+
+
+class TestRemoveTicketVolumes:
+    """Test the module-level ``remove_ticket_volumes`` helper."""
+
+    @patch("src.environment_manager.subprocess.run")
+    def test_removes_both_volumes_when_present(self, mock_run):
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+
+        removed = remove_ticket_volumes("STNL-001", "sentinel-stnl-001")
+
+        assert removed == [
+            "sentinel-projects-stnl-001",
+            "sentinel-stnl-001_db-data",
+        ]
+        assert mock_run.call_count == 2
+        assert mock_run.call_args_list[0][0][0] == [
+            "docker", "volume", "rm", "sentinel-projects-stnl-001",
+        ]
+        assert mock_run.call_args_list[1][0][0] == [
+            "docker", "volume", "rm", "sentinel-stnl-001_db-data",
+        ]
+
+    @patch("src.environment_manager.subprocess.run")
+    def test_no_op_when_volumes_absent(self, mock_run, caplog):
+        mock_run.side_effect = [
+            MagicMock(
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Error response from daemon: get sentinel-projects-stnl-001: "
+                    "no such volume"
+                ),
+            ),
+            MagicMock(
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Error response from daemon: get sentinel-stnl-001_db-data: "
+                    "no such volume"
+                ),
+            ),
+        ]
+
+        with caplog.at_level("WARNING", logger="src.environment_manager"):
+            removed = remove_ticket_volumes("STNL-001", "sentinel-stnl-001")
+
+        assert removed == []
+        # No WARNING-level messages — "already absent" goes to DEBUG.
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    @patch("src.environment_manager.subprocess.run")
+    def test_warns_when_volume_in_use(self, mock_run, caplog):
+        mock_run.side_effect = [
+            MagicMock(
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "Error response from daemon: remove sentinel-projects-stnl-001: "
+                    "volume is in use"
+                ),
+            ),
+            MagicMock(returncode=0, stdout="", stderr=""),
+        ]
+
+        with caplog.at_level("WARNING", logger="src.environment_manager"):
+            removed = remove_ticket_volumes("STNL-001", "sentinel-stnl-001")
+
+        assert removed == ["sentinel-stnl-001_db-data"]
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "in use" in warnings[0].getMessage()
+
+    @patch("src.environment_manager.subprocess.run")
+    def test_slugifies_ticket_id(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        removed = remove_ticket_volumes("STNL/001 BAD", "sentinel-stnl-001-bad")
+
+        assert mock_run.call_args_list[0][0][0] == [
+            "docker", "volume", "rm", "sentinel-projects-stnl-001-bad",
+        ]
+        assert "sentinel-projects-stnl-001-bad" in removed

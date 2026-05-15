@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import click
+import questionary
 
 
 from src.config_loader import get_config
@@ -180,15 +181,250 @@ def _get_version() -> str:
     return version("sentinel")
 
 
-@click.group()
+_TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*-\d+$")
+
+_MENU_ACTIONS = ["Debrief", "Plan", "Execute", "Reset"]
+
+
+def _collect_loaded_tickets() -> list[tuple[str, str]]:
+    """Return ``[(project_key, ticket_id), ...]`` for every active worktree.
+
+    Iterates the configured projects from :class:`ConfigLoader` and aggregates
+    each project's worktrees from :class:`WorktreeManager.list_worktrees`. The
+    returned list is sorted alphabetically by ``(project_key, ticket_id)`` so
+    the menu order is stable across invocations.
+    """
+    config = get_config()
+    worktree_mgr = WorktreeManager()
+    tickets: list[tuple[str, str]] = []
+    for project_key in config.get_all_projects().keys():
+        for ticket_id in worktree_mgr.list_worktrees(project_key):
+            tickets.append((project_key, ticket_id))
+    tickets.sort()
+    return tickets
+
+
+def _prompt_ticket(
+    tickets: list[tuple[str, str]],
+) -> tuple[str, str] | str | None:
+    """Prompt for a ticket selection from ``tickets`` plus a ``+ new…`` entry.
+
+    The visible label is the ticket ID verbatim — the worktree dirname is
+    the source of truth, and inventing a ``project_ticket`` form would
+    double-stamp prefixes for projects whose tickets already include the
+    project key (e.g. ``DHLEXS_DHLEXC`` / ``DHLEXS_DHLEXC-384``).
+
+    Returns the selected ``(project_key, ticket_id)`` tuple, the sentinel
+    string ``"__new__"`` when the user picks the new-ticket entry, or
+    ``None`` when the user hits ESC (back/exit at this top step).
+
+    Uses ``unsafe_ask()`` so Ctrl-C propagates as :class:`KeyboardInterrupt`
+    while ESC returns ``None`` — the caller distinguishes the two.
+    """
+    choices: list = [
+        questionary.Choice(title=t, value=(p, t)) for p, t in tickets
+    ]
+    if choices:
+        choices.append(questionary.Separator())
+    choices.append(questionary.Choice(title="+ new…", value="__new__"))
+    return questionary.select("Select a ticket:", choices=choices).unsafe_ask()
+
+
+def _parse_ticket_input(raw: str) -> tuple[str, str] | None:
+    """Parse free-text ticket input into ``(project_key, ticket_id)``.
+
+    Accepts two shapes (case-insensitive, whitespace stripped):
+
+    1. **Menu display form** — ``PROJECT_TICKETPREFIX-NUM`` (e.g.
+       ``DHLEXS_DHLEXC-384``). The prefix before the first ``_`` is matched
+       against the configured projects; if it matches, the rest is used as
+       the ticket ID. This is the form the menu shows for loaded worktrees,
+       so re-typing it round-trips correctly.
+    2. **Bare ticket form** — ``PROJECT-NUM`` (e.g. ``ACME-142``). The
+       project key is derived from the prefix. Suitable when the JIRA
+       project key equals the ticket-ID prefix.
+
+    Returns ``None`` for invalid shapes (caller emits the user-facing error).
+    """
+    text = raw.strip().upper()
+    if not text:
+        return None
+
+    if "_" in text:
+        candidate_project, _, rest = text.partition("_")
+        configured = set(get_config().get_all_projects().keys())
+        if candidate_project in configured and _TICKET_ID_RE.match(rest):
+            return (candidate_project, rest)
+
+    if _TICKET_ID_RE.match(text):
+        return (text.split("-", 1)[0], text)
+
+    return None
+
+
+def _prompt_new_ticket(ctx: click.Context) -> tuple[str, str] | None:
+    """Prompt for a free-text ticket ID and resolve its project.
+
+    See :func:`_parse_ticket_input` for accepted input shapes. If the
+    project key is unknown, invokes :func:`projects_add` to add it, then
+    re-reads the configuration before returning. Returns ``None`` if the
+    user hits ESC, types invalid input, or the project add is aborted.
+    """
+    raw = questionary.text(
+        "Ticket ID (e.g. ACME-142 or DHLEXS_DHLEXC-384):"
+    ).unsafe_ask()
+    if raw is None:
+        return None
+    parsed = _parse_ticket_input(raw)
+    if parsed is None:
+        click.echo("❌ Invalid ticket ID format (expected PROJECT-NUMBER)", err=True)
+        return None
+    project_key, ticket_id = parsed
+    config = get_config()
+    if project_key not in config.get_all_projects():
+        click.echo(f"\nℹ️  Project '{project_key}' is not configured — adding it now.")
+        ctx.invoke(projects_add)
+        # Re-read config in case ConfigLoader cached the old state.
+        config = get_config()
+        if project_key not in config.get_all_projects():
+            click.echo(f"❌ Project '{project_key}' was not added; aborting.", err=True)
+            return None
+    return (project_key, ticket_id)
+
+
+def _prompt_action(label: str) -> str | None:
+    """Prompt for the action menu. Returns one of ``_MENU_ACTIONS`` or ``None``.
+
+    ``None`` signals ESC — the caller treats it as "back to ticket select".
+    """
+    return questionary.select(
+        f"Action for {label}:", choices=list(_MENU_ACTIONS)
+    ).unsafe_ask()
+
+
+def _dispatch(
+    ctx: click.Context, project_key: str, ticket_id: str, action: str
+) -> bool:
+    """Route the selected action to the matching Click subcommand.
+
+    Returns ``True`` when the menu should exit (action ran or user gave a
+    real yes/no answer at the reset confirm), ``False`` when the user hit
+    ESC at the reset confirm and the caller should re-prompt the action.
+    """
+    if action == "Debrief":
+        ctx.invoke(debrief, ticket_id=ticket_id, project=project_key)
+    elif action == "Plan":
+        ctx.invoke(plan, ticket_id=ticket_id, project=project_key)
+    elif action == "Execute":
+        ctx.invoke(execute, ticket_id=ticket_id, project=project_key)
+    elif action == "Reset":
+        confirmed = questionary.confirm(
+            f"Reset {ticket_id}? This removes the worktree and local branch.",
+            default=False,
+        ).unsafe_ask()
+        if confirmed is None:
+            # ESC at the confirm = go back to the action menu.
+            return False
+        if confirmed:
+            ctx.invoke(reset, ticket_id=ticket_id, project=project_key, yes=True)
+    return True
+
+
+def _detect_execute_state(ticket_id: str, project_key: str) -> dict:
+    """Detect whether ``sentinel execute`` should run fresh or revise.
+
+    Mirrors the source-branch + unresolved-discussions check used by
+    :meth:`PlanGeneratorAgent._detect_plan_state` so the two commands stay
+    in sync. Exceptions from the GitLab client are intentionally not
+    swallowed — a silent demote-to-fresh would re-create the same footgun
+    (overwriting in-flight revision work) the menu collapse is meant to fix.
+
+    Returns:
+        ``{"state": "has_feedback", "mr_iid": int, "mr_url": str,
+        "project_path": str}`` when the ticket's source branch has an MR
+        with at least one unresolved discussion; otherwise
+        ``{"state": "fresh"}``.
+    """
+    from src.gitlab_client import GitLabClient  # noqa: PLC0415
+
+    config = get_config()
+    project_config = config.get_project_config(project_key)
+    git_url = project_config.get("git_url", "")
+    if not git_url:
+        return {"state": "fresh"}
+    gitlab = GitLabClient()
+    project_path = GitLabClient.extract_project_path(git_url)
+    source_branch = get_branch_name(ticket_id)
+    mrs = gitlab.list_merge_requests(
+        project_id=project_path,
+        source_branch=source_branch,
+    )
+    if not mrs:
+        return {"state": "fresh"}
+    mr_iid = mrs[0]["iid"]
+    mr_url = mrs[0]["web_url"]
+    discussions = gitlab.get_merge_request_discussions(
+        project_id=project_path,
+        mr_iid=mr_iid,
+        unresolved_only=True,
+    )
+    if not discussions:
+        return {"state": "fresh"}
+    return {
+        "state": "has_feedback",
+        "mr_iid": mr_iid,
+        "mr_url": mr_url,
+        "project_path": project_path,
+    }
+
+
+def _run_menu(ctx: click.Context) -> None:
+    """Two-step interactive menu fired when ``sentinel`` is run with no args.
+
+    Navigation:
+      * **ESC** — go back one step. ESC at the top (ticket select) exits.
+      * **Ctrl-C** — exit immediately, regardless of step.
+    """
+    try:
+        while True:
+            tickets = _collect_loaded_tickets()
+            selection = _prompt_ticket(tickets)
+            if selection is None:
+                return  # ESC at step 1 → exit
+            if selection == "__new__":
+                new_selection = _prompt_new_ticket(ctx)
+                if new_selection is None:
+                    continue  # ESC / invalid input → back to ticket select
+                project_key, ticket_id = new_selection
+            else:
+                project_key, ticket_id = selection  # type: ignore[misc]
+
+            # Action sub-loop so ESC at the reset confirm re-prompts the action.
+            while True:
+                action = _prompt_action(ticket_id)
+                if action is None:
+                    break  # ESC at action select → back to ticket select
+                if _dispatch(ctx, project_key, ticket_id, action):
+                    return  # Action ran (or reset was answered yes/no) — done
+                # else: ESC at reset confirm → re-prompt action menu
+    except KeyboardInterrupt:
+        # Ctrl-C anywhere — exit cleanly. Print a newline so the next shell
+        # prompt doesn't land on the partially-rendered questionary line.
+        click.echo()
+        return
+
+
+@click.group(invoke_without_command=True)
 @click.version_option(version=_get_version())
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """Sentinel - Autonomous agent orchestration for Jira tickets.
 
-    Sentinel automates the development workflow from Jira ticket to merge-ready code
-    using specialized AI agents.
+    Run with no arguments for an interactive menu of loaded tickets.
+    Use 'sentinel COMMAND --help' for non-interactive command details.
     """
-    pass
+    if ctx.invoked_subcommand is None:
+        _run_menu(ctx)
 
 
 @cli.command()
@@ -599,7 +835,8 @@ def _format_drupal_findings_comment(
 @click.option(
     "--revise",
     is_flag=True,
-    help="Revise existing implementation based on MR feedback",
+    hidden=True,
+    help="Deprecated — execute now auto-detects state",
 )
 @click.option(
     "--no-env",
@@ -615,22 +852,33 @@ def _format_drupal_findings_comment(
 def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False, no_env: bool = False, prompt: Optional[str] = None) -> None:
     """Execute implementation plan for a Jira ticket.
 
-    Reads the plan, implements features using TDD, and iterates with security review
-    until code is approved or max iterations reached.
+    Reads the plan, implements features using TDD, and iterates with security
+    review until code is approved or max iterations reached.
 
-    Use --revise to update the implementation based on code review feedback.
+    Auto-detects state: if the ticket's MR has unresolved discussions, runs the
+    revision workflow against that feedback; otherwise runs fresh against the
+    saved plan.
 
     Args:
         ticket_id: Jira ticket ID (e.g., ACME-123)
-        project: Project key (optional)
+        project: Project key (optional, extracted from ticket if not provided)
         max_iterations: Maximum security review iterations
         force: Force-push to remote if branch has diverged
-        revise: Revise existing implementation based on MR feedback
+        revise: Deprecated — flag still forces the revision workflow but is no
+            longer required; auto-detection picks the same path on its own.
+        no_env: Skip container environment setup
+        prompt: Additional instruction to inject into the developer agent session
     """
     try:
         # Extract project key from ticket ID if not provided
         if project is None:
             project = ticket_id.split("-")[0]
+
+        if revise:
+            click.echo(
+                "⚠️  --revise is deprecated. 'sentinel execute' now auto-detects "
+                "fresh vs revise from MR state."
+            )
 
         # Initialize managers
         worktree_mgr = WorktreeManager()
@@ -650,8 +898,13 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             except Exception as e:
                 logger.warning("outcome sync preflight failed: %s", e)
 
-        # Run revision workflow if --revise flag is set
-        if revise:
+        # Auto-detect whether to run the revision workflow. The explicit
+        # --revise flag still forces revision (preserves old script semantics —
+        # `run_revision` itself handles the "0 unresolved discussions" case).
+        exec_state = _detect_execute_state(ticket_id, project)
+        run_revision_path = exec_state["state"] == "has_feedback" or revise
+
+        if run_revision_path:
             click.echo(f"🔄 Revising implementation for: {ticket_id}")
             click.echo(f"🏗️  Project: {project}")
 
@@ -1418,12 +1671,18 @@ def _teardown_containers(
 
     Looks for docker-compose.sentinel.yml in the worktree and runs
     docker compose down. Also cleans up orphan containers by project name.
+    Then idempotently removes the per-ticket Docker volumes (the external
+    ``sentinel-projects-<slug>`` volume that compose ignores, plus the
+    compose-managed ``<project>_db-data`` volume) so reset is a real wipe.
     """
     from src.compose_runner import ComposeRunner
-    from src.environment_manager import SENTINEL_COMPOSE_FILE
+    from src.environment_manager import SENTINEL_COMPOSE_FILE, remove_ticket_volumes
 
     worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
     compose_project = f"sentinel-{ticket_id}".lower()
+
+    handled_compose = False
+    docker_available = True
 
     if worktree_path:
         compose_file = worktree_path / SENTINEL_COMPOSE_FILE
@@ -1437,18 +1696,30 @@ def _teardown_containers(
                     click.echo("   ✓ Containers stopped and removed")
                 else:
                     click.echo(f"   ⚠️  Container teardown issue: {result.stderr}")
-                return
+                handled_compose = True
             except RuntimeError:
                 # Docker Compose not available — try orphan cleanup
                 pass
 
-    # Fallback: clean up by project name even without compose file
-    try:
-        runner = ComposeRunner(project_name=compose_project)
-        runner.cleanup_orphans()
-        click.echo("   ✓ No active containers found (or cleaned up orphans)")
-    except RuntimeError:
-        click.echo("   ℹ️  Docker not available — skipping container cleanup")
+    if not handled_compose:
+        # Fallback: clean up by project name even without compose file
+        try:
+            runner = ComposeRunner(project_name=compose_project)
+            runner.cleanup_orphans()
+            click.echo("   ✓ No active containers found (or cleaned up orphans)")
+        except RuntimeError:
+            click.echo("   ℹ️  Docker not available — skipping container cleanup")
+            docker_available = False
+
+    if not docker_available:
+        click.echo("   ℹ️  Docker not available — skipping volume cleanup")
+        return
+
+    removed = remove_ticket_volumes(ticket_id, compose_project)
+    for vol in removed:
+        click.echo(f"   ✓ Removed volume {vol}")
+    if not removed:
+        click.echo("   ℹ️  No volumes to remove")
 
 
 def _reset_ticket(
@@ -1466,6 +1737,7 @@ def _reset_ticket(
     # Confirmation
     click.echo("\nThis will remove:")
     click.echo(f"  • Containers for {ticket_id} (if running)")
+    click.echo(f"  • Docker volumes for {ticket_id} (if present)")
     click.echo(f"  • Worktree for {ticket_id}")
     click.echo(f"  • Local branch {get_branch_name(ticket_id)}")
     click.echo("\n⚠️  Any uncommitted changes will be lost!")
