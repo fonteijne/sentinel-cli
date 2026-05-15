@@ -183,7 +183,7 @@ def _get_version() -> str:
 
 _TICKET_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]*-\d+$")
 
-_MENU_ACTIONS = ["Debrief", "Plan", "Execute", "Execute --revise", "Reset"]
+_MENU_ACTIONS = ["Debrief", "Plan", "Execute", "Reset"]
 
 
 def _collect_loaded_tickets() -> list[tuple[str, str]]:
@@ -317,8 +317,6 @@ def _dispatch(
         ctx.invoke(plan, ticket_id=ticket_id, project=project_key)
     elif action == "Execute":
         ctx.invoke(execute, ticket_id=ticket_id, project=project_key)
-    elif action == "Execute --revise":
-        ctx.invoke(execute, ticket_id=ticket_id, project=project_key, revise=True)
     elif action == "Reset":
         confirmed = questionary.confirm(
             f"Reset {ticket_id}? This removes the worktree and local branch.",
@@ -330,6 +328,54 @@ def _dispatch(
         if confirmed:
             ctx.invoke(reset, ticket_id=ticket_id, project=project_key, yes=True)
     return True
+
+
+def _detect_execute_state(ticket_id: str, project_key: str) -> dict:
+    """Detect whether ``sentinel execute`` should run fresh or revise.
+
+    Mirrors the source-branch + unresolved-discussions check used by
+    :meth:`PlanGeneratorAgent._detect_plan_state` so the two commands stay
+    in sync. Exceptions from the GitLab client are intentionally not
+    swallowed — a silent demote-to-fresh would re-create the same footgun
+    (overwriting in-flight revision work) the menu collapse is meant to fix.
+
+    Returns:
+        ``{"state": "has_feedback", "mr_iid": int, "mr_url": str,
+        "project_path": str}`` when the ticket's source branch has an MR
+        with at least one unresolved discussion; otherwise
+        ``{"state": "fresh"}``.
+    """
+    from src.gitlab_client import GitLabClient  # noqa: PLC0415
+
+    config = get_config()
+    project_config = config.get_project_config(project_key)
+    git_url = project_config.get("git_url", "")
+    if not git_url:
+        return {"state": "fresh"}
+    gitlab = GitLabClient()
+    project_path = GitLabClient.extract_project_path(git_url)
+    source_branch = get_branch_name(ticket_id)
+    mrs = gitlab.list_merge_requests(
+        project_id=project_path,
+        source_branch=source_branch,
+    )
+    if not mrs:
+        return {"state": "fresh"}
+    mr_iid = mrs[0]["iid"]
+    mr_url = mrs[0]["web_url"]
+    discussions = gitlab.get_merge_request_discussions(
+        project_id=project_path,
+        mr_iid=mr_iid,
+        unresolved_only=True,
+    )
+    if not discussions:
+        return {"state": "fresh"}
+    return {
+        "state": "has_feedback",
+        "mr_iid": mr_iid,
+        "mr_url": mr_url,
+        "project_path": project_path,
+    }
 
 
 def _run_menu(ctx: click.Context) -> None:
@@ -789,7 +835,8 @@ def _format_drupal_findings_comment(
 @click.option(
     "--revise",
     is_flag=True,
-    help="Revise existing implementation based on MR feedback",
+    hidden=True,
+    help="Deprecated — execute now auto-detects state",
 )
 @click.option(
     "--no-env",
@@ -805,22 +852,33 @@ def _format_drupal_findings_comment(
 def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False, no_env: bool = False, prompt: Optional[str] = None) -> None:
     """Execute implementation plan for a Jira ticket.
 
-    Reads the plan, implements features using TDD, and iterates with security review
-    until code is approved or max iterations reached.
+    Reads the plan, implements features using TDD, and iterates with security
+    review until code is approved or max iterations reached.
 
-    Use --revise to update the implementation based on code review feedback.
+    Auto-detects state: if the ticket's MR has unresolved discussions, runs the
+    revision workflow against that feedback; otherwise runs fresh against the
+    saved plan.
 
     Args:
         ticket_id: Jira ticket ID (e.g., ACME-123)
-        project: Project key (optional)
+        project: Project key (optional, extracted from ticket if not provided)
         max_iterations: Maximum security review iterations
         force: Force-push to remote if branch has diverged
-        revise: Revise existing implementation based on MR feedback
+        revise: Deprecated — flag still forces the revision workflow but is no
+            longer required; auto-detection picks the same path on its own.
+        no_env: Skip container environment setup
+        prompt: Additional instruction to inject into the developer agent session
     """
     try:
         # Extract project key from ticket ID if not provided
         if project is None:
             project = ticket_id.split("-")[0]
+
+        if revise:
+            click.echo(
+                "⚠️  --revise is deprecated. 'sentinel execute' now auto-detects "
+                "fresh vs revise from MR state."
+            )
 
         # Initialize managers
         worktree_mgr = WorktreeManager()
@@ -840,8 +898,13 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
             except Exception as e:
                 logger.warning("outcome sync preflight failed: %s", e)
 
-        # Run revision workflow if --revise flag is set
-        if revise:
+        # Auto-detect whether to run the revision workflow. The explicit
+        # --revise flag still forces revision (preserves old script semantics —
+        # `run_revision` itself handles the "0 unresolved discussions" case).
+        exec_state = _detect_execute_state(ticket_id, project)
+        run_revision_path = exec_state["state"] == "has_feedback" or revise
+
+        if run_revision_path:
             click.echo(f"🔄 Revising implementation for: {ticket_id}")
             click.echo(f"🏗️  Project: {project}")
 

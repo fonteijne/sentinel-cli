@@ -291,11 +291,6 @@ def test_prompt_new_ticket_unknown_project_user_aborts_add(
             "execute",
             {"ticket_id": "ACME-1", "project": "ACME"},
         ),
-        (
-            "Execute --revise",
-            "execute",
-            {"ticket_id": "ACME-1", "project": "ACME", "revise": True},
-        ),
     ],
 )
 def test_dispatch_routes_to_correct_command(
@@ -379,27 +374,17 @@ def test_bare_invocation_dispatches_plan(
     assert captured.get("project") == "ACME"
 
 
-def test_bare_invocation_execute_revise(
-    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, patch_questionary
-) -> None:
-    monkeypatch.setattr("src.cli.get_config", lambda: _stub_config({"ACME": {}}))
-    monkeypatch.setattr(
-        "src.cli.WorktreeManager",
-        lambda: _stub_worktree_mgr({"ACME": ["ACME-1"]}),
-    )
-    patch_questionary(select=[("ACME", "ACME-1"), "Execute --revise"])
+def test_menu_actions_does_not_include_execute_revise() -> None:
+    """The menu must collapse Execute and Execute --revise into a single entry.
 
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        "src.cli.execute.callback", lambda **kw: captured.update(kw)
-    )
+    Regression test for the CLI consolidation: state is auto-detected at
+    runtime, so users cannot pick the wrong variant from the menu.
+    """
+    from src.cli import _MENU_ACTIONS
 
-    result = runner.invoke(cli, [])
-
-    assert result.exit_code == 0, result.output
-    assert captured.get("ticket_id") == "ACME-1"
-    assert captured.get("project") == "ACME"
-    assert captured.get("revise") is True
+    assert "Execute --revise" not in _MENU_ACTIONS
+    assert "Execute" in _MENU_ACTIONS
+    assert _MENU_ACTIONS == ["Debrief", "Plan", "Execute", "Reset"]
 
 
 def test_bare_invocation_reset_decline(
@@ -620,12 +605,12 @@ def test_prompt_new_ticket_round_trips_menu_display_form(
 def test_dispatch_returns_true_for_normal_actions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Plan/Debrief/Execute/--revise all return True (= exit menu)."""
+    """Plan/Debrief/Execute all return True (= exit menu)."""
     for name in ("plan", "debrief", "execute"):
         monkeypatch.setattr(f"src.cli.{name}.callback", lambda **kw: None)
 
     ctx = _make_ctx()
-    for action in ("Debrief", "Plan", "Execute", "Execute --revise"):
+    for action in ("Debrief", "Plan", "Execute"):
         assert _dispatch(ctx, "ACME", "ACME-1", action) is True, action
 
 
