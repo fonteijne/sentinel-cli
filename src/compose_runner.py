@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from src.utils.perf import timed
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,14 +134,15 @@ class ComposeRunner:
         Returns:
             ComposeResult
         """
-        args = ["up"]
-        if detach:
-            args.append("-d")
-        if build:
-            args.append("--build")
-        args.append("--remove-orphans")
+        with timed("compose.up", meta={"build": build, "detach": detach}):
+            args = ["up"]
+            if detach:
+                args.append("-d")
+            if build:
+                args.append("--build")
+            args.append("--remove-orphans")
 
-        return self._run(*args, timeout=timeout)
+            return self._run(*args, timeout=timeout)
 
     def down(self, volumes: bool = True, remove_orphans: bool = True, timeout: int = 120) -> ComposeResult:
         """Stop and remove services.
@@ -152,13 +155,14 @@ class ComposeRunner:
         Returns:
             ComposeResult
         """
-        args = ["down"]
-        if volumes:
-            args.append("-v")
-        if remove_orphans:
-            args.append("--remove-orphans")
+        with timed("compose.down", meta={"volumes": volumes}):
+            args = ["down"]
+            if volumes:
+                args.append("-v")
+            if remove_orphans:
+                args.append("--remove-orphans")
 
-        return self._run(*args, timeout=timeout)
+            return self._run(*args, timeout=timeout)
 
     def exec(
         self,
@@ -180,19 +184,21 @@ class ComposeRunner:
         Returns:
             ComposeResult with command output
         """
-        args = ["exec", "-T"]  # -T disables pseudo-TTY
-        if user:
-            args.extend(["-u", user])
-        if workdir:
-            args.extend(["-w", workdir])
-        args.append(service)
+        cmd_kind = command if isinstance(command, str) else " ".join(command)
+        with timed("compose.exec", meta={"service": service, "cmd_preview": cmd_kind[:80]}):
+            args = ["exec", "-T"]  # -T disables pseudo-TTY
+            if user:
+                args.extend(["-u", user])
+            if workdir:
+                args.extend(["-w", workdir])
+            args.append(service)
 
-        if isinstance(command, str):
-            args.extend(["sh", "-c", command])
-        else:
-            args.extend(command)
+            if isinstance(command, str):
+                args.extend(["sh", "-c", command])
+            else:
+                args.extend(command)
 
-        return self._run(*args, timeout=timeout)
+            return self._run(*args, timeout=timeout)
 
     def ps(self) -> list[ServiceStatus]:
         """Get status of all services.

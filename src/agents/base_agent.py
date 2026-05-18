@@ -10,6 +10,7 @@ from src.config_loader import get_config
 from src.prompt_loader import load_agent_prompt
 from src.command_executor import execute_command
 from src.agent_sdk_wrapper import AgentSDKWrapper
+from src.utils.perf import timed
 
 
 logger = logging.getLogger(__name__)
@@ -82,35 +83,36 @@ class BaseAgent(ABC):
         Args:
             project: Project key (e.g., "ACME").
         """
-        self._project = project
-        self.agent_sdk.set_project(project)
+        with timed("base_agent.set_project", meta={"agent": self.agent_name, "project": project}):
+            self._project = project
+            self.agent_sdk.set_project(project)
 
-        try:
-            project_config = self.config.get_project_config(project)
-            stack_type = project_config.get("stack_type") or None
-            if not stack_type:
-                return  # No stack context → keep the static prompt loaded at __init__.
-
-            from src.core.persistence import apply_migrations, connect
-
-            conn = connect()
             try:
-                apply_migrations(conn)
-                self.system_prompt = load_agent_prompt(
-                    self.agent_name, stack_type=stack_type, conn=conn
+                project_config = self.config.get_project_config(project)
+                stack_type = project_config.get("stack_type") or None
+                if not stack_type:
+                    return  # No stack context → keep the static prompt loaded at __init__.
+
+                from src.core.persistence import apply_migrations, connect
+
+                conn = connect()
+                try:
+                    apply_migrations(conn)
+                    self.system_prompt = load_agent_prompt(
+                        self.agent_name, stack_type=stack_type, conn=conn
+                    )
+                    logger.info(
+                        "Re-loaded system prompt for %s with stack=%s (%d chars)",
+                        self.agent_name, stack_type, len(self.system_prompt),
+                    )
+                finally:
+                    conn.close()
+            except Exception:
+                # Non-fatal: keep the static prompt loaded at __init__ if anything fails.
+                logger.warning(
+                    "stack-aware prompt re-load failed for %s/%s; keeping static prompt",
+                    self.agent_name, project, exc_info=True,
                 )
-                logger.info(
-                    "Re-loaded system prompt for %s with stack=%s (%d chars)",
-                    self.agent_name, stack_type, len(self.system_prompt),
-                )
-            finally:
-                conn.close()
-        except Exception:
-            # Non-fatal: keep the static prompt loaded at __init__ if anything fails.
-            logger.warning(
-                "stack-aware prompt re-load failed for %s/%s; keeping static prompt",
-                self.agent_name, project, exc_info=True,
-            )
 
     def _add_system_message(self) -> None:
         """Add system prompt to message history if not already present."""

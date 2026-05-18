@@ -210,3 +210,19 @@ From §9 of the design, the ones the Phase 1 session must actively guard against
 - An issue tracker list. Beads (`bd`) is disabled in worktrees per the `project_beads_dolt_issue.md` memory.
 - A merged PR. Branch is on origin; merging to main is deferred until at least Phase 1 agents are created.
 - Commit/push of this handover doc itself — the user requested creation; commit is theirs to make.
+
+
+---
+
+## Performance Iteration (added 2026-05-18)
+
+A profile-first perf iteration on `sentinel execute` landed alongside the learning subsystem. Stage-0 autopsy (15 sessions across 3 DHLEXC tickets) confirmed the `sentinel execute` slowness is concentrated **inside developer agent invocations** (95–99% of agent wallclock, 50–75 tool roundtrips per call), **not** in orchestration or learning-system hooks.
+
+- Living report: `.claude/PRPs/reports/execute-cycle-perf-baseline.md`
+- Frozen Stage-0 dataset: `.claude/PRPs/reports/perf-data/autopsy-stage0.json`
+- Source plan: `.claude/PRPs/plans/completed/execute-cycle-perf-iteration.plan.md`
+
+Stage A (instrumentation) shipped — opt-in via `SENTINEL_PERF=1`; default behavior unchanged. Extends `agent_sdk_wrapper.py` with per-API-request `cache_read_input_tokens` / `cache_creation_input_tokens` / `time_to_first_chunk_s`, adds a new `tool_complete` event with actual per-tool wallclock, and plants `with timed():` seeds in `cli.py:execute`, `base_agent.set_project`, `base_developer.{verifier_iteration,run_tests}`, `plan_generator.{generate,revise}`, `drupal_reviewer.assemble_prompt` (with per-section byte counters), `compose_runner.{up,down,exec}`, and `environment_manager.{setup,seed_volume,post_start_commands}`.
+
+Stage B (fresh baseline) and Stage C (follow-on fix plans) are operator-gated: a real `SENTINEL_PERF=1 sentinel execute <ticket>` run from `sentinel-dev` is required before any optimization plans can be filed. Instructions are in the baseline report.
+

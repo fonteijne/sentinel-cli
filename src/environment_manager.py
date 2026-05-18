@@ -20,6 +20,7 @@ import yaml
 from src.compose_runner import ComposeRunner, ComposeResult
 from src.config_loader import get_config
 from src.lando_translator import LandoTranslator
+from src.utils.perf import timed
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,10 @@ class EnvironmentManager:
         Raises:
             RuntimeError: If environment setup fails
         """
+        with timed("env.setup", meta={"ticket": ticket_id}):
+            return self._setup_inner(worktree_path, ticket_id)
+
+    def _setup_inner(self, worktree_path: Path, ticket_id: str) -> EnvironmentInfo:
         env_config = self.get_environment_config()
 
         if not env_config.get("auto_detect", True):
@@ -290,6 +295,10 @@ class EnvironmentManager:
                 )
 
     def _seed_volume(self, worktree_path: Path, volume_name: str) -> None:
+        with timed("env.seed_volume", meta={"volume": volume_name}):
+            return self._seed_volume_inner(worktree_path, volume_name)
+
+    def _seed_volume_inner(self, worktree_path: Path, volume_name: str) -> None:
         """Wipe and re-seed the per-ticket project volume from the worktree.
 
         Worktrees live in sentinel-dev's container filesystem and are not
@@ -494,26 +503,42 @@ class EnvironmentManager:
             runner: ComposeRunner instance
             compose_dict: Parsed compose configuration
         """
-        for svc_name, svc_config in compose_dict.get("services", {}).items():
-            labels = svc_config.get("labels", {})
-            commands_str = labels.get("sentinel.post_start_commands", "")
+        with timed("env.post_start_commands"):
+            for svc_name, svc_config in compose_dict.get("services", {}).items():
+                labels = svc_config.get("labels", {})
+                commands_str = labels.get("sentinel.post_start_commands", "")
 
-            if not commands_str:
-                continue
-
-            commands = commands_str.split(";")
-            for cmd in commands:
-                cmd = cmd.strip()
-                if not cmd:
+                if not commands_str:
                     continue
 
-                logger.info(f"Running post-start command in {svc_name}: {cmd}")
-                result = runner.exec(svc_name, cmd, user="root")
-                if not result.success:
-                    logger.warning(
-                        f"Post-start command failed in {svc_name}: "
-                        f"{cmd}\n{result.stderr}"
-                    )
+                commands = commands_str.split(";")
+                for cmd in commands:
+                    cmd = cmd.strip()
+                    if not cmd:
+                        continue
+
+                    # Tag the kind so the autopsy can group composer / drush /
+                    # other build commands separately even when invoked here.
+                    cmd_lower = cmd.lower()
+                    if "composer" in cmd_lower:
+                        kind = "composer"
+                    elif "drush" in cmd_lower:
+                        kind = "drush"
+                    elif "git " in cmd_lower or cmd_lower.startswith("git"):
+                        kind = "git"
+                    else:
+                        kind = "other"
+                    with timed(
+                        f"env.post_start.{kind}",
+                        meta={"service": svc_name, "cmd_preview": cmd[:80]},
+                    ):
+                        logger.info(f"Running post-start command in {svc_name}: {cmd}")
+                        result = runner.exec(svc_name, cmd, user="root")
+                        if not result.success:
+                            logger.warning(
+                                f"Post-start command failed in {svc_name}: "
+                                f"{cmd}\n{result.stderr}"
+                            )
 
 
 def remove_ticket_volumes(ticket_id: str, compose_project: str) -> list[str]:

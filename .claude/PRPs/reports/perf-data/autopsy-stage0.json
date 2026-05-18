@@ -1,0 +1,112 @@
+{
+  "methodology": {
+    "data_source": "logs/agent_diagnostics.jsonl",
+    "date_window": "2026-04-20 .. 2026-05-15",
+    "session_segmentation": "gap > 30min between adjacent events => new session",
+    "frozen_at": "2026-05-18",
+    "n_sessions": 15,
+    "n_tickets": 3,
+    "tickets": ["DHLEXC-311", "DHLEXC-356", "DHLEXC-384"]
+  },
+  "representative_sessions": [
+    {
+      "ticket_session": "DHLEXC-384-S0",
+      "wall_min": 82,
+      "agent_min": 73,
+      "gap_min": 9,
+      "dev_calls": 11,
+      "avg_dev_call_min": 6.1,
+      "tools_per_dev_call": 45
+    },
+    {
+      "ticket_session": "DHLEXC-384-S1",
+      "wall_min": 60,
+      "agent_min": 58,
+      "gap_min": 2,
+      "dev_calls": 11,
+      "avg_dev_call_min": 5.3,
+      "tools_per_dev_call": 44
+    },
+    {
+      "ticket_session": "DHLEXC-384-S3",
+      "wall_min": 128,
+      "agent_min": 99,
+      "gap_min": 29,
+      "dev_calls": 18,
+      "avg_dev_call_min": 5.5,
+      "tools_per_dev_call": 51
+    },
+    {
+      "ticket_session": "DHLEXC-311-S3",
+      "wall_min": 41,
+      "agent_min": 41,
+      "gap_min": 0,
+      "dev_calls": 5,
+      "avg_dev_call_min": 8.2,
+      "tools_per_dev_call": 74
+    }
+  ],
+  "global_tool_distribution": {
+    "total_tool_use_records": 8728,
+    "drupal_developer_records": 8019,
+    "by_tool": {
+      "Bash": 5263,
+      "Read": 1294,
+      "TodoWrite": 676,
+      "Write": 648,
+      "Edit": 417
+    }
+  },
+  "per_agent_observations": {
+    "drupal_developer": {
+      "share_of_agent_wallclock_pct_min": 95,
+      "share_of_agent_wallclock_pct_max": 99,
+      "tool_roundtrips_per_call_min": 50,
+      "tool_roundtrips_per_call_max": 75,
+      "bash_share_of_tools_pct": 66
+    },
+    "drupal_reviewer": {
+      "prompt_chars_min": 600000,
+      "prompt_chars_max": 820000,
+      "developer_prompt_chars_compare": 27000,
+      "prefill_overhead_ratio_vs_developer": 30,
+      "response_wallclock_seconds_observed": [3, 5]
+    },
+    "plan_generator": {
+      "invocations_per_ticket_min": 1,
+      "invocations_per_ticket_max": 7,
+      "wallclock_per_call_seconds_min": 218,
+      "wallclock_per_call_seconds_max": 299,
+      "example_dhlexc_311_invocations": 7,
+      "example_dhlexc_311_total_min": 28
+    }
+  },
+  "blind_spots": [
+    {
+      "name": "per_tool_actual_wallclock",
+      "evidence": "tool_use.elapsed_s is timeline offset from exec_start, not duration; total tool elapsed exceeds total agent wallclock by 24x.",
+      "fix": "New tool_complete event with explicit start_ts / end_ts."
+    },
+    {
+      "name": "prompt_cache_hit_miss",
+      "evidence": "cli_stderr.log (84MB Anthropic SDK debug) contains no cache_creation_input_tokens / cache_read_input_tokens fields.",
+      "fix": "Capture usage object on each API response in agent_sdk_wrapper.py."
+    },
+    {
+      "name": "container_test_ops_wallclock",
+      "evidence": "compose_runner / environment_manager / command_executor have no perf timing instrumentation.",
+      "fix": "Plant `with timed(\"compose.up\"):` etc. at top-level methods."
+    },
+    {
+      "name": "per_api_prefill_vs_stream",
+      "evidence": "No time-to-first-chunk recorded; stream loop only logs total elapsed.",
+      "fix": "Capture first-chunk timestamp inside receive_response loop."
+    }
+  ],
+  "confirmed_by_data": [
+    "Orchestration is NOT the bottleneck (median gap 0-9 min vs. 50-100 min in agents).",
+    "drupal_developer dominates agent wallclock (95-99%).",
+    "Each developer call makes 50-75 tool round-trips (66% Bash).",
+    "Reviewer prompts are 600-820k chars (~30x dev prefill cost per call)."
+  ]
+}

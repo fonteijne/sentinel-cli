@@ -66,3 +66,6 @@ workspaces/
 .dolt/
 *.db
 .beads-credential-key
+
+# Claude Code session-local worktrees (created by EnterWorktree)
+.claude/worktrees/

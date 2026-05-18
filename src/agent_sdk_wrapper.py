@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Dict
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
-from claude_agent_sdk.types import AssistantMessage, SystemPromptPreset, TextBlock, ToolUseBlock
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    SystemPromptPreset,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    UserMessage,
+)
 
 from src.config_loader import ConfigLoader
 from src.guardrails import GuardrailEngine
@@ -354,6 +361,12 @@ class AgentSDKWrapper:
         responses: list[str] = []
         tool_uses: list[Dict[str, Any]] = []
         final_session_id: str | None = None
+        # Per-tool wallclock tracking (Task 3c): map ToolUseBlock.id -> (start_ts_monotonic, start_iso, name, index)
+        tool_start_ix: Dict[str, Dict[str, Any]] = {}
+        # Final cumulative usage object captured from the last AssistantMessage / ResultMessage
+        final_usage: Dict[str, Any] | None = None
+        # Time-to-first-chunk (Task 3b): captured on the first text/tool-use block seen
+        first_chunk_t: float | None = None
 
         sdk_start = time.monotonic()
         logger.info(f"[{self.agent_name}] Opening ClaudeSDKClient (model={self.model})...")
@@ -396,8 +409,15 @@ class AgentSDKWrapper:
                         last_heartbeat = now
 
                     if isinstance(message, AssistantMessage):
+                        # Capture cumulative usage on every AssistantMessage; the
+                        # final value seen will be the most recent (and the
+                        # ResultMessage usage below will overwrite it if present).
+                        if getattr(message, "usage", None):
+                            final_usage = dict(message.usage) if isinstance(message.usage, dict) else None
                         for block in message.content:
                             if isinstance(block, TextBlock):
+                                if first_chunk_t is None:
+                                    first_chunk_t = now
                                 responses.append(block.text)
                                 text_chars += len(block.text)
                                 elapsed_in_stream = now - stream_start
@@ -406,33 +426,109 @@ class AgentSDKWrapper:
                                     f"{elapsed_in_stream:.1f}s into stream)"
                                 )
                             elif isinstance(block, ToolUseBlock):
+                                if first_chunk_t is None:
+                                    first_chunk_t = now
                                 elapsed_in_stream = now - stream_start
                                 tool_uses.append({
                                     "tool": block.name,
                                     "input": block.input
                                 })
+                                tool_index = len(tool_uses)
+                                # Task 3c: record start time keyed by tool_use_id so the
+                                # later ToolResultBlock can compute wallclock and emit
+                                # a tool_complete event.
+                                tool_start_ix[block.id] = {
+                                    "start_mono": now,
+                                    "start_iso": datetime.now(timezone.utc).isoformat(),
+                                    "name": block.name,
+                                    "index": tool_index,
+                                }
                                 input_preview = str(block.input.get("command", block.input))[:200] if isinstance(block.input, dict) else str(block.input)[:200]
                                 logger.info(f"[{self.agent_name}] Tool use: {block.name} ({elapsed_in_stream:.1f}s into stream) - {input_preview}")
                                 self._write_diagnostic("tool_use", {
                                     "tool": block.name,
                                     "input": block.input if isinstance(block.input, dict) else str(block.input),
-                                    "tool_index": len(tool_uses),
+                                    "tool_index": tool_index,
                                     "elapsed_s": round(elapsed_in_stream, 1),
                                 }, cwd=cwd)
+                    elif isinstance(message, UserMessage):
+                        # Task 3c: tool results arrive on subsequent UserMessage events.
+                        # Match each ToolResultBlock to its prior ToolUseBlock by id and
+                        # emit a tool_complete event with actual wallclock + output size.
+                        if isinstance(message.content, list):
+                            for block in message.content:
+                                if isinstance(block, ToolResultBlock):
+                                    started = tool_start_ix.pop(block.tool_use_id, None)
+                                    if started is None:
+                                        continue
+                                    end_mono = time.monotonic()
+                                    end_iso = datetime.now(timezone.utc).isoformat()
+                                    if isinstance(block.content, str):
+                                        output_size = len(block.content)
+                                    elif isinstance(block.content, list):
+                                        output_size = sum(
+                                            len(c.get("text", ""))
+                                            if isinstance(c, dict)
+                                            else len(str(c))
+                                            for c in block.content
+                                        )
+                                    else:
+                                        output_size = 0
+                                    self._write_diagnostic("tool_complete", {
+                                        "tool": started["name"],
+                                        "tool_index": started["index"],
+                                        "tool_use_id": block.tool_use_id,
+                                        "start_ts": started["start_iso"],
+                                        "end_ts": end_iso,
+                                        "actual_elapsed_s": round(end_mono - started["start_mono"], 3),
+                                        "output_size_chars": output_size,
+                                        "is_error": bool(block.is_error) if block.is_error is not None else False,
+                                    }, cwd=cwd)
                     # Extract session ID from ResultMessage
                     if hasattr(message, 'session_id'):
                         final_session_id = message.session_id
+                    # Final cumulative usage on ResultMessage (preferred over per-Assistant)
+                    if getattr(message, "usage", None) and not isinstance(message, AssistantMessage):
+                        usage_obj = getattr(message, "usage", None)
+                        if isinstance(usage_obj, dict):
+                            final_usage = dict(usage_obj)
         finally:
             self._stream_active = False
 
         total_elapsed = time.monotonic() - sdk_start
         logger.info(f"[{self.agent_name}] Stream complete: {msg_count} messages, {len(tool_uses)} tool uses, {total_elapsed:.1f}s total")
+
+        # Task 3a + 3b: derive per-call usage + first-chunk metrics.
+        usage = final_usage or {}
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_creation_raw = usage.get("cache_creation_input_tokens")
+        if isinstance(cache_creation_raw, dict):
+            cache_creation = int(sum(v for v in cache_creation_raw.values() if isinstance(v, (int, float))))
+        else:
+            cache_creation = int(cache_creation_raw or 0)
+        if first_chunk_t is not None:
+            ttfc = round(first_chunk_t - query_start, 3)
+            stream_duration = round(time.monotonic() - first_chunk_t, 3)
+        else:
+            ttfc = None
+            stream_duration = None
+
         self._write_diagnostic("exec_complete", {
             "msg_count": msg_count,
             "tool_count": len(tool_uses),
             "total_elapsed_s": round(total_elapsed, 1),
             "response_len": len("\n".join(responses)),
             "session_id": final_session_id,
+            # Task 3a — token usage; defaults to 0 when SDK/version omits the field.
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+            # Task 3b — prefill vs. stream split.
+            "time_to_first_chunk_s": ttfc,
+            "stream_duration_s": stream_duration,
         }, cwd=cwd)
 
         # Track the session ID if we got one (with project association)

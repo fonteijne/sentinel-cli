@@ -33,6 +33,7 @@ from src.agents.base_developer import (
     RegressionContext,
 )
 from src.core.events import EventBus, ReviewerHandoffTriggered
+from src.utils.perf import timed
 from src.core.execution.post_execute import (
     TicketContext as LearningTicketContext,
     register_post_execute_subscribers,
@@ -869,6 +870,11 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         no_env: Skip container environment setup
         prompt: Additional instruction to inject into the developer agent session
     """
+    with timed("execute.full", meta={"ticket": ticket_id, "project": project}):
+        _execute_impl(ticket_id, project, max_iterations, force, revise, no_env, prompt)
+
+
+def _execute_impl(ticket_id: str, project: Optional[str] = None, max_iterations: int = 5, force: bool = False, revise: bool = False, no_env: bool = False, prompt: Optional[str] = None) -> None:
     try:
         # Extract project key from ticket ID if not provided
         if project is None:

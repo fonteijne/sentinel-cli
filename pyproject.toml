@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "sentinel"
-version = "0.2.0"
+version = "0.3.0"
 description = "Autonomous agent orchestration system for Jira ticket implementation"
 authors = ["Sentinel Team"]
 readme = "README.md"
@@ -26,6 +26,8 @@ pytest-asyncio = "^0.23.2"
 types-pyyaml = "^6.0.12.20250915"
 types-requests = "^2.32.4.20260107"
 pytest-cov = "^7.0.0"
+pytest-benchmark = "^4.0"
+py-spy = "^0.3"
 
 [tool.poetry.scripts]
 sentinel = "src.cli:cli"
@@ -49,3 +51,6 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+markers = [
+    "perf_baseline: opt-in baseline run (slow; not part of default CI suite)",
+]

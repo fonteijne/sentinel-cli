@@ -21,6 +21,7 @@ from src.stack_profiler import generate_profile_markdown
 from src.worktree_manager import get_branch_name
 from src.ticket_context import TicketContextBuilder
 from src.utils.adf_parser import parse_adf_to_text
+from src.utils.perf import timed
 
 
 logger = logging.getLogger(__name__)
@@ -421,6 +422,20 @@ Return ONLY the JSON object. No markdown code blocks, no explanatory text, just 
         Returns:
             Plan content as markdown string
         """
+        with timed("plan_generator.generate", meta={"ticket_id": ticket_id}):
+            return self._generate_plan_inner(
+                ticket_id, context, output_path, worktree_path, investigation_findings, user_prompt,
+            )
+
+    def _generate_plan_inner(
+        self,
+        ticket_id: str,
+        context: Dict[str, Any],
+        output_path: Path,
+        worktree_path: Path | None = None,
+        investigation_findings: str | None = None,
+        user_prompt: str | None = None,
+    ) -> str:
         logger.info(f"Generating plan for {ticket_id}")
 
         # Reset session to avoid context contamination from previous conversations
@@ -645,6 +660,19 @@ This is iteration {iteration + 2} of {max_iterations}.
                 - feedback_responses: Responses to each feedback item
                 - revision_type: "incremental" or "full_rewrite"
         """
+        with timed("plan_generator.revise", meta={"ticket_id": ticket_id, "feedback_count": len(feedback)}):
+            return self._revise_plan_inner(ticket_id, current_plan, feedback, output_path, user_prompt, cwd, ticket_context)
+
+    def _revise_plan_inner(
+        self,
+        ticket_id: str,
+        current_plan: str,
+        feedback: list[Dict[str, Any]],
+        output_path: Path,
+        user_prompt: str | None = None,
+        cwd: str | None = None,
+        ticket_context: str | None = None,
+    ) -> Dict[str, Any]:
         logger.info(f"Revising plan for {ticket_id} based on {len(feedback)} feedback items")
 
         # Format feedback for LLM

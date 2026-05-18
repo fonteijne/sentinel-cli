@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.agents.base_agent import ReviewAgent
+from src.utils.perf import timed
 
 
 logger = logging.getLogger(__name__)
@@ -228,23 +229,36 @@ class DrupalReviewerAgent(ReviewAgent):
         Returns:
             Complete review prompt string
         """
-        prompt = "Review this Drupal merge request.\n\n"
+        with timed("drupal_reviewer.assemble_prompt") as span:
+            header = "Review this Drupal merge request.\n\n"
+            description_section = (
+                f"## MR Description\n{ticket_description}\n\n"
+                if ticket_description
+                else ""
+            )
+            diff_section = f"## Diff\n```diff\n{diff_content}\n```\n\n"
+            file_section = (
+                f"## Changed File Contents\n{file_contents}\n\n"
+                if file_contents
+                else ""
+            )
+            footer = (
+                "Follow your review workflow exactly. Evaluate all 11 review dimensions. "
+                "Produce the full output format including the Handover JSON in Section 8. "
+                "The JSON must be valid and parseable."
+            )
 
-        if ticket_description:
-            prompt += f"## MR Description\n{ticket_description}\n\n"
+            prompt = header + description_section + diff_section + file_section + footer
 
-        prompt += f"## Diff\n```diff\n{diff_content}\n```\n\n"
+            span.add_meta("section_header_chars", len(header))
+            span.add_meta("section_description_chars", len(description_section))
+            span.add_meta("section_diff_chars", len(diff_section))
+            span.add_meta("section_file_contents_chars", len(file_section))
+            span.add_meta("section_footer_chars", len(footer))
+            span.add_meta("system_prompt_chars", len(self.system_prompt) if self.system_prompt else 0)
+            span.add_meta("total_user_prompt_chars", len(prompt))
 
-        if file_contents:
-            prompt += f"## Changed File Contents\n{file_contents}\n\n"
-
-        prompt += (
-            "Follow your review workflow exactly. Evaluate all 11 review dimensions. "
-            "Produce the full output format including the Handover JSON in Section 8. "
-            "The JSON must be valid and parseable."
-        )
-
-        return prompt
+            return prompt
 
     def _parse_review_response(self, response: str) -> Dict[str, Any]:
         """Parse the LLM review response to extract structured data.

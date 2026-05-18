@@ -1,0 +1,35 @@
+## Sessions
+
+| # | Wall (min) | Agent (min) | Gap (min) | Agents | CWD sample |
+| - | ---------- | ----------- | --------- | ------ | ---------- |
+| 1 | 17.6 | 7.7 | 9.9 | plan_generator×2 | entinel-workspaces/dhlexs_dhlexc/DHLEXS_DHLEXC-356 |
+| 2 | 3.4 | 3.4 | 0.0 | plan_generator×1 | entinel-workspaces/dhlexs_dhlexc/DHLEXS_DHLEXC-356 |
+| 3 | 0.0 | 0.0 | 0.0 | integration_test×4, no_session_test×1, sync_test×1 |  |
+| 4 | 53.0 | 6.1 | 47.0 | confidence_evaluator×1, functional_debrief×1, plan_generator×3 | entinel-workspaces/dhlexs_dhlexc/DHLEXS_DHLEXC-356 |
+| 5 | 36.5 | 5.6 | 30.9 | confidence_evaluator×1, functional_debrief×1, integration_test×4, plan_generator×2, project_profiler×1 | entinel-workspaces/dhlexs_dhlexc/DHLEXS_DHLEXC-311 |
+
+## Top spans (perf.jsonl)
+
+_no perf.jsonl records_
+
+## Cache hit rate (per agent)
+
+_No `cache_read_input_tokens` / `cache_creation_input_tokens` recorded._
+_(Pre-Stage-A data, or SDK didn't surface usage object.)_
+| Agent | Calls | Input tokens | Cache read | Cache creation | Hit % |
+| ----- | ----- | ------------ | ---------- | -------------- | ----- |
+| confidence_evaluator | 2 | 0 | 0 | 0 | 0.0 |
+| functional_debrief | 2 | 0 | 0 | 0 | 0.0 |
+| integration_test | 8 | 0 | 0 | 0 | 0.0 |
+| no_session_test | 1 | 0 | 0 | 0 | 0.0 |
+| plan_generator | 8 | 0 | 0 | 0 | 0.0 |
+| project_profiler | 1 | 0 | 0 | 0 | 0.0 |
+| sync_test | 1 | 0 | 0 | 0 | 0.0 |
+
+## Per-tool wallclock histogram
+
+_No `tool_complete` events found — pre-Stage-A data only._
+
+## Reviewer prompt section breakdown
+
+_No `drupal_reviewer.assemble_prompt` spans recorded._

@@ -26,6 +26,7 @@ from src.core.events import (
     TestResultRecorded,
 )
 from src.prompt_loader import load_agent_prompt
+from src.utils.perf import timed
 from src.worktree_manager import get_branch_name
 
 
@@ -713,40 +714,49 @@ Return the task list now, one task per line:"""
         last_errors: List[StructuredError] = []
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            logger.info("Loop A attempt %d/%d for task: %s", attempt, MAX_ATTEMPTS, task)
-
-            # Re-capture HEAD at the top of each attempt so the verifier's
-            # changed-files scope reflects what *this attempt* changed, not
-            # what's accumulated since loop entry. The outer ``pretask_sha``
-            # remains as the loop-entry sentinel for drift detection only.
-            attempt_sha = self._capture_pretask_sha(worktree_path)
-            self._warn_if_sha_drifted(pretask_sha, attempt_sha, attempt)
-
-            prompt = (
-                tdd_prompt
-                if attempt == 1
-                else self._build_refine_prompt(last_errors, attempt)
+            trigger_reason = "initial" if attempt == 1 else (
+                f"refine_test_errors={len(last_errors)}"
             )
+            with timed(
+                "base_developer.verifier_iteration",
+                meta={"attempt": attempt, "trigger": trigger_reason, "agent": self.agent_name},
+            ) as _retry_span:
+                logger.info("Loop A attempt %d/%d for task: %s", attempt, MAX_ATTEMPTS, task)
 
-            sdk_result = asyncio.run(self.agent_sdk.execute_with_tools(
-                prompt=prompt,
-                session_id=None,
-                system_prompt=self.system_prompt,
-                cwd=str(worktree_path),
-            ))
+                # Re-capture HEAD at the top of each attempt so the verifier's
+                # changed-files scope reflects what *this attempt* changed, not
+                # what's accumulated since loop entry. The outer ``pretask_sha``
+                # remains as the loop-entry sentinel for drift detection only.
+                attempt_sha = self._capture_pretask_sha(worktree_path)
+                self._warn_if_sha_drifted(pretask_sha, attempt_sha, attempt)
 
-            for tool_use in sdk_result.get("tool_uses", []):
-                tool_name = tool_use.get("tool")
-                if tool_name == "Write":
-                    files_created.append(tool_use.get("input", {}).get("file_path", ""))
-                elif tool_name == "Edit":
-                    files_modified.append(tool_use.get("input", {}).get("file_path", ""))
+                prompt = (
+                    tdd_prompt
+                    if attempt == 1
+                    else self._build_refine_prompt(last_errors, attempt)
+                )
 
-            test_result = self.run_tests(worktree_path, pretask_sha=attempt_sha)
-            static_result = self.run_static_checks(worktree_path)
+                sdk_result = asyncio.run(self.agent_sdk.execute_with_tools(
+                    prompt=prompt,
+                    session_id=None,
+                    system_prompt=self.system_prompt,
+                    cwd=str(worktree_path),
+                ))
 
-            test_errors = test_result.get("structured_errors", []) or []
-            static_errors = static_result.get("structured_errors", []) or []
+                for tool_use in sdk_result.get("tool_uses", []):
+                    tool_name = tool_use.get("tool")
+                    if tool_name == "Write":
+                        files_created.append(tool_use.get("input", {}).get("file_path", ""))
+                    elif tool_name == "Edit":
+                        files_modified.append(tool_use.get("input", {}).get("file_path", ""))
+
+                test_result = self.run_tests(worktree_path, pretask_sha=attempt_sha)
+                static_result = self.run_static_checks(worktree_path)
+
+                test_errors = test_result.get("structured_errors", []) or []
+                static_errors = static_result.get("structured_errors", []) or []
+                _retry_span.add_meta("test_errors", len(test_errors))
+                _retry_span.add_meta("static_errors", len(static_errors))
 
             self._emit(
                 TestResultRecorded(
@@ -1142,6 +1152,17 @@ Return the task list now, one task per line:"""
             current = parent
 
     def run_tests(
+        self,
+        worktree_path: Path,
+        pretask_sha: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with timed("cmd.run_tests", meta={"agent": self.agent_name, "scoped": pretask_sha is not None}) as _span:
+            result = self._run_tests_inner(worktree_path, pretask_sha)
+            _span.add_meta("passed", bool(result.get("passed")))
+            _span.add_meta("output_size_chars", len(result.get("test_results", "") or ""))
+            return result
+
+    def _run_tests_inner(
         self,
         worktree_path: Path,
         pretask_sha: Optional[str] = None,
