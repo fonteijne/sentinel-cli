@@ -890,6 +890,12 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         # returns the existing path otherwise. The plan-file check
         # further down still catches "did you run `sentinel plan` first"
         # for fresh tickets.
+        bare_clone_dir = worktree_mgr.workspace_root / project.lower()
+        if not bare_clone_dir.exists():
+            click.echo(
+                f"📦 Bare clone for {project} is missing — cloning now "
+                f"(first run, or volume was wiped by a rebuild)…"
+            )
         worktree_path = worktree_mgr.create_worktree(ticket_id, project)
 
         # Phase 3A: pull-on-demand outcome ingestion. Non-fatal — sync
