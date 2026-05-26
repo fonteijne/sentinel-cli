@@ -145,7 +145,7 @@ def _patch_common(
     fake_env_mgr.teardown.return_value = True
 
     fake_worktree_mgr = MagicMock()
-    fake_worktree_mgr.get_worktree_path.return_value = worktree_path
+    fake_worktree_mgr.create_worktree.return_value = worktree_path
 
     return [
         patch("src.cli.get_config", return_value=fake_config),

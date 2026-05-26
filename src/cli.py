@@ -883,12 +883,14 @@ def execute(ticket_id: str, project: Optional[str] = None, max_iterations: int =
         # Initialize managers
         worktree_mgr = WorktreeManager()
 
-        # Get worktree path
-        worktree_path = worktree_mgr.get_worktree_path(ticket_id, project)
-        if not worktree_path:
-            click.echo(f"\n❌ Worktree not found for {ticket_id}", err=True)
-            click.echo("   Run 'sentinel plan' first to create the worktree")
-            sys.exit(1)
+        # Self-heal the workspace: container rebuilds can wipe the
+        # sentinel-projects volume, leaving the bare clone and worktree
+        # missing. ``create_worktree`` is idempotent — it clones the bare
+        # repo if absent, recreates the worktree dir if absent, and
+        # returns the existing path otherwise. The plan-file check
+        # further down still catches "did you run `sentinel plan` first"
+        # for fresh tickets.
+        worktree_path = worktree_mgr.create_worktree(ticket_id, project)
 
         # Phase 3A: pull-on-demand outcome ingestion. Non-fatal — sync
         # failures must never block execution. Gated on OUTCOME_SYNC_ENABLED.
